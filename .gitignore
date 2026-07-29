@@ -1,0 +1,7 @@
+agent/auth.json
+agent/models-store.json
+agent/settings.json
+agent/trust.json
+
+agent/bin
+agent/sessions
