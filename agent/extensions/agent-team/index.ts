@@ -451,8 +451,8 @@ const ChainItem = Type.Object({
 });
 
 const AgentScopeSchema = StringEnum(["user", "project", "both"] as const, {
-	description: 'Which agent directories to use. Default: "project". Use "both" to include user-level agents.',
-	default: "project",
+	description: 'Which agent directories to use. Default: "both"; project-level agents override user-level agents with the same name.',
+	default: "both",
 });
 
 const SubagentParams = Type.Object({
@@ -471,14 +471,14 @@ export default function (pi: ExtensionAPI) {
 		description: [
 			"Delegate tasks to specialized subagents with isolated context.",
 			"Modes: single (agent + task), parallel (tasks array), chain (sequential with {previous} placeholder).",
-			`Default agent scope is "project" (from ${CONFIG_DIR_NAME}/agents in the current project).`,
-			`Set agentScope: "both" (or "user") to include user-level agents.`,
+			`Default agent scope is "both": user-level agents plus ${CONFIG_DIR_NAME}/agents from the current project.`,
+			`Project-level agents override user-level agents with the same name.`,
 		].join(" "),
 		parameters: SubagentParams,
 		renderShell: "self",
 
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
-			const agentScope: AgentScope = params.agentScope ?? "project";
+			const agentScope: AgentScope = params.agentScope ?? "both";
 			const discovery = discoverAgents(ctx.cwd, agentScope);
 			const agents = discovery.agents;
 
@@ -680,7 +680,7 @@ export default function (pi: ExtensionAPI) {
 		},
 
 		renderCall(args, theme, _context) {
-			const scope: AgentScope = args.agentScope ?? "project";
+			const scope: AgentScope = args.agentScope ?? "both";
 			if (args.chain && args.chain.length > 0) {
 				let text =
 					theme.fg("toolTitle", theme.bold("subagent ")) +

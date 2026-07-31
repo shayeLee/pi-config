@@ -1,6 +1,6 @@
-# development-team 数据流说明
+# agent-team 数据流说明
 
-`development-team` 扩展向 Pi 注册 `subagent` 工具，通过独立的 Pi 子进程运行项目级或用户级子角色。扩展只负责角色发现、任务转发、事件采集和结果汇总，不包含具体领域的角色提示词。
+`agent-team` 扩展向 Pi 注册 `subagent` 工具，通过独立的 Pi 子进程运行项目级或用户级子角色。扩展只负责角色发现、任务转发、事件采集和结果汇总，不包含具体领域的角色提示词。
 
 ## 数据流概览
 
@@ -22,7 +22,7 @@
 
 ```yaml
 ---
-name: coder
+name: worker
 description: 角色说明
 tools: read, grep, find, ls, bash, edit, write
 model: provider/model
@@ -33,9 +33,9 @@ Markdown 正文是该角色的系统提示词。
 
 `agentScope` 决定发现范围：
 
-- `project`：默认值。从当前工作目录向上寻找最近的 `.pi/agents`。
+- `both`：默认值。同时读取用户级角色和当前工作目录向上最近的 `.pi/agents`；同名角色由项目级配置覆盖用户级配置。
+- `project`：只读取当前项目的 `.pi/agents`。
 - `user`：只读取用户级 Pi agent 目录中的 `agents`。
-- `both`：同时读取；同名角色由项目级配置覆盖用户级配置。
 
 角色配置在每次 `subagent` 调用时重新发现，不缓存到扩展的长期状态中。
 
@@ -121,7 +121,7 @@ Pi JSON 模式按行输出事件。扩展解析每一行，并主要采集：
 
 ```json
 {
-  "agent": "coder",
+  "agent": "worker",
   "task": "..."
 }
 ```
@@ -157,7 +157,7 @@ Pi JSON 模式按行输出事件。扩展解析每一行，并主要采集：
 ```json
 {
   "chain": [
-    { "agent": "coder", "task": "调查问题" },
+    { "agent": "worker", "task": "调查问题" },
     { "agent": "reviewer", "task": "根据以下结果复核：\n{previous}" }
   ]
 }
