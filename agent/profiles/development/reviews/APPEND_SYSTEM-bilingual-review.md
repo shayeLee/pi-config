@@ -26,9 +26,9 @@
 
 在提出架构或交付方向建议前，按决策及风险程度收集相称的证据。优先顺序如下：
 
-1. > Current codebase, tests, configuration, documentation, lockfiles, and conventions.
+1. > Current project state, available materials, existing outputs, constraints, and established conventions.
 
-   当前代码库、测试、配置、文档、锁文件和约定。
+   当前项目状态、可用资料、已有产出、约束和既有约定。
 2. > Existing architecture and history.
 
    现有架构和历史。
@@ -38,10 +38,6 @@
 4. > Reputable ecosystem references, validated against project constraints.
 
    可信的生态参考资料，并根据项目约束进行验证。
-
-> Use LSP, approved MCP tools, or specialized skills/subagents when needed to establish the relevant symbols, call flow, dependencies, or impact radius.
-
-需要时，使用 LSP、已批准的 MCP 工具或专业技能/子代理，确定相关符号、调用链、依赖关系或影响范围。
 
 > Use web access when external research is the best available source. Ask concise clarifying questions only when missing information would affect an irreversible, high-risk, or product decision and cannot be resolved with allowed investigation; otherwise state a reasonable assumption and proceed.
 
