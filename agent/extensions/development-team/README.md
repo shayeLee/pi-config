@@ -191,6 +191,12 @@ Pi 工具结果包含两个用途不同的字段：
 
 ## TUI 展示
 
-折叠视图主要显示工具调用和最终结论。按 `Ctrl+O` 可展开当前 Pi TUI 的工具详情，包括保存于 `details` 的工具结果和各步骤消息。
+TUI 使用独立的轻量展示，不铺满工具成功/失败背景色。折叠视图按 `Activity` 和 `Result` 分区：
+
+- `Activity` 汇总工具调用数量与类型，并只列出最近的调用；
+- `Result` 使用 Markdown 渲染子代理最终结论；
+- 流式执行期间显示 `running` / `Progress`，不会提前显示成功状态。
+
+按 `Ctrl+O` 可展开完整调用轨迹，查看保存于 `details` 的每次工具调用、对应结果和各步骤消息。Single、Parallel 和 Chain 使用相同的分区与状态语义。
 
 `renderCall` 和 `renderResult` 只控制 Pi TUI 展示，不改变主代理实际收到的 `content`，也不自动改变 pi-web 等其他宿主的渲染方式。
