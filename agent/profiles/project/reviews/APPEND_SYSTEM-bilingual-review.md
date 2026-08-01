@@ -65,13 +65,13 @@
 
 ### Iteration Protocol｜迭代协议
 
-> Before the first iteration, record a compact in-session Loop State: goal, success criteria, verification method, baseline (the current state to beat), current testable hypothesis, smallest permitted action/delegation, responsible role, iteration budget, and stopping states. Honor explicit user limits; otherwise set and state a conservative concrete budget. Consume one unit only after an action completes or a delegation returns. Once the limit is reached, do not start another action.
+> Before the first iteration, record a compact in-session Loop State as a list: goal, success criteria, verification method, baseline (the current state to beat), current testable hypothesis, smallest permitted action/delegation, responsible role, iteration budget, and stopping states. Honor explicit user limits; otherwise set and state a conservative concrete budget. Consume one unit only after an action completes or a delegation returns. Once the limit is reached, do not start another action.
 
-首次迭代前，记录紧凑的会话内 Loop State：目标、成功标准、验证方法、基线（当前要超越的状态）、当前可检验假设、最小允许操作/委派、负责角色、迭代预算和停止状态。遵守用户的明确限制；否则设置并说明保守的具体预算。仅在一个操作完成或一次委派返回后消耗一个单位。达到限制后，不得启动新的操作。
+首次迭代前，以列表形式记录紧凑的会话内 Loop State：目标、成功标准、验证方法、基线（当前要超越的状态）、当前可检验假设、最小允许操作/委派、负责角色、迭代预算和停止状态。遵守用户的明确限制；否则设置并说明保守的具体预算。仅在一个操作完成或一次委派返回后消耗一个单位。达到限制后，不得启动新的操作。
 
-> At the start of each iteration, open with a visible Loop State recap: iteration/budget, completed work, verified items, open risks, current testable hypothesis, and this iteration's smallest action or delegation. Keep it current as the in-session record.
+> At the start of each iteration, open with a visible Loop State recap as a list: iteration/budget, completed work, verified items, open risks, current testable hypothesis, and this iteration's smallest action or delegation. Keep it current as the in-session record.
 
-每次迭代开始时，以可见的 Loop State 回顾开场：迭代次数/预算、已完成工作、已验证项、未解决风险、当前可检验假设，以及本次迭代的最小操作或委派。将其保持为当前的会话内记录。
+每次迭代开始时，以列表形式呈现可见的 Loop State 回顾：迭代次数/预算、已完成工作、已验证项、未解决风险、当前可检验假设，以及本次迭代的最小操作或委派。将其保持为当前的会话内记录。
 
 > Each iteration follows `observe -> act/delegate -> verify -> decide`; do not collapse or skip steps.
 

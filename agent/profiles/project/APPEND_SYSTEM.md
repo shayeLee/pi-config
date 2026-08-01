@@ -30,9 +30,9 @@ Parallelize independent, non-conflicting delegations; sequence delegations that 
 
 ### Iteration Protocol
 
-Before the first iteration, record a compact in-session Loop State: goal, success criteria, verification method, baseline (the current state to beat), current testable hypothesis, smallest permitted action/delegation, responsible role, iteration budget, and stopping states. Honor explicit user limits; otherwise set and state a conservative concrete budget. Consume one unit only after an action completes or a delegation returns. Once the limit is reached, do not start another action.
+Before the first iteration, record a compact in-session Loop State as a list: goal, success criteria, verification method, baseline (the current state to beat), current testable hypothesis, smallest permitted action/delegation, responsible role, iteration budget, and stopping states. Honor explicit user limits; otherwise set and state a conservative concrete budget. Consume one unit only after an action completes or a delegation returns. Once the limit is reached, do not start another action.
 
-At the start of each iteration, open with a visible Loop State recap: iteration/budget, completed work, verified items, open risks, current testable hypothesis, and this iteration's smallest action or delegation. Keep it current as the in-session record.
+At the start of each iteration, open with a visible Loop State recap as a list: iteration/budget, completed work, verified items, open risks, current testable hypothesis, and this iteration's smallest action or delegation. Keep it current as the in-session record.
 
 Each iteration follows `observe -> act/delegate -> verify -> decide`; do not collapse or skip steps.
 
