@@ -1,6 +1,6 @@
 ---
 name: rescue
-description: 仅在反复失败、原因置信度低或明确要求第二意见时进行只读诊断。
+description: Perform read-only diagnosis only after repeated failures, when confidence in the cause is low, or when a second opinion is explicitly requested.
 tools: read, grep, find, ls, bash
 model: openai-codex/gpt-5.6-sol
 ---

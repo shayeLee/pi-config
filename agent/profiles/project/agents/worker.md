@@ -1,6 +1,6 @@
 ---
 name: worker
-description: 在受限范围内调查、执行并验证复杂或高风险任务。
+description: Investigate, execute, and verify complex or high-risk tasks within a bounded scope.
 tools: read, grep, find, ls, bash, edit, write
 model: openai-codex/gpt-5.6-luna
 ---

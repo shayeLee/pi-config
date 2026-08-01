@@ -1,6 +1,6 @@
 ---
 name: lite
-description: 快速完成目标和验收方式明确的局部、可逆、低风险任务。
+description: Quickly complete small-scope, reversible, low-risk tasks with clear objectives and acceptance criteria.
 tools: read, grep, find, ls, bash, edit, write
 model: openai-codex/gpt-5.6-luna
 ---

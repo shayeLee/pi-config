@@ -1,6 +1,6 @@
 ---
 name: reviewer
-description: 只读审查指定目标，识别正确性、安全性及外部影响风险。
+description: Perform a read-only review of the specified target to identify correctness, safety, and external-impact risks.
 tools: read, grep, find, ls, bash
 model: openai-codex/gpt-5.6-sol
 ---
