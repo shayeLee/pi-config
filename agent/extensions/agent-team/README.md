@@ -200,3 +200,28 @@ TUI 使用独立的轻量展示，不铺满工具成功/失败背景色。折叠
 按 `Ctrl+O` 可展开完整调用轨迹，查看保存于 `details` 的每次工具调用、对应结果和各步骤消息。Single、Parallel 和 Chain 使用相同的分区与状态语义。
 
 `renderCall` 和 `renderResult` 只控制 Pi TUI 展示，不改变主代理实际收到的 `content`，也不自动改变 pi-web 等其他宿主的渲染方式。
+
+### FleetView 与对话浮层
+
+TUI 会在编辑器下方显示当前 session 的 FleetView：
+
+- 运行中的子代理持续显示 agent、model、任务、耗时和 token/费用摘要；
+- 已完成、失败或停止的子代理短暂保留 15 秒，便于确认终态；
+- FleetView 最多显示最近 6 项，扩展内存中保留最近 32 项供浮层查看。
+
+恢复已有 session 时，浮层会从当前 session 分支中已保存的 `subagent` 工具结果重建最近 32 条记录。历史记录为只读，不能执行停止；没有最终工具结果的中断调用显示为 `interrupted`。切换 session tree 分支后，列表会按新分支重新构建。历史记录不会重新写入 session，也不会进入 LLM 上下文。
+
+按 `Ctrl+Alt+F` 或运行 `/subagents` 打开对话浮层。列表中可以：
+
+- 使用方向键、`j` / `k` 或 `Ctrl+N` / `Ctrl+P` 选择子代理；
+- 按 `Enter` 查看任务、assistant 文本、工具调用和工具结果；
+- 在对话中使用方向键、`j` / `k`、`Ctrl+N` / `Ctrl+P`、`PageUp` / `PageDown`、鼠标滚轮或触摸板滚动；
+- 在对话中使用 `Home` / `End` 回到内容顶部或底部；
+- 对运行中的子代理连续按两次 `x` 确认停止；
+- 按 `Esc` 返回列表，再按一次关闭浮层。
+
+进入对话详情时会临时启用终端 mouse tracking，返回列表或关闭浮层时恢复；agent 列表不响应触摸板滑动。Warp 需要先在 `Settings → Features` 开启 `Enable Mouse Reporting` 和 `Scroll Reporting`；按住 `Shift` 滚动或选择时，事件交还给 Warp。
+
+停止操作针对单个子进程：先发送 `SIGTERM`，5 秒后仍未退出则发送 `SIGKILL`。已采集的消息和部分输出会保留，终态标记为 `stopped`，与正常完成和失败分开显示。Parallel 中停止一个任务不会终止其他任务；Chain 中停止当前步骤会结束整条 chain，不再启动后续步骤。
+
+FleetView、对话浮层和运行注册表只消费现有的 JSON 事件与 `SingleResult` 引用，不改变主代理收到的 `content`、结构化 `details` 或 `{previous}` 传递规则。当前子进程仍使用一次性的 `--no-session` print 模式，不支持运行中 steer。

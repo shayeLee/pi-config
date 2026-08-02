@@ -22,12 +22,20 @@ import { StringEnum } from "@earendil-works/pi-ai";
 import {
 	CONFIG_DIR_NAME,
 	type ExtensionAPI,
+	type SessionEntry,
 	getMarkdownTheme,
 	withFileMutationQueue,
 } from "@earendil-works/pi-coding-agent";
 import { Container, Markdown, Spacer, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { type AgentConfig, type AgentScope, discoverAgents } from "./agents.ts";
+import {
+	FleetStore,
+	FleetWidget,
+	showFleetOverlay,
+	type FleetRunStatus,
+	type RestoredFleetRun,
+} from "./fleet-view.ts";
 
 const MAX_PARALLEL_TASKS = 8;
 const MAX_CONCURRENCY = 4;
@@ -223,6 +231,7 @@ interface UsageStats {
 }
 
 interface SingleResult {
+	runId?: string;
 	agent: string;
 	agentSource: "user" | "project" | "unknown";
 	task: string;
@@ -234,6 +243,8 @@ interface SingleResult {
 	stopReason?: string;
 	errorMessage?: string;
 	step?: number;
+	startedAt?: number;
+	endedAt?: number;
 }
 
 interface SubagentDetails {
@@ -241,6 +252,131 @@ interface SubagentDetails {
 	agentScope: AgentScope;
 	projectAgentsDir: string | null;
 	results: SingleResult[];
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null;
+}
+
+function finiteNumber(value: unknown, fallback = 0): number {
+	return typeof value === "number" && Number.isFinite(value) ? value : fallback;
+}
+
+function restoredUsage(value: unknown): UsageStats {
+	const usage = isRecord(value) ? value : {};
+	return {
+		input: finiteNumber(usage.input),
+		output: finiteNumber(usage.output),
+		cacheRead: finiteNumber(usage.cacheRead),
+		cacheWrite: finiteNumber(usage.cacheWrite),
+		cost: finiteNumber(usage.cost),
+		contextTokens: finiteNumber(usage.contextTokens),
+		turns: finiteNumber(usage.turns),
+	};
+}
+
+function restoredMessages(value: unknown): Message[] {
+	if (!Array.isArray(value)) return [];
+	return value.filter(
+		(message): message is Message =>
+			isRecord(message) &&
+			(message.role === "user" || message.role === "assistant" || message.role === "toolResult") &&
+			Array.isArray(message.content),
+	);
+}
+
+function restoredStatus(result: Record<string, unknown>): Exclude<FleetRunStatus, "running"> {
+	if (result.stopReason === "stopped") return "stopped";
+	if (result.exitCode === -1 || typeof result.exitCode !== "number") return "interrupted";
+	if (result.exitCode !== 0 || result.stopReason === "error" || result.stopReason === "aborted") return "failed";
+	return "completed";
+}
+
+function entryTimestamp(entry: SessionEntry): number {
+	const timestamp = Date.parse(entry.timestamp);
+	return Number.isFinite(timestamp) ? timestamp : Date.now();
+}
+
+function restoredRun(
+	result: unknown,
+	mode: "single" | "parallel" | "chain",
+	fallbackTimestamp: number,
+): RestoredFleetRun | undefined {
+	if (!isRecord(result) || typeof result.agent !== "string" || typeof result.task !== "string") return undefined;
+	const messages = restoredMessages(result.messages);
+	const firstMessageTimestamp = messages.length > 0 ? finiteNumber(messages[0].timestamp, fallbackTimestamp) : fallbackTimestamp;
+	const startedAt = finiteNumber(result.startedAt, firstMessageTimestamp);
+	const endedAt = Math.max(startedAt, finiteNumber(result.endedAt, fallbackTimestamp));
+	return {
+		mode,
+		agent: result.agent,
+		task: result.task,
+		messages,
+		usage: restoredUsage(result.usage),
+		model: typeof result.model === "string" ? result.model : undefined,
+		status: restoredStatus(result),
+		startedAt,
+		endedAt,
+	};
+}
+
+function interruptedRunFromToolCall(
+	args: unknown,
+	fallbackTimestamp: number,
+): RestoredFleetRun {
+	const params = isRecord(args) ? args : {};
+	let mode: "single" | "parallel" | "chain" = "single";
+	let agent = typeof params.agent === "string" ? params.agent : "subagent";
+	let task = typeof params.task === "string" ? params.task : "Interrupted subagent call without a final result";
+	if (Array.isArray(params.tasks)) {
+		mode = "parallel";
+		agent = "parallel";
+		task = `Interrupted parallel call with ${params.tasks.length} planned task${params.tasks.length === 1 ? "" : "s"}`;
+	} else if (Array.isArray(params.chain)) {
+		mode = "chain";
+		agent = "chain";
+		task = `Interrupted chain call with ${params.chain.length} planned step${params.chain.length === 1 ? "" : "s"}`;
+	}
+	return {
+		mode,
+		agent,
+		task,
+		messages: [],
+		usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
+		status: "interrupted",
+		startedAt: fallbackTimestamp,
+		endedAt: fallbackTimestamp,
+	};
+}
+
+function collectRestoredFleetRuns(entries: readonly SessionEntry[]): RestoredFleetRun[] {
+	const restored: RestoredFleetRun[] = [];
+	const completedToolCallIds = new Set<string>();
+
+	for (const entry of entries) {
+		if (entry.type !== "message" || entry.message.role !== "toolResult" || entry.message.toolName !== "subagent") continue;
+		completedToolCallIds.add(entry.message.toolCallId);
+		const details = entry.message.details;
+		if (!isRecord(details) || !Array.isArray(details.results)) continue;
+		const mode = details.mode;
+		if (mode !== "single" && mode !== "parallel" && mode !== "chain") continue;
+		const fallbackTimestamp = finiteNumber(entry.message.timestamp, entryTimestamp(entry));
+		for (const result of details.results) {
+			const run = restoredRun(result, mode, fallbackTimestamp);
+			if (run) restored.push(run);
+		}
+	}
+
+	for (const entry of entries) {
+		if (entry.type !== "message" || entry.message.role !== "assistant") continue;
+		const fallbackTimestamp = finiteNumber(entry.message.timestamp, entryTimestamp(entry));
+		for (const part of entry.message.content) {
+			if (part.type !== "toolCall" || part.name !== "subagent" || completedToolCallIds.has(part.id)) continue;
+			restored.push(interruptedRunFromToolCall(part.arguments, fallbackTimestamp));
+		}
+	}
+
+	return restored.sort((a, b) => a.startedAt - b.startedAt);
 }
 
 function getFinalOutput(messages: Message[]): string {
@@ -261,7 +397,14 @@ function isFailedResult(result: SingleResult): boolean {
 	return result.exitCode !== 0 || result.stopReason === "error" || result.stopReason === "aborted";
 }
 
+function isStoppedResult(result: SingleResult): boolean {
+	return result.stopReason === "stopped";
+}
+
 function getResultOutput(result: SingleResult): string {
+	if (isStoppedResult(result)) {
+		return getFinalOutput(result.messages) || result.errorMessage || result.stderr || "(stopped before output)";
+	}
 	if (isFailedResult(result)) {
 		return result.errorMessage || result.stderr || getFinalOutput(result.messages) || "(no output)";
 	}
@@ -354,6 +497,7 @@ type OnUpdateCallback = (partial: AgentToolResult<SubagentDetails>) => void;
 async function runSingleAgent(
 	defaultCwd: string,
 	agents: AgentConfig[],
+	mode: "single" | "parallel" | "chain",
 	agentName: string,
 	task: string,
 	cwd: string | undefined,
@@ -361,6 +505,7 @@ async function runSingleAgent(
 	signal: AbortSignal | undefined,
 	onUpdate: OnUpdateCallback | undefined,
 	makeDetails: (results: SingleResult[]) => SubagentDetails,
+	fleetStore: FleetStore,
 ): Promise<SingleResult> {
 	const agent = agents.find((a) => a.name === agentName);
 
@@ -396,8 +541,55 @@ async function runSingleAgent(
 		model: agent.model,
 		step,
 	};
+	let childProcess: ReturnType<typeof spawn> | null = null;
+	let forceKillTimer: ReturnType<typeof setTimeout> | undefined;
+	let stopRequested = false;
+	let parentAborted = false;
+	let settled = false;
+
+	const terminateProcess = () => {
+		if (!childProcess || childProcess.exitCode !== null || childProcess.signalCode !== null) return;
+		childProcess.kill("SIGTERM");
+		forceKillTimer = setTimeout(() => {
+			if (childProcess && childProcess.exitCode === null && childProcess.signalCode === null) {
+				childProcess.kill("SIGKILL");
+			}
+		}, 5000);
+		forceKillTimer.unref?.();
+	};
+
+	const fleetRun = fleetStore.add({
+		mode,
+		agent: currentResult.agent,
+		task: currentResult.task,
+		messages: currentResult.messages,
+		usage: currentResult.usage,
+		model: currentResult.model,
+		stop: () => {
+			if (settled || stopRequested) return false;
+			stopRequested = true;
+			terminateProcess();
+			return true;
+		},
+	});
+	currentResult.runId = fleetRun.id;
+	currentResult.startedAt = fleetRun.startedAt;
+
+	const abortFromParent = () => {
+		parentAborted = true;
+		if (!stopRequested) {
+			stopRequested = true;
+			terminateProcess();
+		}
+	};
+	if (signal) {
+		if (signal.aborted) abortFromParent();
+		else signal.addEventListener("abort", abortFromParent, { once: true });
+	}
 
 	const emitUpdate = () => {
+		fleetRun.model = currentResult.model;
+		fleetStore.touch();
 		if (onUpdate) {
 			onUpdate({
 				content: [{ type: "text", text: getFinalOutput(currentResult.messages) || "(running...)" }],
@@ -415,7 +607,6 @@ async function runSingleAgent(
 		}
 
 		args.push(`Task: ${task}`);
-		let wasAborted = false;
 
 		const exitCode = await new Promise<number>((resolve) => {
 			const invocation = getPiInvocation(args);
@@ -424,6 +615,8 @@ async function runSingleAgent(
 				shell: false,
 				stdio: ["ignore", "pipe", "pipe"],
 			});
+			childProcess = proc;
+			if (stopRequested) terminateProcess();
 			let buffer = "";
 
 			const processLine = (line: string) => {
@@ -482,24 +675,24 @@ async function runSingleAgent(
 			proc.on("error", () => {
 				resolve(1);
 			});
-
-			if (signal) {
-				const killProc = () => {
-					wasAborted = true;
-					proc.kill("SIGTERM");
-					setTimeout(() => {
-						if (!proc.killed) proc.kill("SIGKILL");
-					}, 5000);
-				};
-				if (signal.aborted) killProc();
-				else signal.addEventListener("abort", killProc, { once: true });
-			}
 		});
 
-		currentResult.exitCode = exitCode;
-		if (wasAborted) throw new Error("Subagent was aborted");
+		currentResult.exitCode = stopRequested ? 130 : exitCode;
+		if (stopRequested) {
+			currentResult.stopReason = "stopped";
+			currentResult.errorMessage = parentAborted ? "Stopped with the parent operation" : "Stopped by user";
+		}
 		return currentResult;
 	} finally {
+		settled = true;
+		if (forceKillTimer) clearTimeout(forceKillTimer);
+		if (signal) signal.removeEventListener("abort", abortFromParent);
+		currentResult.endedAt = Date.now();
+		let fleetStatus: Exclude<FleetRunStatus, "running">;
+		if (stopRequested) fleetStatus = "stopped";
+		else if (isFailedResult(currentResult)) fleetStatus = "failed";
+		else fleetStatus = "completed";
+		fleetStore.finish(fleetRun, fleetStatus);
 		if (tmpPromptPath)
 			try {
 				fs.unlinkSync(tmpPromptPath);
@@ -542,6 +735,43 @@ const SubagentParams = Type.Object({
 });
 
 export default function (pi: ExtensionAPI) {
+	const fleetStore = new FleetStore();
+	const restoreFleetHistory = (ctx: { sessionManager: { getBranch(): SessionEntry[] } }) => {
+		fleetStore.restore(collectRestoredFleetRuns(ctx.sessionManager.getBranch()));
+	};
+
+	pi.on("session_start", (_event, ctx) => {
+		restoreFleetHistory(ctx);
+		if (ctx.mode !== "tui") return;
+		ctx.ui.setWidget(
+			"agent-team-fleet",
+			(tui, theme) => new FleetWidget(fleetStore, tui, theme),
+			{ placement: "belowEditor" },
+		);
+	});
+
+	pi.on("session_shutdown", (_event, ctx) => {
+		for (const run of fleetStore.list()) {
+			if (run.status === "running") run.stop();
+		}
+		if (ctx.mode === "tui") ctx.ui.setWidget("agent-team-fleet", undefined);
+		fleetStore.clear();
+	});
+
+	pi.on("session_tree", (_event, ctx) => {
+		restoreFleetHistory(ctx);
+	});
+
+	pi.registerCommand("subagents", {
+		description: "Open the live subagent FleetView",
+		handler: async (_args, ctx) => showFleetOverlay(ctx, fleetStore),
+	});
+
+	pi.registerShortcut("ctrl+alt+f", {
+		description: "Open the live subagent FleetView",
+		handler: async (ctx) => showFleetOverlay(ctx, fleetStore),
+	});
+
 	pi.registerTool({
 		name: "subagent",
 		label: "Subagent",
@@ -612,6 +842,7 @@ export default function (pi: ExtensionAPI) {
 					const result = await runSingleAgent(
 						ctx.cwd,
 						agents,
+						"chain",
 						step.agent,
 						taskWithContext,
 						step.cwd,
@@ -619,6 +850,7 @@ export default function (pi: ExtensionAPI) {
 						signal,
 						chainUpdate,
 						makeDetails("chain"),
+						fleetStore,
 					);
 					results.push(result);
 
@@ -684,6 +916,7 @@ export default function (pi: ExtensionAPI) {
 					const result = await runSingleAgent(
 						ctx.cwd,
 						agents,
+						"parallel",
 						t.agent,
 						t.task,
 						t.cwd,
@@ -697,6 +930,7 @@ export default function (pi: ExtensionAPI) {
 							}
 						},
 						makeDetails("parallel"),
+						fleetStore,
 					);
 					allResults[index] = result;
 					emitParallelUpdate();
@@ -706,9 +940,11 @@ export default function (pi: ExtensionAPI) {
 				const successCount = results.filter((r) => !isFailedResult(r)).length;
 				const summaries = results.map((r) => {
 					const output = truncateParallelOutput(getResultOutput(r));
-					const status = isFailedResult(r)
-						? `failed${r.stopReason && r.stopReason !== "end" ? ` (${r.stopReason})` : ""}`
-						: "completed";
+					const status = isStoppedResult(r)
+						? "stopped"
+						: isFailedResult(r)
+							? `failed${r.stopReason && r.stopReason !== "end" ? ` (${r.stopReason})` : ""}`
+							: "completed";
 					return `### [${r.agent}] ${status}\n\n${output}`;
 				});
 				return {
@@ -726,6 +962,7 @@ export default function (pi: ExtensionAPI) {
 				const result = await runSingleAgent(
 					ctx.cwd,
 					agents,
+					"single",
 					params.agent,
 					params.task,
 					params.cwd,
@@ -733,6 +970,7 @@ export default function (pi: ExtensionAPI) {
 					signal,
 					onUpdate,
 					makeDetails("single"),
+					fleetStore,
 				);
 				const isError = isFailedResult(result);
 				if (isError) {
@@ -869,12 +1107,15 @@ export default function (pi: ExtensionAPI) {
 			if (details.mode === "single" && details.results.length === 1) {
 				const r = details.results[0];
 				const isRunning = r.exitCode === -1;
+				const isStopped = !isRunning && isStoppedResult(r);
 				const isError = !isRunning && isFailedResult(r);
 				const icon = isRunning
 					? theme.fg("warning", "●")
-					: isError
-						? theme.fg("error", "✗")
-						: theme.fg("success", "✓");
+					: isStopped
+						? theme.fg("warning", "■")
+						: isError
+							? theme.fg("error", "✗")
+							: theme.fg("success", "✓");
 				const displayItems = getDisplayItems(r.messages, expanded);
 				const finalOutput = getFinalOutput(r.messages);
 
@@ -882,11 +1123,12 @@ export default function (pi: ExtensionAPI) {
 					const container = new Container();
 					let header = `${icon} ${theme.fg("toolTitle", theme.bold(r.agent))}${theme.fg("muted", ` (${r.agentSource})`)}`;
 					if (isRunning) header += theme.fg("warning", "  running");
-					if (isError && r.stopReason) header += ` ${theme.fg("error", `[${r.stopReason}]`)}`;
+					if (isStopped) header += theme.fg("warning", "  stopped");
+					else if (isError && r.stopReason) header += ` ${theme.fg("error", `[${r.stopReason}]`)}`;
 					const usageStr = formatUsageStats(r.usage, r.model);
 					if (usageStr) header += theme.fg("dim", `  ${usageStr}`);
 					container.addChild(new Text(header, 0, 0));
-					if (isError && r.errorMessage)
+					if (isError && !isStopped && r.errorMessage)
 						container.addChild(new Text(theme.fg("error", `Error: ${r.errorMessage}`), 0, 0));
 					addSectionTitle(container, "Task");
 					container.addChild(new Text(theme.fg("dim", r.task), 1, 0));
@@ -908,11 +1150,12 @@ export default function (pi: ExtensionAPI) {
 				const container = new Container();
 				let header = `${icon} ${theme.fg("toolTitle", theme.bold(r.agent))}${theme.fg("muted", ` (${r.agentSource})`)}`;
 				if (isRunning) header += theme.fg("warning", "  running");
-				if (isError && r.stopReason) header += ` ${theme.fg("error", `[${r.stopReason}]`)}`;
+				if (isStopped) header += theme.fg("warning", "  stopped");
+				else if (isError && r.stopReason) header += ` ${theme.fg("error", `[${r.stopReason}]`)}`;
 				const usageStr = formatUsageStats(r.usage, r.model);
 				if (usageStr) header += theme.fg("dim", `  ${usageStr}`);
 				container.addChild(new Text(header, 0, 0));
-				if (isError && r.errorMessage) {
+				if (isError && !isStopped && r.errorMessage) {
 					container.addChild(new Text(theme.fg("error", `Error: ${r.errorMessage}`), 1, 0));
 					return container;
 				}
@@ -948,12 +1191,15 @@ export default function (pi: ExtensionAPI) {
 			if (details.mode === "chain") {
 				const successCount = details.results.filter((r) => r.exitCode === 0).length;
 				const runningCount = details.results.filter((r) => r.exitCode === -1).length;
+				const stoppedCount = details.results.filter(isStoppedResult).length;
 				const icon =
 					runningCount > 0
 						? theme.fg("warning", "●")
-						: successCount === details.results.length
-							? theme.fg("success", "✓")
-							: theme.fg("error", "✗");
+						: stoppedCount > 0
+							? theme.fg("warning", "■")
+							: successCount === details.results.length
+								? theme.fg("success", "✓")
+								: theme.fg("error", "✗");
 
 				if (expanded) {
 					const container = new Container();
@@ -972,9 +1218,11 @@ export default function (pi: ExtensionAPI) {
 						const rIcon =
 							r.exitCode === -1
 								? theme.fg("warning", "●")
-								: r.exitCode === 0
-									? theme.fg("success", "✓")
-									: theme.fg("error", "✗");
+								: isStoppedResult(r)
+									? theme.fg("warning", "■")
+									: r.exitCode === 0
+										? theme.fg("success", "✓")
+										: theme.fg("error", "✗");
 						const displayItems = getDisplayItems(r.messages, true);
 						const finalOutput = getFinalOutput(r.messages);
 
@@ -1021,9 +1269,11 @@ export default function (pi: ExtensionAPI) {
 					const rIcon =
 						r.exitCode === -1
 							? theme.fg("warning", "●")
-							: r.exitCode === 0
-								? theme.fg("success", "✓")
-								: theme.fg("error", "✗");
+							: isStoppedResult(r)
+								? theme.fg("warning", "■")
+								: r.exitCode === 0
+									? theme.fg("success", "✓")
+									: theme.fg("error", "✗");
 					const displayItems = getDisplayItems(r.messages);
 					const finalOutput = getFinalOutput(r.messages);
 					container.addChild(new Spacer(1));
@@ -1050,16 +1300,21 @@ export default function (pi: ExtensionAPI) {
 			if (details.mode === "parallel") {
 				const running = details.results.filter((r) => r.exitCode === -1).length;
 				const successCount = details.results.filter((r) => r.exitCode !== -1 && !isFailedResult(r)).length;
-				const failCount = details.results.filter((r) => r.exitCode !== -1 && isFailedResult(r)).length;
+				const stoppedCount = details.results.filter(isStoppedResult).length;
+				const failCount = details.results.filter(
+					(r) => r.exitCode !== -1 && isFailedResult(r) && !isStoppedResult(r),
+				).length;
 				const isRunning = running > 0;
 				const icon = isRunning
 					? theme.fg("warning", "⏳")
-					: failCount > 0
-						? theme.fg("warning", "◐")
-						: theme.fg("success", "✓");
+					: stoppedCount > 0
+						? theme.fg("warning", "■")
+						: failCount > 0
+							? theme.fg("warning", "◐")
+							: theme.fg("success", "✓");
 				const status = isRunning
-					? `${successCount + failCount}/${details.results.length} done, ${running} running`
-					: `${successCount}/${details.results.length} tasks`;
+					? `${successCount + failCount + stoppedCount}/${details.results.length} done, ${running} running`
+					: `${successCount} completed${stoppedCount ? ` · ${stoppedCount} stopped` : ""}${failCount ? ` · ${failCount} failed` : ""}`;
 
 				if (expanded && !isRunning) {
 					const container = new Container();
@@ -1072,7 +1327,11 @@ export default function (pi: ExtensionAPI) {
 					);
 
 					for (const r of details.results) {
-						const rIcon = isFailedResult(r) ? theme.fg("error", "✗") : theme.fg("success", "✓");
+						const rIcon = isStoppedResult(r)
+							? theme.fg("warning", "■")
+							: isFailedResult(r)
+								? theme.fg("error", "✗")
+								: theme.fg("success", "✓");
 						const displayItems = getDisplayItems(r.messages, true);
 						const finalOutput = getFinalOutput(r.messages);
 
@@ -1112,9 +1371,11 @@ export default function (pi: ExtensionAPI) {
 					const rIcon =
 						r.exitCode === -1
 							? theme.fg("warning", "⏳")
-							: isFailedResult(r)
-								? theme.fg("error", "✗")
-								: theme.fg("success", "✓");
+							: isStoppedResult(r)
+								? theme.fg("warning", "■")
+								: isFailedResult(r)
+									? theme.fg("error", "✗")
+									: theme.fg("success", "✓");
 					const displayItems = getDisplayItems(r.messages);
 					const finalOutput = getFinalOutput(r.messages);
 					container.addChild(new Spacer(1));
