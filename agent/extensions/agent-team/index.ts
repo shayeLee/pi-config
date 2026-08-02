@@ -71,15 +71,43 @@ function formatToolCall(
 	toolName: string,
 	args: Record<string, unknown>,
 	themeFg: (color: any, text: string) => string,
+	expanded = false,
 ): string {
 	const shortenPath = (p: string) => {
 		const home = os.homedir();
 		return p.startsWith(home) ? `~${p.slice(home.length)}` : p;
 	};
+	const formatValue = (value: unknown): string => {
+		if (typeof value === "string") return value;
+		if (value === undefined) return "...";
+		if (value === null) return "null";
+		if (Array.isArray(value)) return value.map(formatValue).join(", ");
+		if (typeof value === "object") {
+			return Object.entries(value)
+				.map(([key, item]) => `${key}: ${formatValue(item)}`)
+				.join(", ");
+		}
+		return String(value);
+	};
+	const formatField = (label: string, value: unknown, indent = "  ") => {
+		const lines = formatValue(value).split("\n");
+		let text = `\n${themeFg("dim", `${indent}${label}: `)}${themeFg("toolOutput", lines[0] || "")}`;
+		for (const line of lines.slice(1)) {
+			text += `\n${themeFg("dim", `${indent}  `)}${themeFg("toolOutput", line)}`;
+		}
+		return text;
+	};
+	const formatExpanded = (header: string, fields: Array<[string, unknown]>) =>
+		header + fields.map(([label, value]) => formatField(label, value)).join("");
 
 	switch (toolName) {
 		case "bash": {
 			const command = (args.command as string) || "...";
+			if (expanded) {
+				const fields: Array<[string, unknown]> = [];
+				if (args.timeout !== undefined) fields.push(["timeout", `${args.timeout}s`]);
+				return formatExpanded(themeFg("muted", "$ ") + themeFg("toolOutput", command), fields);
+			}
 			const preview = command.length > 60 ? `${command.slice(0, 60)}...` : command;
 			return themeFg("muted", "$ ") + themeFg("toolOutput", preview);
 		}
@@ -88,6 +116,12 @@ function formatToolCall(
 			const filePath = shortenPath(rawPath);
 			const offset = args.offset as number | undefined;
 			const limit = args.limit as number | undefined;
+			if (expanded) {
+				const fields: Array<[string, unknown]> = [];
+				if (offset !== undefined) fields.push(["offset", offset]);
+				if (limit !== undefined) fields.push(["limit", limit]);
+				return formatExpanded(themeFg("muted", "read ") + themeFg("accent", filePath), fields);
+			}
 			let text = themeFg("accent", filePath);
 			if (offset !== undefined || limit !== undefined) {
 				const startLine = offset ?? 1;
@@ -100,6 +134,11 @@ function formatToolCall(
 			const rawPath = (args.file_path || args.path || "...") as string;
 			const filePath = shortenPath(rawPath);
 			const content = (args.content || "") as string;
+			if (expanded)
+				return formatExpanded(
+					themeFg("muted", "write ") + themeFg("accent", filePath),
+					[["content", content]],
+				);
 			const lines = content.split("\n").length;
 			let text = themeFg("muted", "write ") + themeFg("accent", filePath);
 			if (lines > 1) text += themeFg("dim", ` (${lines} lines)`);
@@ -107,30 +146,68 @@ function formatToolCall(
 		}
 		case "edit": {
 			const rawPath = (args.file_path || args.path || "...") as string;
-			return themeFg("muted", "edit ") + themeFg("accent", shortenPath(rawPath));
+			const header = themeFg("muted", "edit ") + themeFg("accent", shortenPath(rawPath));
+			if (!expanded) return header;
+
+			let edits: unknown[] = Array.isArray(args.edits) ? args.edits : [];
+			if (typeof args.edits === "string") {
+				try {
+					const parsed = JSON.parse(args.edits);
+					if (Array.isArray(parsed)) edits = parsed;
+				} catch {
+					/* Keep invalid input empty, matching the tool's validation failure. */
+				}
+			}
+			if (typeof args.oldText === "string" && typeof args.newText === "string") {
+				edits = [...edits, { oldText: args.oldText, newText: args.newText }];
+			}
+			let text = formatExpanded(header, [["edits", `${edits.length} block${edits.length === 1 ? "" : "s"}`]]);
+			for (let i = 0; i < edits.length; i++) {
+				const edit = edits[i] as Record<string, unknown>;
+				text += `\n${themeFg("dim", `  edit ${i + 1}:`)}`;
+				if (edit.oldText !== undefined) text += formatField("oldText", edit.oldText, "    ");
+				if (edit.newText !== undefined) text += formatField("newText", edit.newText, "    ");
+			}
+			return text;
 		}
 		case "ls": {
 			const rawPath = (args.path || ".") as string;
+			if (expanded) {
+				const fields: Array<[string, unknown]> = [];
+				if (args.limit !== undefined) fields.push(["limit", args.limit]);
+				return formatExpanded(themeFg("muted", "ls ") + themeFg("accent", shortenPath(rawPath)), fields);
+			}
 			return themeFg("muted", "ls ") + themeFg("accent", shortenPath(rawPath));
 		}
 		case "find": {
 			const pattern = (args.pattern || "*") as string;
 			const rawPath = (args.path || ".") as string;
-			return themeFg("muted", "find ") + themeFg("accent", pattern) + themeFg("dim", ` in ${shortenPath(rawPath)}`);
+			const header = themeFg("muted", "find ") + themeFg("accent", pattern) + themeFg("dim", ` in ${shortenPath(rawPath)}`);
+			if (expanded && args.limit !== undefined) return formatExpanded(header, [["limit", args.limit]]);
+			return header;
 		}
 		case "grep": {
 			const pattern = (args.pattern || "") as string;
 			const rawPath = (args.path || ".") as string;
-			return (
+			const header =
 				themeFg("muted", "grep ") +
 				themeFg("accent", `/${pattern}/`) +
-				themeFg("dim", ` in ${shortenPath(rawPath)}`)
-			);
+				themeFg("dim", ` in ${shortenPath(rawPath)}`);
+			if (expanded) {
+				const fields: Array<[string, unknown]> = [];
+				for (const name of ["glob", "ignoreCase", "literal", "context", "limit"]) {
+					if (args[name] !== undefined) fields.push([name, args[name]]);
+				}
+				return formatExpanded(header, fields);
+			}
+			return header;
 		}
 		default: {
-			const argsStr = JSON.stringify(args);
+			const fields = Object.entries(args);
+			if (expanded) return formatExpanded(themeFg("accent", toolName), fields);
+			const argsStr = fields.map(([key, value]) => `${key}: ${formatValue(value)}`).join(", ");
 			const preview = argsStr.length > 50 ? `${argsStr.slice(0, 50)}...` : argsStr;
-			return themeFg("accent", toolName) + themeFg("dim", ` ${preview}`);
+			return themeFg("accent", toolName) + themeFg("dim", argsStr ? ` ${preview}` : "");
 		}
 	}
 }
@@ -776,7 +853,7 @@ export default function (pi: ExtensionAPI) {
 					if (item.type === "toolCall") {
 						container.addChild(
 							new Text(
-								theme.fg("accent", "▶ ") + formatToolCall(item.name, item.args, theme.fg.bind(theme)),
+								theme.fg("accent", "▶ ") + formatToolCall(item.name, item.args, theme.fg.bind(theme), true),
 								1,
 								0,
 							),
