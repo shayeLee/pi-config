@@ -36,6 +36,7 @@ import {
 	type FleetRunStatus,
 	type RestoredFleetRun,
 } from "./fleet-view.ts";
+import { FleetWebServer } from "./fleet-web.ts";
 
 const MAX_PARALLEL_TASKS = 8;
 const MAX_CONCURRENCY = 4;
@@ -736,6 +737,7 @@ const SubagentParams = Type.Object({
 
 export default function (pi: ExtensionAPI) {
 	const fleetStore = new FleetStore();
+	const fleetWebServer = new FleetWebServer(fleetStore);
 	const restoreFleetHistory = (ctx: { sessionManager: { getBranch(): SessionEntry[] } }) => {
 		fleetStore.restore(collectRestoredFleetRuns(ctx.sessionManager.getBranch()));
 	};
@@ -750,12 +752,13 @@ export default function (pi: ExtensionAPI) {
 		);
 	});
 
-	pi.on("session_shutdown", (_event, ctx) => {
+	pi.on("session_shutdown", async (_event, ctx) => {
 		for (const run of fleetStore.list()) {
 			if (run.status === "running") run.stop();
 		}
 		if (ctx.mode === "tui") ctx.ui.setWidget("agent-team-fleet", undefined);
 		fleetStore.clear();
+		await fleetWebServer.close();
 	});
 
 	pi.on("session_tree", (_event, ctx) => {
@@ -764,12 +767,12 @@ export default function (pi: ExtensionAPI) {
 
 	pi.registerCommand("subagents", {
 		description: "Open the live subagent FleetView",
-		handler: async (_args, ctx) => showFleetOverlay(ctx, fleetStore),
+		handler: async (_args, ctx) => showFleetOverlay(ctx, fleetStore, (runId) => fleetWebServer.open(runId)),
 	});
 
 	pi.registerShortcut("ctrl+alt+f", {
 		description: "Open the live subagent FleetView",
-		handler: async (ctx) => showFleetOverlay(ctx, fleetStore),
+		handler: async (ctx) => showFleetOverlay(ctx, fleetStore, (runId) => fleetWebServer.open(runId)),
 	});
 
 	pi.registerTool({

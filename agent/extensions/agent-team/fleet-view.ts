@@ -297,6 +297,8 @@ class FleetOverlay {
 		private tui: TUI,
 		private theme: Theme,
 		private done: () => void,
+		private openWebUi: (runId: string) => Promise<void>,
+		private reportError: (message: string) => void,
 	) {
 		this.selectedId = this.sortedRuns()[0]?.id;
 		this.unsubscribe = store.subscribe(() => tui.requestRender());
@@ -341,6 +343,10 @@ class FleetOverlay {
 				this.selectedId = runs[Math.min(runs.length - 1, selectedIndex + 1)]?.id;
 				this.confirmStopId = undefined;
 			} else if (matchesKey(data, "return") && this.selectedId) {
+				void this.openWebUi(this.selectedId)
+					.then(() => this.done())
+					.catch((error: unknown) => this.reportError(`Could not open Fleet web UI: ${error instanceof Error ? error.message : String(error)}`));
+			} else if (data === "i" && this.selectedId) {
 				this.view = "conversation";
 				this.offsetFromBottom = 0;
 				this.enableMouseTracking();
@@ -443,7 +449,7 @@ class FleetOverlay {
 		if (this.confirmStopId) {
 			lines.push(this.theme.fg("warning", `Press x again to stop #${this.confirmStopId}`));
 		} else {
-			lines.push(this.theme.fg("dim", "↑↓/jk/Ctrl+P,N select · Enter inspect · x stop · Esc close"));
+			lines.push(this.theme.fg("dim", "↑↓/jk/Ctrl+P,N select · Enter web UI · i inspect here · x stop · Esc close"));
 		}
 		return lines;
 	}
@@ -488,12 +494,18 @@ class FleetOverlay {
 	}
 }
 
-export async function showFleetOverlay(ctx: ExtensionContext, store: FleetStore): Promise<void> {
+export async function showFleetOverlay(
+	ctx: ExtensionContext,
+	store: FleetStore,
+	openWebUi: (runId: string) => Promise<void>,
+): Promise<void> {
 	if (ctx.mode !== "tui") {
 		ctx.ui.notify("Subagent Fleet requires TUI mode", "error");
 		return;
 	}
-	await ctx.ui.custom<void>((tui, theme, _keybindings, done) => new FleetOverlay(store, tui, theme, done), {
+	await ctx.ui.custom<void>((tui, theme, _keybindings, done) =>
+		new FleetOverlay(store, tui, theme, done, openWebUi, (message) => ctx.ui.notify(message, "error")),
+	{
 		overlay: true,
 		overlayOptions: {
 			anchor: "center",

@@ -214,7 +214,8 @@ TUI 会在编辑器下方显示当前 session 的 FleetView：
 按 `Ctrl+Alt+F` 或运行 `/subagents` 打开对话浮层。列表中可以：
 
 - 使用方向键、`j` / `k` 或 `Ctrl+N` / `Ctrl+P` 选择子代理；
-- 按 `Enter` 查看任务、assistant 文本、工具调用和工具结果；
+- 按 `Enter` 在默认浏览器打开本机只读 Web UI，查看任务、实时状态、assistant 文本、工具调用和工具结果；页面只监听 `127.0.0.1`，关闭 Pi 后不可访问；
+- 按 `i` 保持在终端内查看同样的对话详情；
 - 在对话中使用方向键、`j` / `k`、`Ctrl+N` / `Ctrl+P`、`PageUp` / `PageDown`、鼠标滚轮或触摸板滚动；
 - 在对话中使用 `Home` / `End` 回到内容顶部或底部；
 - 对运行中的子代理连续按两次 `x` 确认停止；
