@@ -38,22 +38,36 @@ export interface FleetUsage {
 	turns: number;
 }
 
+export interface FleetToolUpdate {
+	toolName: string;
+	phase: "streaming" | "completed";
+	content: Array<{ type: string; text?: string }>;
+	isError?: boolean;
+	contentTruncated?: boolean;
+	actualDiffTruncated?: boolean;
+	actualDiff?: string;
+}
+
 export interface FleetRun {
 	id: string;
 	mode: "single" | "parallel" | "chain";
 	agent: string;
 	task: string;
 	messages: Message[];
+	/** Transient tool output for the live Web UI; terminal messages remain the durable transcript. */
+	toolUpdates: Record<string, FleetToolUpdate>;
 	usage: FleetUsage;
 	model?: string;
 	status: FleetRunStatus;
+	stopping?: boolean;
 	startedAt: number;
 	endedAt?: number;
 	stop: () => boolean;
 }
 
-export type RestoredFleetRun = Omit<FleetRun, "id" | "stop" | "status"> & {
+export type RestoredFleetRun = Omit<FleetRun, "id" | "stop" | "status" | "toolUpdates"> & {
 	status: Exclude<FleetRunStatus, "running">;
+	toolUpdates?: Record<string, FleetToolUpdate>;
 };
 
 type FleetListener = () => void;
@@ -81,6 +95,7 @@ export class FleetStore {
 		const restoredRuns: FleetRun[] = runs.slice(-32).map((run) => ({
 			...run,
 			id: String(this.nextId++),
+			toolUpdates: run.toolUpdates ?? {},
 			stop: () => false,
 		}));
 		this.runs = [...restoredRuns, ...activeRuns];
@@ -95,6 +110,7 @@ export class FleetStore {
 	finish(run: FleetRun, status: Exclude<FleetRunStatus, "running">): void {
 		if (run.status !== "running") return;
 		run.status = status;
+		run.stopping = false;
 		run.endedAt = Date.now();
 		this.notify();
 	}
@@ -102,7 +118,15 @@ export class FleetStore {
 	stop(id: string): boolean {
 		const run = this.runs.find((item) => item.id === id);
 		if (!run || run.status !== "running") return false;
-		return run.stop();
+		const stopped = run.stop();
+		if (stopped) this.markStopping(run);
+		return stopped;
+	}
+
+	markStopping(run: FleetRun): void {
+		if (run.status !== "running" || run.stopping) return;
+		run.stopping = true;
+		this.notify();
 	}
 
 	list(): readonly FleetRun[] {
@@ -150,6 +174,7 @@ function formatDuration(startedAt: number, endedAt?: number): string {
 }
 
 function getStatusIcon(run: FleetRun, theme: Theme): string {
+	if (run.stopping) return theme.fg("warning", "■");
 	switch (run.status) {
 		case "running":
 			return theme.fg("warning", "●");
@@ -287,10 +312,11 @@ class FleetOverlay {
 	private selectedId?: string;
 	private view: "list" | "conversation" = "list";
 	private offsetFromBottom = 0;
-	private confirmStopId?: string;
 	private unsubscribe: () => void;
 	private ticker: ReturnType<typeof setInterval>;
 	private mouseTrackingEnabled = false;
+	private stopConfirmationId?: string;
+	private stopConfirmationTimer?: ReturnType<typeof setTimeout>;
 
 	constructor(
 		private store: FleetStore,
@@ -308,10 +334,10 @@ class FleetOverlay {
 
 	handleInput(data: string): void {
 		if (matchesKey(data, "escape")) {
+			this.clearStopConfirmation();
 			if (this.view === "conversation") {
 				this.view = "list";
 				this.offsetFromBottom = 0;
-				this.confirmStopId = undefined;
 				this.disableMouseTracking();
 			} else {
 				this.done();
@@ -320,6 +346,8 @@ class FleetOverlay {
 			return;
 		}
 
+		const stopKey = data === "x" || data === "X";
+		if (!stopKey) this.clearStopConfirmation();
 		const runs = this.sortedRuns();
 		const selectedIndex = Math.max(
 			0,
@@ -338,10 +366,8 @@ class FleetOverlay {
 		if (this.view === "list") {
 			if (matchesKey(data, "up") || matchesKey(data, "ctrl+p") || data === "k") {
 				this.selectedId = runs[Math.max(0, selectedIndex - 1)]?.id;
-				this.confirmStopId = undefined;
 			} else if (matchesKey(data, "down") || matchesKey(data, "ctrl+n") || data === "j") {
 				this.selectedId = runs[Math.min(runs.length - 1, selectedIndex + 1)]?.id;
-				this.confirmStopId = undefined;
 			} else if (matchesKey(data, "return") && this.selectedId) {
 				void this.openWebUi(this.selectedId)
 					.then(() => this.done())
@@ -350,8 +376,8 @@ class FleetOverlay {
 				this.view = "conversation";
 				this.offsetFromBottom = 0;
 				this.enableMouseTracking();
-			} else if (data === "x") {
-				this.requestStop();
+			} else if (stopKey) {
+				this.requestStopSelectedRun();
 			}
 		} else if (matchesKey(data, "up") || matchesKey(data, "ctrl+p") || data === "k") {
 			this.offsetFromBottom += 1;
@@ -365,8 +391,8 @@ class FleetOverlay {
 			this.offsetFromBottom = Number.MAX_SAFE_INTEGER;
 		} else if (matchesKey(data, "end")) {
 			this.offsetFromBottom = 0;
-		} else if (data === "x") {
-			this.requestStop();
+		} else if (stopKey) {
+			this.requestStopSelectedRun();
 		}
 		this.tui.requestRender();
 	}
@@ -381,6 +407,7 @@ class FleetOverlay {
 
 	dispose(): void {
 		this.disableMouseTracking();
+		this.clearStopConfirmation();
 		clearInterval(this.ticker);
 		this.unsubscribe();
 	}
@@ -405,16 +432,32 @@ class FleetOverlay {
 		});
 	}
 
-	private requestStop(): void {
-		if (!this.selectedId) return;
+	private clearStopConfirmation(): void {
+		if (this.stopConfirmationTimer) clearTimeout(this.stopConfirmationTimer);
+		this.stopConfirmationTimer = undefined;
+		this.stopConfirmationId = undefined;
+	}
+
+	private requestStopSelectedRun(): boolean {
+		if (!this.selectedId) return false;
 		const run = this.store.list().find((item) => item.id === this.selectedId);
-		if (!run || run.status !== "running") return;
-		if (this.confirmStopId === run.id) {
-			this.store.stop(run.id);
-			this.confirmStopId = undefined;
-		} else {
-			this.confirmStopId = run.id;
+		if (!run || run.status !== "running") {
+			this.clearStopConfirmation();
+			return false;
 		}
+		if (this.stopConfirmationId === run.id) {
+			this.clearStopConfirmation();
+			return this.store.stop(run.id);
+		}
+		this.clearStopConfirmation();
+		this.stopConfirmationId = run.id;
+		this.stopConfirmationTimer = setTimeout(() => {
+			this.stopConfirmationId = undefined;
+			this.stopConfirmationTimer = undefined;
+			this.tui.requestRender();
+		}, 3000);
+		this.stopConfirmationTimer.unref?.();
+		return false;
 	}
 
 	private renderList(width: number): string[] {
@@ -438,7 +481,7 @@ class FleetOverlay {
 				const selected = run.id === this.selectedId;
 				const prefix = selected ? this.theme.fg("accent", "› ") : "  ";
 				const usage = getUsageText(run);
-				const meta = `${run.status}${run.model ? ` · ${run.model}` : ""} · ${formatDuration(run.startedAt, run.endedAt)}${usage ? ` · ${usage}` : ""}`;
+				const meta = `${run.stopping ? "stopping" : run.status}${run.model ? ` · ${run.model}` : ""} · ${formatDuration(run.startedAt, run.endedAt)}${usage ? ` · ${usage}` : ""}`;
 				const label = `${getStatusIcon(run, this.theme)} #${run.id} ${run.agent}  ${singleLine(run.task)}`;
 				const line = `${prefix}${selected ? this.theme.bg("selectedBg", this.theme.fg("text", label)) : label}`;
 				lines.push(truncateToWidth(line, width, "…"));
@@ -446,11 +489,8 @@ class FleetOverlay {
 			}
 		}
 		lines.push("");
-		if (this.confirmStopId) {
-			lines.push(this.theme.fg("warning", `Press x again to stop #${this.confirmStopId}`));
-		} else {
-			lines.push(this.theme.fg("dim", "↑↓/jk/Ctrl+P,N select · Enter web UI · i inspect here · x stop · Esc close"));
-		}
+		const stopHint = this.stopConfirmationId === this.selectedId ? "x again stop · other key cancel" : "x x stop";
+		lines.push(this.theme.fg("dim", `↑↓/jk/Ctrl+P,N select · Enter web UI · i inspect here · ${stopHint} · Esc close`));
 		return lines;
 	}
 
@@ -469,15 +509,12 @@ class FleetOverlay {
 		const start = Math.max(0, transcript.length - height - offset);
 		const visible = transcript.slice(start, start + height);
 		const usage = getUsageText(run);
-		const meta = `${run.status}${run.model ? ` · ${run.model}` : ""} · ${formatDuration(run.startedAt, run.endedAt)}${usage ? ` · ${usage}` : ""}`;
+		const meta = `${run.stopping ? "stopping" : run.status}${run.model ? ` · ${run.model}` : ""} · ${formatDuration(run.startedAt, run.endedAt)}${usage ? ` · ${usage}` : ""}`;
 		const header = `${getStatusIcon(run, this.theme)} ${this.theme.fg("accent", `#${run.id}`)} ${this.theme.fg("toolTitle", this.theme.bold(run.agent))} ${this.theme.fg("dim", meta)}`;
 		const lines = [truncateToWidth(header, width), this.theme.fg("borderMuted", "─".repeat(width)), ...visible];
 		lines.push(this.theme.fg("borderMuted", "─".repeat(width)));
-		if (this.confirmStopId) {
-			lines.push(this.theme.fg("warning", `Press x again to stop #${this.confirmStopId}`));
-		} else {
-			lines.push(this.theme.fg("dim", "↑↓/jk/Ctrl+P,N/trackpad scroll · Home/End jump · PgUp/PgDn · x stop · Esc back"));
-		}
+		const stopHint = this.stopConfirmationId === this.selectedId ? "x again stop · other key cancel" : "x x stop";
+		lines.push(this.theme.fg("dim", `↑↓/jk/Ctrl+P,N/trackpad scroll · Home/End jump · PgUp/PgDn · ${stopHint} · Esc back`));
 		return lines;
 	}
 

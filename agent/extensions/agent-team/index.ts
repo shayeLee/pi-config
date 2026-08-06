@@ -42,6 +42,63 @@ const MAX_PARALLEL_TASKS = 8;
 const MAX_CONCURRENCY = 4;
 const COLLAPSED_ITEM_COUNT = 10;
 const PER_TASK_OUTPUT_CAP = 50 * 1024;
+const MAX_FLEET_TOOL_UPDATE_BYTES = 48 * 1024;
+const MAX_FLEET_TRANSIENT_BYTES = 256 * 1024;
+const FLEET_TRUNCATION_MARKER = "\n\n[Fleet live output truncated]";
+
+function capFleetText(value: string, maxBytes: number): { text: string; truncated: boolean } {
+	if (maxBytes <= 0) return { text: "", truncated: value.length > 0 };
+	if (Buffer.byteLength(value) <= maxBytes) return { text: value, truncated: false };
+	const marker = Buffer.byteLength(FLEET_TRUNCATION_MARKER) <= maxBytes ? FLEET_TRUNCATION_MARKER : "";
+	const limit = maxBytes - Buffer.byteLength(marker);
+	let low = 0;
+	let high = value.length;
+	while (low < high) {
+		const middle = Math.ceil((low + high) / 2);
+		if (Buffer.byteLength(value.slice(0, middle)) <= limit) low = middle;
+		else high = middle - 1;
+	}
+	return { text: value.slice(0, low) + marker, truncated: true };
+}
+
+function fleetToolUpdateBytes(update: { content: Array<{ type: string; text?: string }>; actualDiff?: string }): number {
+	return update.content.reduce((total, part) => total + (part.text ? Buffer.byteLength(part.text) : 0), 0) + (update.actualDiff ? Buffer.byteLength(update.actualDiff) : 0);
+}
+
+function fleetToolContent(value: unknown, maxBytes: number): { content: Array<{ type: string; text?: string }>; truncated: boolean } {
+	if (!Array.isArray(value)) return { content: [], truncated: false };
+	let remaining = maxBytes;
+	let truncated = false;
+	const content: Array<{ type: string; text?: string }> = [];
+	for (let index = 0; index < value.length; index++) {
+		const part = value[index];
+		if (content.length >= 64) {
+			truncated = true;
+			break;
+		}
+		if (part?.type !== "text") {
+			content.push({ type: typeof part?.type === "string" ? part.type : "unknown" });
+			continue;
+		}
+		const capped = capFleetText(typeof part.text === "string" ? part.text : "", remaining);
+		content.push({ type: "text", text: capped.text });
+		truncated ||= capped.truncated;
+		remaining -= Buffer.byteLength(capped.text);
+		if (remaining <= 0) {
+			truncated ||= index < value.length - 1;
+			break;
+		}
+	}
+	return { content, truncated };
+}
+
+function fleetActualEditDiff(result: unknown, maxBytes: number): { text?: string; truncated: boolean } {
+	if (!isRecord(result) || !isRecord(result.details)) return { truncated: false };
+	const candidate = typeof result.details.diff === "string" ? result.details.diff : typeof result.details.patch === "string" ? result.details.patch : undefined;
+	if (candidate === undefined) return { truncated: false };
+	const capped = capFleetText(candidate, maxBytes);
+	return { text: capped.text, truncated: capped.truncated };
+}
 
 function formatTokens(count: number): string {
 	if (count < 1000) return count.toString();
@@ -543,20 +600,62 @@ async function runSingleAgent(
 		step,
 	};
 	let childProcess: ReturnType<typeof spawn> | null = null;
+	let childPid: number | undefined;
 	let forceKillTimer: ReturnType<typeof setTimeout> | undefined;
+	let terminationStarted = false;
 	let stopRequested = false;
 	let parentAborted = false;
 	let settled = false;
 
-	const terminateProcess = () => {
-		if (!childProcess || childProcess.exitCode !== null || childProcess.signalCode !== null) return;
-		childProcess.kill("SIGTERM");
-		forceKillTimer = setTimeout(() => {
-			if (childProcess && childProcess.exitCode === null && childProcess.signalCode === null) {
-				childProcess.kill("SIGKILL");
+	const clearForceKillTimerIfGroupGone = () => {
+		if (process.platform === "win32" || !childPid || !forceKillTimer) return;
+		try {
+			process.kill(-childPid, 0);
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ESRCH") {
+				clearTimeout(forceKillTimer);
+				forceKillTimer = undefined;
 			}
+		}
+	};
+
+	const sendTerminationSignal = (signal: NodeJS.Signals): boolean => {
+		if (!childPid) return false;
+		if (process.platform !== "win32") {
+			try {
+				// The detached child is the process-group leader. Its descendants remain addressable
+				// by this PGID even after the leader itself has exited.
+				process.kill(-childPid, signal);
+				return true;
+			} catch {
+				return false; // ESRCH is the expected race when the entire group is already gone.
+			}
+		}
+		try {
+			// Best effort only: taskkill /T can miss descendants if the root process has
+			// already exited. A reliable Windows tree lifetime requires a Job Object.
+			const killer = spawn("taskkill.exe", ["/PID", String(childPid), "/T", ...(signal === "SIGKILL" ? ["/F"] : [])], {
+				shell: false,
+				stdio: "ignore",
+				windowsHide: true,
+			});
+			killer.on("error", () => childProcess?.kill(signal));
+			killer.unref();
+			return true;
+		} catch {
+			return childProcess?.kill(signal) ?? false;
+		}
+	};
+
+	const terminateProcess = () => {
+		if (terminationStarted || !childPid) return;
+		terminationStarted = true;
+		sendTerminationSignal("SIGTERM");
+		forceKillTimer = setTimeout(() => {
+			forceKillTimer = undefined;
+			sendTerminationSignal("SIGKILL");
 		}, 5000);
-		forceKillTimer.unref?.();
+		clearForceKillTimerIfGroupGone();
 	};
 
 	const fleetRun = fleetStore.add({
@@ -564,6 +663,7 @@ async function runSingleAgent(
 		agent: currentResult.agent,
 		task: currentResult.task,
 		messages: currentResult.messages,
+		toolUpdates: {},
 		usage: currentResult.usage,
 		model: currentResult.model,
 		stop: () => {
@@ -576,10 +676,36 @@ async function runSingleAgent(
 	currentResult.runId = fleetRun.id;
 	currentResult.startedAt = fleetRun.startedAt;
 
+	const updateFleetTool = (
+		toolCallId: string,
+		toolName: string,
+		phase: "streaming" | "completed",
+		result: unknown,
+		isError = false,
+	) => {
+		const usedBytes = Object.entries(fleetRun.toolUpdates)
+			.filter(([id]) => id !== toolCallId)
+			.reduce((total, [, update]) => total + fleetToolUpdateBytes(update), 0);
+		const remaining = Math.max(0, Math.min(MAX_FLEET_TOOL_UPDATE_BYTES, MAX_FLEET_TRANSIENT_BYTES - usedBytes));
+		const diff = phase === "completed" ? fleetActualEditDiff(result, Math.min(16 * 1024, remaining)) : { truncated: false };
+		const contentBudget = Math.max(0, remaining - (diff.text ? Buffer.byteLength(diff.text) : 0));
+		const content = fleetToolContent(isRecord(result) ? result.content : undefined, contentBudget);
+		fleetRun.toolUpdates[toolCallId] = {
+			toolName,
+			phase,
+			content: content.content,
+			isError,
+			contentTruncated: content.truncated,
+			actualDiffTruncated: diff.truncated,
+			actualDiff: diff.text,
+		};
+	};
+
 	const abortFromParent = () => {
 		parentAborted = true;
 		if (!stopRequested) {
 			stopRequested = true;
+			fleetStore.markStopping(fleetRun);
 			terminateProcess();
 		}
 	};
@@ -613,12 +739,23 @@ async function runSingleAgent(
 			const invocation = getPiInvocation(args);
 			const proc = spawn(invocation.command, invocation.args, {
 				cwd: cwd ?? defaultCwd,
+				detached: process.platform !== "win32",
 				shell: false,
 				stdio: ["ignore", "pipe", "pipe"],
 			});
 			childProcess = proc;
+			childPid = proc.pid;
 			if (stopRequested) terminateProcess();
 			let buffer = "";
+			const durableToolResultIds = new Set<string>();
+			const appendDurableMessage = (message: Message): boolean => {
+				if (message.role === "toolResult") {
+					if (durableToolResultIds.has(message.toolCallId)) return false;
+					durableToolResultIds.add(message.toolCallId);
+				}
+				currentResult.messages.push(message);
+				return true;
+			};
 
 			const processLine = (line: string) => {
 				if (!line.trim()) return;
@@ -631,7 +768,8 @@ async function runSingleAgent(
 
 				if (event.type === "message_end" && event.message) {
 					const msg = event.message as Message;
-					currentResult.messages.push(msg);
+					if (!appendDurableMessage(msg)) return;
+					if (msg.role === "toolResult") delete fleetRun.toolUpdates[msg.toolCallId];
 
 					if (msg.role === "assistant") {
 						currentResult.usage.turns++;
@@ -651,8 +789,26 @@ async function runSingleAgent(
 					emitUpdate();
 				}
 
+				// Both message_end and the legacy tool_result_end event can carry a durable
+				// tool result. appendDurableMessage deduplicates them by toolCallId.
+				// Tool execution events below are Fleet-only transient state and cannot
+				// affect content, details, or chain {previous}.
+
 				if (event.type === "tool_result_end" && event.message) {
-					currentResult.messages.push(event.message as Message);
+					const msg = event.message as Message;
+					if (appendDurableMessage(msg)) {
+						if (msg.role === "toolResult") delete fleetRun.toolUpdates[msg.toolCallId];
+						emitUpdate();
+					}
+				}
+
+				if (event.type === "tool_execution_update" && event.toolCallId) {
+					updateFleetTool(event.toolCallId, typeof event.toolName === "string" ? event.toolName : "tool", "streaming", event.partialResult);
+					emitUpdate();
+				}
+
+				if (event.type === "tool_execution_end" && event.toolCallId) {
+					updateFleetTool(event.toolCallId, typeof event.toolName === "string" ? event.toolName : "tool", "completed", event.result, Boolean(event.isError));
 					emitUpdate();
 				}
 			};
@@ -670,6 +826,7 @@ async function runSingleAgent(
 
 			proc.on("close", (code) => {
 				if (buffer.trim()) processLine(buffer);
+				clearForceKillTimerIfGroupGone();
 				resolve(code ?? 0);
 			});
 
@@ -686,7 +843,7 @@ async function runSingleAgent(
 		return currentResult;
 	} finally {
 		settled = true;
-		if (forceKillTimer) clearTimeout(forceKillTimer);
+		if (forceKillTimer && !stopRequested) clearTimeout(forceKillTimer);
 		if (signal) signal.removeEventListener("abort", abortFromParent);
 		currentResult.endedAt = Date.now();
 		let fleetStatus: Exclude<FleetRunStatus, "running">;
@@ -754,7 +911,7 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("session_shutdown", async (_event, ctx) => {
 		for (const run of fleetStore.list()) {
-			if (run.status === "running") run.stop();
+			if (run.status === "running") fleetStore.stop(run.id);
 		}
 		if (ctx.mode === "tui") ctx.ui.setWidget("agent-team-fleet", undefined);
 		fleetStore.clear();

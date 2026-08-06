@@ -91,7 +91,8 @@ pi --mode json -p --no-session
 Pi JSON 模式按行输出事件。扩展解析每一行，并主要采集：
 
 - `message_end`：一条 user、assistant 或 toolResult 消息已经结束。
-- `tool_result_end`：兼容性事件；存在时同样保存其中的消息。
+- `tool_execution_update` / `tool_execution_end`：仅用于 Fleet 的运行中展示；不会写入 durable 消息记录。
+- `tool_result_end`：旧版 runner 的兼容事件；存在时会采集其中的 durable toolResult。若同一 `toolCallId` 也收到 `message_end`，仅保留一次，避免重复。
 
 所有采集到的消息保存在 `SingleResult.messages` 中。对于 assistant 消息，扩展还累计：
 
@@ -214,15 +215,15 @@ TUI 会在编辑器下方显示当前 session 的 FleetView：
 按 `Ctrl+Alt+F` 或运行 `/subagents` 打开对话浮层。列表中可以：
 
 - 使用方向键、`j` / `k` 或 `Ctrl+N` / `Ctrl+P` 选择子代理；
-- 按 `Enter` 在默认浏览器打开本机只读 Web UI，查看任务、实时状态、assistant 文本、工具调用和工具结果；页面只监听 `127.0.0.1`，关闭 Pi 后不可访问；
+- 按 `Enter` 在本机只读 Web UI 查看任务、实时状态、assistant 文本、工具调用和工具结果；macOS 明确使用 Safari，Windows/Linux 使用系统默认浏览器。页面只监听 `127.0.0.1`，关闭 Pi 后不可访问；
 - 按 `i` 保持在终端内查看同样的对话详情；
 - 在对话中使用方向键、`j` / `k`、`Ctrl+N` / `Ctrl+P`、`PageUp` / `PageDown`、鼠标滚轮或触摸板滚动；
 - 在对话中使用 `Home` / `End` 回到内容顶部或底部；
-- 对运行中的子代理连续按两次 `x` 确认停止；
+- 连续按两次 `x` 停止运行中的子代理；首次按下后 3 秒内再按一次确认，其他按键会取消；
 - 按 `Esc` 返回列表，再按一次关闭浮层。
 
 进入对话详情时会临时启用终端 mouse tracking，返回列表或关闭浮层时恢复；agent 列表不响应触摸板滑动。Warp 需要先在 `Settings → Features` 开启 `Enable Mouse Reporting` 和 `Scroll Reporting`；按住 `Shift` 滚动或选择时，事件交还给 Warp。
 
-停止操作针对单个子进程：先发送 `SIGTERM`，5 秒后仍未退出则发送 `SIGKILL`。已采集的消息和部分输出会保留，终态标记为 `stopped`，与正常完成和失败分开显示。Parallel 中停止一个任务不会终止其他任务；Chain 中停止当前步骤会结束整条 chain，不再启动后续步骤。
+停止操作针对单个子进程：在 POSIX 平台向独立进程组发送 `SIGTERM`，5 秒后仍有成员则发送 `SIGKILL`；已退出组长的后代仍会被该进程组信号覆盖。Windows 使用 `taskkill /T` 尝试终止进程树；这属于 best-effort，若根进程已先退出，后代可能无法被可靠发现或终止。已采集的消息和部分输出会保留，终态标记为 `stopped`，与正常完成和失败分开显示。Parallel 中停止一个任务不会终止其他任务；Chain 中停止当前步骤会结束整条 chain，不再启动后续步骤。
 
 FleetView、对话浮层和运行注册表只消费现有的 JSON 事件与 `SingleResult` 引用，不改变主代理收到的 `content`、结构化 `details` 或 `{previous}` 传递规则。当前子进程仍使用一次性的 `--no-session` print 模式，不支持运行中 steer。
