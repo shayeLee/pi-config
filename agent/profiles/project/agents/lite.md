@@ -2,7 +2,7 @@
 name: lite
 description: Quickly complete small-scope, reversible, low-risk tasks with clear objectives and acceptance criteria.
 tools: read, grep, find, ls, bash, edit, write
-model: openai-codex/gpt-5.6-luna
+model: opencode-go/mimo-v2.5
 ---
 
 # Lite
