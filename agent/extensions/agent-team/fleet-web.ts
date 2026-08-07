@@ -507,7 +507,7 @@ function addEntry(title, body, klass = "", collapsible = false) {
 	text(heading, title);
 	text(pre, body);
 	entry.append(heading, pre);
-	if (collapsible && body.split("\\n").length > 5) {
+	if (collapsible && body.split("\\n").length > 8) {
 		entry.classList.add("collapsible");
 		const toggle = document.createElement("button");
 		toggle.className = "toggle";
@@ -823,7 +823,7 @@ function addToolExecution(call, result, update, run, unmatchedUpdate = false) {
 		output.className = "tool-output" + (result && result.isError ? " error" : "");
 		appendAnsiText(output, value);
 		entry.append(divider, outputLabel, output);
-		if (result && value.split("\\n").length > 5) {
+		if (result && value.split("\\n").length > 8) {
 			entry.classList.add("collapsible");
 			setTimeout(() => {
 				if (entry.isConnected && !entry.classList.contains("expanded")) entry.classList.add("collapse-ready");
