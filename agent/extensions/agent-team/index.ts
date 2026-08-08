@@ -26,7 +26,7 @@ import {
 	getMarkdownTheme,
 	withFileMutationQueue,
 } from "@earendil-works/pi-coding-agent";
-import { Container, Markdown, Spacer, Text } from "@earendil-works/pi-tui";
+import { Container, Markdown, Spacer, Text, truncateToWidth, type Component, visibleWidth } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { type AgentConfig, type AgentScope, discoverAgents } from "./agents.ts";
 import { FleetStore, type FleetRunStatus, type RestoredFleetRun } from "./fleet-store.ts";
@@ -40,6 +40,29 @@ const PER_TASK_OUTPUT_CAP = 50 * 1024;
 const MAX_FLEET_TOOL_UPDATE_BYTES = 48 * 1024;
 const MAX_FLEET_TRANSIENT_BYTES = 256 * 1024;
 const FLEET_TRUNCATION_MARKER = "\n\n[Fleet live output truncated]";
+
+/** Renders a subagent tool row in the opencode style: subtle background + left rail. */
+class OpencodeToolShell implements Component {
+	constructor(
+		private readonly inner: Component,
+		private readonly background: (text: string) => string,
+		private readonly rail: (text: string) => string,
+	) {}
+
+	render(width: number): string[] {
+		if (width <= 0) return [""];
+		const contentWidth = Math.max(1, width - 2);
+		return this.inner.render(contentWidth).map((line) => {
+			const clipped = truncateToWidth(line, contentWidth, "");
+			const padding = " ".repeat(Math.max(0, contentWidth - visibleWidth(clipped)));
+			return truncateToWidth(this.background(`${this.rail("│")} ${clipped}${padding}`), width, "");
+		});
+	}
+
+	invalidate(): void {
+		this.inner.invalidate();
+	}
+}
 
 function capFleetText(value: string, maxBytes: number): { text: string; truncated: boolean } {
 	if (maxBytes <= 0) return { text: "", truncated: value.length > 0 };
@@ -1167,7 +1190,11 @@ export default function (pi: ExtensionAPI) {
 						theme.fg("accent", step.agent) +
 						theme.fg("dim", ` ${cleanTask}`);
 				}
-				return new Text(text, 0, 0);
+				return new OpencodeToolShell(
+					new Text(text, 0, 0),
+					(s) => theme.bg("toolPendingBg", s),
+					(s) => theme.fg("muted", s),
+				);
 			}
 			if (args.tasks && args.tasks.length > 0) {
 				let text =
@@ -1177,7 +1204,11 @@ export default function (pi: ExtensionAPI) {
 				for (const t of args.tasks) {
 					text += `\n  ${theme.fg("accent", t.agent)}${theme.fg("dim", ` ${t.task}`)}`;
 				}
-				return new Text(text, 0, 0);
+				return new OpencodeToolShell(
+					new Text(text, 0, 0),
+					(s) => theme.bg("toolPendingBg", s),
+					(s) => theme.fg("muted", s),
+				);
 			}
 			const agentName = args.agent || "...";
 			const task = args.task || "...";
@@ -1186,14 +1217,31 @@ export default function (pi: ExtensionAPI) {
 				theme.fg("accent", agentName) +
 				theme.fg("muted", ` [${scope}]`);
 			text += `\n  ${theme.fg("dim", task)}`;
-			return new Text(text, 0, 0);
+			return new OpencodeToolShell(
+				new Text(text, 0, 0),
+				(s) => theme.bg("toolPendingBg", s),
+				(s) => theme.fg("muted", s),
+			);
 		},
 
-		renderResult(result, { expanded }, theme, _context) {
+		renderResult(result, { expanded, isPartial }, theme, context) {
 			const details = result.details as SubagentDetails | undefined;
+			const hasRunningResult = details?.results.some((item) => item.exitCode === -1) ?? false;
+			const hasFailedResult = details?.results.some((item) => item.exitCode !== -1 && isFailedResult(item)) ?? false;
+			const resultBackground = isPartial || hasRunningResult
+				? "toolPendingBg"
+				: context.isError || hasFailedResult
+					? "toolErrorBg"
+					: "toolSuccessBg";
+			const shell = (component: Component) =>
+				new OpencodeToolShell(
+					component,
+					(s) => theme.bg(resultBackground, s),
+					(s) => theme.fg("muted", s),
+				);
 			if (!details || details.results.length === 0) {
 				const text = result.content[0];
-				return new Text(text?.type === "text" ? text.text : "(no output)", 0, 0);
+				return shell(new Text(text?.type === "text" ? text.text : "(no output)", 0, 0));
 			}
 
 			const mdTheme = getMarkdownTheme();
@@ -1299,7 +1347,7 @@ export default function (pi: ExtensionAPI) {
 							container.addChild(new Markdown(finalOutput.trim(), 1, 0, mdTheme));
 						}
 					}
-					return container;
+					return shell(container);
 				}
 
 				const container = new Container();
@@ -1312,11 +1360,11 @@ export default function (pi: ExtensionAPI) {
 				container.addChild(new Text(header, 0, 0));
 				if (isError && !isStopped && r.errorMessage) {
 					container.addChild(new Text(theme.fg("error", `Error: ${r.errorMessage}`), 1, 0));
-					return container;
+					return shell(container);
 				}
 				if (displayItems.length === 0 && !finalOutput) {
 					container.addChild(new Text(theme.fg("muted", "(no output)"), 1, 0));
-					return container;
+					return shell(container);
 				}
 
 				addCollapsedActivity(container, displayItems, COLLAPSED_ITEM_COUNT);
@@ -1327,7 +1375,7 @@ export default function (pi: ExtensionAPI) {
 					addSectionTitle(container, isRunning ? "Progress" : "Result");
 					container.addChild(new Markdown(finalOutput.trim(), 1, 0, mdTheme));
 				}
-				return container;
+				return shell(container);
 			}
 
 			const aggregateUsage = (results: SingleResult[]) => {
@@ -1410,7 +1458,7 @@ export default function (pi: ExtensionAPI) {
 						container.addChild(new Spacer(1));
 						container.addChild(new Text(theme.fg("dim", `Total: ${usageStr}`), 0, 0));
 					}
-					return container;
+					return shell(container);
 				}
 
 				const container = new Container();
@@ -1449,7 +1497,7 @@ export default function (pi: ExtensionAPI) {
 					container.addChild(new Text(theme.fg("dim", `Total: ${usageStr}`), 0, 0));
 				}
 				container.addChild(new Text(theme.fg("muted", "Ctrl+O: inspect every call and result"), 0, 0));
-				return container;
+				return shell(container);
 			}
 
 			if (details.mode === "parallel") {
@@ -1515,7 +1563,7 @@ export default function (pi: ExtensionAPI) {
 						container.addChild(new Spacer(1));
 						container.addChild(new Text(theme.fg("dim", `Total: ${usageStr}`), 0, 0));
 					}
-					return container;
+					return shell(container);
 				}
 
 				const container = new Container();
@@ -1555,11 +1603,11 @@ export default function (pi: ExtensionAPI) {
 					}
 				}
 				container.addChild(new Text(theme.fg("muted", "Ctrl+O: inspect every call and result"), 0, 0));
-				return container;
+				return shell(container);
 			}
 
 			const text = result.content[0];
-			return new Text(text?.type === "text" ? text.text : "(no output)", 0, 0);
+			return shell(new Text(text?.type === "text" ? text.text : "(no output)", 0, 0));
 		},
 	});
 }
