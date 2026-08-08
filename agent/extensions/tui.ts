@@ -33,6 +33,94 @@ function block(theme: any, background: string, foreground: string, text: string)
 
 export default function (pi: ExtensionAPI) {
 	let activeTui: { requestRender(): void } | undefined;
+	const CHARS_PER_TOKEN = 4;
+	const TPS_THROTTLE_MS = 250;
+	const MIN_TPS_WINDOW_MS = 250;
+	const MAX_DISPLAY_TPS = 1000;
+	let firstDeltaAt: number | undefined;
+	let deltaChars = 0;
+	let lastTpsRefreshAt = 0;
+	let tpsTimer: ReturnType<typeof setTimeout> | undefined;
+	let tpsText = "0 tok/s";
+
+	function resetTpsMeasurement() {
+		firstDeltaAt = undefined;
+		deltaChars = 0;
+		lastTpsRefreshAt = performance.now();
+		if (tpsTimer !== undefined) {
+			clearTimeout(tpsTimer);
+			tpsTimer = undefined;
+		}
+	}
+
+	function calculateTps(tokens: number, startedAt: number, now = performance.now()): number | undefined {
+		const elapsed = now - startedAt;
+		if (elapsed < 0) return undefined;
+		const effectiveElapsed = Math.max(elapsed, MIN_TPS_WINDOW_MS);
+		return Math.min(MAX_DISPLAY_TPS, Math.round(tokens / (effectiveElapsed / 1000)));
+	}
+
+	function estimateTps(): number | undefined {
+		if (firstDeltaAt === undefined) return undefined;
+		return calculateTps(deltaChars / CHARS_PER_TOKEN, firstDeltaAt);
+	}
+
+	function scheduleTpsRefresh() {
+		if (tpsTimer !== undefined) return;
+		const now = performance.now();
+		const delay = Math.max(0, TPS_THROTTLE_MS - (now - lastTpsRefreshAt));
+		tpsTimer = setTimeout(() => {
+			tpsTimer = undefined;
+			lastTpsRefreshAt = performance.now();
+			const tps = estimateTps();
+			if (tps !== undefined && tps > 0) {
+				tpsText = `~${tps} tok/s`;
+				activeTui?.requestRender();
+			}
+		}, delay);
+	}
+
+	pi.on("message_start", (event) => {
+		if (event.message.role !== "assistant") return;
+		resetTpsMeasurement();
+		tpsText = "0 tok/s";
+		activeTui?.requestRender();
+	});
+
+	pi.on("message_update", (event) => {
+		if (event.message.role !== "assistant") return;
+		const eventType = event.assistantMessageEvent;
+		if (eventType.type !== "text_delta" && eventType.type !== "thinking_delta" && eventType.type !== "toolcall_delta") return;
+
+		const length = (eventType as { delta: string }).delta.length;
+		if (length <= 0) return;
+		if (firstDeltaAt === undefined) firstDeltaAt = performance.now();
+		deltaChars += length;
+		scheduleTpsRefresh();
+	});
+
+	pi.on("message_end", (event) => {
+		if (event.message.role !== "assistant") return;
+		if (tpsTimer !== undefined) {
+			clearTimeout(tpsTimer);
+			tpsTimer = undefined;
+		}
+
+		const outputTokens = event.message.usage?.output ?? 0;
+		if (firstDeltaAt === undefined || outputTokens <= 0) {
+			tpsText = "0 tok/s";
+			resetTpsMeasurement();
+			activeTui?.requestRender();
+			return;
+		}
+
+		const tps = calculateTps(outputTokens, firstDeltaAt);
+		tpsText = tps === undefined ? "0 tok/s" : `${tps} tok/s`;
+		resetTpsMeasurement();
+		activeTui?.requestRender();
+	});
+
+	pi.on("session_shutdown", () => resetTpsMeasurement());
 
 	pi.on("session_start", (_event, ctx) => {
 		if (ctx.mode !== "tui") return;
@@ -124,6 +212,7 @@ export default function (pi: ExtensionAPI) {
 					let modelText = model?.id || "no-model";
 					if (footerData.getAvailableProviderCount() > 1 && model) modelText = `(${model.provider}) ${modelText}`;
 					modelText += thinking;
+					modelText += ` • ${tpsText}`;
 
 					const modelBlock = block(theme, "selectedBg", "accent", modelText);
 					const statsWidth = visibleWidth(statsText);
