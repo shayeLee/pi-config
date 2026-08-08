@@ -23,6 +23,15 @@ const fs = require("node:fs");
 const argv = process.argv.slice(2);
 const logPath = process.env.FAKE_PI_LOG;
 
+const log = (extra) => {
+	if (!logPath) return;
+	try {
+		fs.appendFileSync(logPath, JSON.stringify(extra) + "\n");
+	} catch {
+		/* ignore */
+	}
+};
+
 function argValue(name) {
 	const index = argv.indexOf(name);
 	return index >= 0 && index + 1 < argv.length ? argv[index + 1] : undefined;
@@ -42,12 +51,62 @@ const taskArg = argv.find((arg) => arg.startsWith("Task: ")) || "";
 const task = taskArg.slice("Task: ".length);
 
 if (logPath) {
-	try {
-		fs.appendFileSync(logPath, JSON.stringify({ argv, task, systemPrompt, cwd: process.cwd() }) + "\n");
-	} catch {
-		/* ignore */
-	}
+	log({ argv, task, systemPrompt, cwd: process.cwd() });
 }
+
+// Long-running scenarios used by the stop-flow tests. They emit (or stay
+// silent) and then keep the process alive so the extension's termination
+// path (SIGTERM, then SIGKILL after 5s) has something to signal.
+const aliveAfterWrite =
+	task.includes("SCENARIO:long_running") || task.includes("SCENARIO:stubborn") || task.includes("SCENARIO:descendant");
+if (task.includes("SCENARIO:descendant")) {
+	// Spawn a descendant in the SAME process group (spawn without detached
+	// inherits the leader's group). The leader exits on SIGTERM; the
+	// descendant ignores SIGTERM so the extension must escalate to SIGKILL
+	// and take the whole group down, proving the group-kill semantics in the
+	// README ("已退出组长的后代仍会被该进程组信号覆盖").
+	const { spawn } = require("node:child_process");
+	// The descendant installs its own ignore-SIGTERM handlers and then writes
+	// its own ready marker (via the inherited FAKE_PI_LOG env), so the harness
+	// never aborts before the descendant is actually protected.
+	const descendantScript = [
+		"const fs=require('node:fs');",
+		"process.on('SIGTERM',()=>{});process.on('SIGINT',()=>{});",
+		`fs.appendFileSync(process.env.FAKE_PI_LOG, JSON.stringify({ descendantReady: true, task: ${JSON.stringify(task)} })+'\\n');`,
+		"setInterval(()=>{},1000);",
+	].join("");
+	const child = spawn(process.execPath, ["-e", descendantScript], {
+		stdio: "ignore",
+		env: { ...process.env, FAKE_PI_LOG: logPath },
+	});
+	log({ descendantPid: child.pid, task });
+	process.on("SIGTERM", () => {
+		log({ signal: "SIGTERM", task });
+		process.exit(130);
+	});
+	process.on("SIGINT", () => process.exit(130));
+} else if (task.includes("SCENARIO:long_running")) {
+	// Cooperate: exit promptly on SIGTERM so the harness can assert the signal
+	// was delivered without waiting for the SIGKILL escalation.
+	process.on("SIGTERM", () => {
+		log({ signal: "SIGTERM", task });
+		process.exit(130);
+	});
+	process.on("SIGINT", () => {
+		log({ signal: "SIGINT", task });
+		process.exit(130);
+	});
+} else if (task.includes("SCENARIO:stubborn")) {
+	// Ignore SIGTERM on purpose: the extension must escalate to SIGKILL after
+	// 5 seconds. SIGKILL cannot be caught, so the process is simply killed.
+	process.on("SIGTERM", () => log({ signal: "SIGTERM", task }));
+	process.on("SIGINT", () => {});
+}
+
+// Ready marker: emitted after the signal handlers are installed. The harness
+// polls for it before aborting, avoiding a startup race in slow CI where the
+// abort could arrive before the handlers exist.
+if (aliveAfterWrite) log({ ready: task });
 
 const lines = [];
 const emit = (event) => lines.push(JSON.stringify(event));
@@ -129,4 +188,10 @@ if (task.includes("SCENARIO:tool_result_end_only")) {
 }
 
 const payload = lines.join("\n") + "\n";
-process.stdout.write(payload, () => process.exit(0));
+process.stdout.write(payload, () => {
+	if (aliveAfterWrite) {
+		setTimeout(() => process.exit(0), 60_000);
+	} else {
+		process.exit(0);
+	}
+});

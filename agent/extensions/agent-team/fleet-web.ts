@@ -1,16 +1,17 @@
 import { spawn } from "node:child_process";
 import { createServer, type Server, type ServerResponse } from "node:http";
 import { randomBytes } from "node:crypto";
-import type { FleetRun, FleetStore } from "./fleet-view.ts";
+import type { FleetRun, FleetStore } from "./fleet-store.ts";
 
 const MAX_WEB_RUN_BYTES = 256 * 1024;
 const WEB_TEXT_TRUNCATION = "\n\n[Fleet Web payload truncated]";
-const WEB_RUN_OPTIONS = [
-	{ textBytes: 24 * 1024, messageLimit: 128, contentPartLimit: 32, updateLimit: 64 },
-	{ textBytes: 8 * 1024, messageLimit: 64, contentPartLimit: 16, updateLimit: 32 },
-	{ textBytes: 2 * 1024, messageLimit: 32, contentPartLimit: 8, updateLimit: 16 },
-	{ textBytes: 512, messageLimit: 0, contentPartLimit: 0, updateLimit: 0 },
-] as const;
+const WEB_RUN_OPTIONS = Object.freeze([
+	Object.freeze({ textBytes: 24 * 1024, messageLimit: 128, contentPartLimit: 32, updateLimit: 64 }),
+	Object.freeze({ textBytes: 8 * 1024, messageLimit: 64, contentPartLimit: 16, updateLimit: 32 }),
+	Object.freeze({ textBytes: 2 * 1024, messageLimit: 32, contentPartLimit: 8, updateLimit: 16 }),
+	Object.freeze({ textBytes: 512, messageLimit: 0, contentPartLimit: 0, updateLimit: 0 }),
+] as const);
+export { WEB_RUN_OPTIONS };
 
 type WebContentPart = { type: string; text?: string };
 type WebTextOmission = { chars: number; lines: number };
@@ -63,7 +64,8 @@ type WebRun = {
 	startedAt: number;
 	endedAt?: number;
 };
-type WebRunOptions = (typeof WEB_RUN_OPTIONS)[number];
+
+export type WebRunOptions = (typeof WEB_RUN_OPTIONS)[number];
 
 function capPrefix(value: string, maxBytes: number): string {
 	if (Buffer.byteLength(value) <= maxBytes) return value;
@@ -269,7 +271,7 @@ function webMessage(message: FleetRun["messages"][number], options: WebRunOption
 	return { message: result, omittedAssistantContentParts: 0 };
 }
 
-function webRun(run: FleetRun | undefined, options: WebRunOptions): WebRun | undefined {
+export function webRun(run: FleetRun | undefined, options: WebRunOptions): WebRun | undefined {
 	if (!run) return undefined;
 	const selectedMessages = options.messageLimit ? run.messages.slice(-options.messageLimit) : [];
 	let omittedMessages = run.messages.length - selectedMessages.length;
@@ -318,19 +320,20 @@ function webRun(run: FleetRun | undefined, options: WebRunOptions): WebRun | und
 	};
 }
 
-function selectWebRun(run: FleetRun | undefined, revision: number): WebRun | undefined {
+export function selectWebRun(run: FleetRun | undefined, revision: number): WebRun | undefined {
 	for (const options of WEB_RUN_OPTIONS) {
 		const candidate = webRun(run, options);
 		if (Buffer.byteLength(JSON.stringify({ revision, run: candidate })) <= MAX_WEB_RUN_BYTES) return candidate;
 	}
 	const minimal = webRun(run, WEB_RUN_OPTIONS[WEB_RUN_OPTIONS.length - 1]);
 	if (Buffer.byteLength(JSON.stringify({ revision, run: minimal })) <= MAX_WEB_RUN_BYTES) return minimal;
+	// Last-resort bounded shape: even the id cannot exceed the cap.
 	return minimal
-		? { ...minimal, agent: "", task: "", model: undefined }
+		? { ...minimal, id: capWebText(minimal.id, 1024), agent: "", task: "", model: undefined }
 		: undefined;
 }
 
-function serializeFleetRun(run: WebRun | undefined, revision: number): string {
+export function serializeFleetRun(run: WebRun | undefined, revision: number): string {
 	const payload = { revision, run };
 	return JSON.stringify(payload);
 }
@@ -1062,6 +1065,11 @@ events.onerror = () => {
 </script>`;
 
 /** A loopback-only, read-only view that lives for the current Pi session. */
+export interface FleetWebServerOptions {
+	/** Override the default browser-open step (used by tests to stub it out). */
+	openBrowser?: (url: string) => Promise<void>;
+}
+
 export class FleetWebServer {
 	private server?: Server;
 	private port?: number;
@@ -1076,7 +1084,10 @@ export class FleetWebServer {
 	private lifecycle: Promise<void> = Promise.resolve();
 	private closing = false;
 
-	constructor(private store: FleetStore) {}
+	constructor(
+		private store: FleetStore,
+		private readonly options: FleetWebServerOptions = {},
+	) {}
 
 	async open(runId: string): Promise<void> {
 		const port = await this.enqueue(async () => {
@@ -1086,6 +1097,10 @@ export class FleetWebServer {
 			return this.port;
 		});
 		const url = `http://127.0.0.1:${port}/fleet/${this.token}/#${encodeURIComponent(runId)}`;
+		if (this.options.openBrowser) {
+			await this.options.openBrowser(url);
+			return;
+		}
 		const command = process.platform === "darwin" ? "open" : process.platform === "win32" ? "cmd" : "xdg-open";
 		const args = process.platform === "darwin" ? ["-a", "Safari", url] : process.platform === "win32" ? ["/c", "start", "", url] : [url];
 		await new Promise<void>((resolve, reject) => {

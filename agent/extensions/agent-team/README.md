@@ -2,6 +2,21 @@
 
 `agent-team` 扩展向 Pi 注册 `subagent` 工具，通过独立的 Pi 子进程运行项目级或用户级子角色。扩展只负责角色发现、任务转发、事件采集和结果汇总，不包含具体领域的角色提示词。
 
+## 核心原则：数据与展示分离
+
+数据流与展示是本扩展的两条独立主线，必须保持单向、可替换的分层：
+
+- **数据流层**（`agents.ts` + `index.ts`）：负责角色发现、任务转发、子进程编排、JSON 事件采集、结果汇总与失败判定。其产物只有两个：`content`（进入主代理模型上下文）和 `details`（结构化完整记录）。
+- **展示层**（`fleet-view.ts` + `fleet-web.ts`）：只消费数据流层的事件与 `SingleResult` 引用，负责 TUI FleetView、对话浮层和只读 Web UI。展示层不持有数据流逻辑，也不反向写入任何数据。
+- **中立契约**（`fleet-store.ts`）：两层共享的 Fleet 运行状态容器。数据流层向它发布状态与事件，展示层订阅它渲染；它不 import 任何一层，可单独被替换。停止操作是显式的控制端口——展示层调用 `FleetStore.stop()` 请求、由数据流层持有的 `run.stop()` 回调实际执行进程终止，不属于“只读消费”的违例。
+
+由此派生两条硬性规则：
+
+1. **单向依赖**：数据流层不得 import 或依赖展示层的渲染组件；两层都只依赖中立契约 `fleet-store.ts`。唯一例外是扩展入口（composition root）需要 import `FleetWidget` / `showFleetOverlay` 等来注册 UI 组件，属于装配行为，不属于数据流逻辑依赖（`harness/presentation.mjs` [0] 用静态断言守护该边界）。
+2. **只读消费**：展示层不得修改主代理收到的 `content`、结构化 `details` 或 `{previous}` 传递规则；删除或替换展示层不应影响数据流产物（`harness/presentation.mjs` 用深冻结 fixture 断言序列化器不改源数据）。
+
+两层之间的契约由类型显式定义：`FleetRun`、`SingleResult`、`Message`、`FleetUsage`、`FleetToolUpdate`。新增能力时，先确定它属于数据流还是展示；跨层通信一律通过 `FleetStore` 的订阅者事件与控制端口，不直接互相调用内部函数。
+
 ## 数据流概览
 
 ```text
@@ -227,3 +242,58 @@ TUI 会在编辑器下方显示当前 session 的 FleetView：
 停止操作针对单个子进程：在 POSIX 平台向独立进程组发送 `SIGTERM`，5 秒后仍有成员则发送 `SIGKILL`；已退出组长的后代仍会被该进程组信号覆盖。Windows 使用 `taskkill /T` 尝试终止进程树；这属于 best-effort，若根进程已先退出，后代可能无法被可靠发现或终止。已采集的消息和部分输出会保留，终态标记为 `stopped`，与正常完成和失败分开显示。Parallel 中停止一个任务不会终止其他任务；Chain 中停止当前步骤会结束整条 chain，不再启动后续步骤。
 
 FleetView、对话浮层和运行注册表只消费现有的 JSON 事件与 `SingleResult` 引用，不改变主代理收到的 `content`、结构化 `details` 或 `{previous}` 传递规则。当前子进程仍使用一次性的 `--no-session` print 模式，不支持运行中 steer。
+
+## 自动化测试
+
+`harness/` 下的两个独立 Node harness（全程不调用真实模型）守护核心原则的两层：
+
+- `harness/run.mjs`（数据流）：加载真实 `index.ts`，用临时 fake `pi` 可执行文件驱动子代理，
+  断言数据流产物语义——`tool_result_end` 兼容与去重、transient 事件隔离、chain `{previous}`
+  不泄漏中间过程，以及停止流程（AbortSignal 中止 → SIGTERM → 5 秒后 SIGKILL 升级、
+  `exitCode 130` / `stopped` 状态、组长退出后同组后代仍被进程组信号终止）。
+- `harness/presentation.mjs`（展示层）：加载 `fleet-store.ts` / `fleet-view.ts` /
+  `fleet-web.ts`，断言展示层作为只读消费者的行为——静态依赖边界（数据流层只从
+  `fleet-store.ts` 取状态、`fleet-view.ts` 只向 composition root 提供 UI）、FleetStore
+  状态机与 prune/restore 上限、FleetWidget 的 6 条上限 / 15 秒保留 / 截断、Web payload
+  截断与 256 KiB 上限（含超长 id 兜底）、深冻结 fixture 验证序列化不改源数据、
+  FleetWebServer 的 token 鉴权 / revision / SSE / close（浏览器打开注入桩，不真实启动）。
+
+```bash
+node agent/extensions/agent-team/harness/run.mjs
+node agent/extensions/agent-team/harness/presentation.mjs
+```
+
+## 真实 Pi 冒烟清单（剩余手测项）
+
+自动 harness 不涉及真实 TUI 渲染与浏览器打开；这两个交互面仍需在发布前手测。使用临时目录，
+避免 Edit 修改真实项目：
+
+```bash
+mkdir -p /tmp/agent-team-smoke
+cd /tmp/agent-team-smoke
+printf 'before\n' > sample.txt
+pi
+```
+
+### 1. 基本子代理与 Fleet（真实 TUI 渲染与浏览器）
+
+在 Pi 中要求主代理：
+
+```text
+使用 subagent 工具调用 worker，任务是：读取当前目录的 sample.txt，并只回复文件内容。
+```
+
+预期：主对话返回 `before`；按 `Ctrl+Alt+F` 或执行 `/subagents` 能打开 Fleet；选中任务后，
+`Enter` 打开本机 Web UI，`i` 打开终端内详情。真实 TUI 渲染、浮层交互（含停止时连续按两次
+`x` 的确认流程）和浏览器打开只能在此验证；其底层状态与停止语义已由自动 harness 覆盖。
+
+### 2. Edit 与实际 diff（浏览器内渲染）
+
+```text
+使用 subagent 工具调用 worker，任务是：使用 edit 工具把 sample.txt 中的 before 改为 after，然后读取文件确认结果。
+```
+
+预期：`cat sample.txt` 输出 `after`；Fleet 中仅显示工具返回的 actual diff，删除行为红色、
+新增行为绿色。edit 参数清理与 diff 序列化已自动化，但浏览器内的 diff 渲染需手测。
+
+更多细节见 `harness/README.md`。

@@ -29,13 +29,8 @@ import {
 import { Container, Markdown, Spacer, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { type AgentConfig, type AgentScope, discoverAgents } from "./agents.ts";
-import {
-	FleetStore,
-	FleetWidget,
-	showFleetOverlay,
-	type FleetRunStatus,
-	type RestoredFleetRun,
-} from "./fleet-view.ts";
+import { FleetStore, type FleetRunStatus, type RestoredFleetRun } from "./fleet-store.ts";
+import { FleetWidget, showFleetOverlay } from "./fleet-view.ts";
 import { FleetWebServer } from "./fleet-web.ts";
 
 const MAX_PARALLEL_TASKS = 8;

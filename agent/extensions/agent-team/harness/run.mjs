@@ -185,7 +185,7 @@ async function main() {
 		if (!subagent) process.exit(1);
 
 		const ctx = { cwd: projectDir };
-		const run = (params) => subagent.execute("harness-call", params, undefined, undefined, ctx);
+		const run = (params, signal) => subagent.execute("harness-call", params, signal, undefined, ctx);
 
 		// --- (1) tool_result_end-only keeps a durable toolResult ---------------
 		console.log("\n[1] tool_result_end-only preserves a durable toolResult");
@@ -290,6 +290,170 @@ async function main() {
 		check("agent tools flag passed", toolsIndex >= 0 && step1Call.argv[toolsIndex + 1]?.split(",").includes("bash"));
 		check("system prompt appended via file", step1Call.argv.includes("--append-system-prompt"));
 		check("agent system prompt content reached subagent", step1Call.systemPrompt.includes(SYSTEM_PROMPT_BODY));
+
+		// --- (5)-(8) stop-flow tests: POSIX-only (production uses taskkill /T on
+		// Windows, which has no process-group SIGTERM/SIGKILL semantics) ---------
+		const isWindows = process.platform === "win32";
+		if (isWindows) {
+			console.log("\n[5-8] stop-flow tests skipped on Windows (best-effort taskkill /T, no process-group semantics)");
+		} else {
+
+		// --- (5) stopping a running subagent via the parent AbortSignal ----------
+		console.log("\n[5] abort stops a running subagent (SIGTERM, exit 130, stopped)");
+		const logHasSignal = (taskMarker, signal) =>
+			fs
+				.readFileSync(logPath, "utf8")
+				.split("\n")
+				.filter(Boolean)
+				.map((line) => JSON.parse(line))
+				.some((entry) => entry.signal === signal && typeof entry.task === "string" && entry.task.includes(taskMarker));
+		// fake `pi` logs a ready marker once its signal handlers are installed;
+		// abort only after that so a slow CI cannot race the handlers.
+		const waitForReady = async (taskMarker) => {
+			const deadline = Date.now() + 5000;
+			while (Date.now() < deadline) {
+				const entries = fs
+					.readFileSync(logPath, "utf8")
+					.split("\n")
+					.filter(Boolean)
+					.map((line) => JSON.parse(line));
+				if (entries.some((entry) => entry.ready && typeof entry.ready === "string" && entry.ready.includes(taskMarker))) return;
+				await new Promise((resolve) => setTimeout(resolve, 20));
+			}
+			throw new Error(`fake pi did not become ready for ${taskMarker}`);
+		};
+		const abort5 = new AbortController();
+		const running5 = run({ agent: "worker", task: "SCENARIO:long_running" }, abort5.signal);
+		await waitForReady("SCENARIO:long_running");
+		abort5.abort();
+		const result5 = await running5;
+		const r5 = result5.details.results[0];
+		check("stopped result has exitCode 130", r5.exitCode === 130, String(r5.exitCode));
+		check("stopped result reports stopReason 'stopped'", r5.stopReason === "stopped", String(r5.stopReason));
+		check("parent abort is recorded in errorMessage", typeof r5.errorMessage === "string" && r5.errorMessage.includes("parent"), String(r5.errorMessage));
+		check("partial assistant text kept in transcript", r5.messages.some((m) => m.role === "assistant"));
+		check("SIGTERM reached the subagent process", logHasSignal("SCENARIO:long_running", "SIGTERM"));
+
+		// --- (6) parallel abort stops every running task -------------------------
+		console.log("\n[6] parallel abort stops every running task");
+		const abort6 = new AbortController();
+		const running6 = run(
+			{
+				tasks: [
+					{ agent: "worker", task: "SCENARIO:long_running P1" },
+					{ agent: "worker", task: "SCENARIO:long_running P2" },
+				],
+			},
+			abort6.signal,
+		);
+		await waitForReady("SCENARIO:long_running P1");
+		await waitForReady("SCENARIO:long_running P2");
+		abort6.abort();
+		const result6 = await running6;
+		const r6 = result6.details.results;
+		check("both parallel tasks recorded", r6.length === 2, String(r6.length));
+		check(
+			"both parallel tasks stopped",
+			r6.every((r) => r.exitCode === 130 && r.stopReason === "stopped"),
+			JSON.stringify(r6.map((r) => ({ code: r.exitCode, reason: r.stopReason }))),
+		);
+		check(
+			"SIGTERM reached both subagent processes",
+			logHasSignal("SCENARIO:long_running P1", "SIGTERM") && logHasSignal("SCENARIO:long_running P2", "SIGTERM"),
+		);
+
+		// --- (7) stubborn subagent: SIGKILL escalation after 5s ------------------
+		console.log("\n[7] stubborn subagent is force-killed after the 5s SIGKILL escalation");
+		const abort7 = new AbortController();
+		const running7 = run({ agent: "worker", task: "SCENARIO:stubborn" }, abort7.signal);
+		await waitForReady("SCENARIO:stubborn");
+		const tAbort7 = Date.now();
+		abort7.abort();
+		const result7 = await running7;
+		const elapsed7 = Date.now() - tAbort7;
+		const r7 = result7.details.results[0];
+		check("stubborn stop escalates to SIGKILL after ~5s", elapsed7 >= 5000 && elapsed7 < 12_000, `${elapsed7}ms`);
+		check("force-killed result still reports exitCode 130", r7.exitCode === 130, String(r7.exitCode));
+		check("SIGTERM was delivered before escalation", logHasSignal("SCENARIO:stubborn", "SIGTERM"));
+
+		// --- (8) group kill reaches a descendant after the leader exits ---------
+		// The fake leader spawns a same-group descendant that ignores SIGTERM.
+		// The leader exits on SIGTERM; only the group SIGKILL escalation (5s)
+		// can take the descendant down. This guards the README claim
+		// "已退出组长的后代仍会被该进程组信号覆盖".
+		console.log("\n[8] process-group termination reaches descendants after the leader exits");
+		const waitForDescendantPid = async () => {
+			const deadline = Date.now() + 5000;
+			while (Date.now() < deadline) {
+				const entries = fs
+					.readFileSync(logPath, "utf8")
+					.split("\n")
+					.filter(Boolean)
+					.map((line) => JSON.parse(line));
+				const entry = entries.find((e) => typeof e.descendantPid === "number" && e.task.includes("SCENARIO:descendant"));
+				if (entry) return entry.descendantPid;
+				await new Promise((resolve) => setTimeout(resolve, 20));
+			}
+			throw new Error("descendant pid was never logged");
+		};
+		const abort8 = new AbortController();
+		const running8 = run({ agent: "worker", task: "SCENARIO:descendant" }, abort8.signal);
+		const descendantPid = await waitForDescendantPid();
+		// The descendant writes its own ready marker after installing its
+		// ignore-SIGTERM handlers; only then is aborting safe.
+		const waitForDescendantReady = async () => {
+			const deadline = Date.now() + 5000;
+			while (Date.now() < deadline) {
+				const entries = fs
+					.readFileSync(logPath, "utf8")
+					.split("\n")
+					.filter(Boolean)
+					.map((line) => JSON.parse(line));
+				if (entries.some((entry) => entry.descendantReady === true && entry.task && entry.task.includes("SCENARIO:descendant"))) return;
+				await new Promise((resolve) => setTimeout(resolve, 20));
+			}
+			throw new Error("descendant never became ready");
+		};
+		await waitForDescendantReady();
+		await waitForReady("SCENARIO:descendant");
+		const tAbort8 = Date.now();
+		abort8.abort();
+		const result8 = await running8;
+		const r8 = result8.details.results[0];
+		check("descendant subagent stopped (exit 130)", r8.exitCode === 130 && r8.stopReason === "stopped", JSON.stringify({ code: r8.exitCode, reason: r8.stopReason }));
+		check("leader exited on SIGTERM", logHasSignal("SCENARIO:descendant", "SIGTERM"));
+		// Immediately after the leader exits, the descendant must still be alive:
+		// it ignored SIGTERM, so only the 5s group SIGKILL escalation may kill it.
+		let aliveAfterLeaderExit = false;
+		try {
+			process.kill(descendantPid, 0);
+			aliveAfterLeaderExit = true;
+		} catch {
+			/* already gone */
+		}
+		check("descendant survives the SIGTERM round", aliveAfterLeaderExit);
+		let descendantGone = false;
+		let elapsedToGone = 0;
+		while (Date.now() - tAbort8 < 8000) {
+			try {
+				process.kill(descendantPid, 0);
+				await new Promise((resolve) => setTimeout(resolve, 200));
+			} catch {
+				descendantGone = true;
+				elapsedToGone = Date.now() - tAbort8;
+				break;
+			}
+		}
+		check("descendant killed by the group SIGKILL escalation", descendantGone);
+		check("descendant survived until the ~5s escalation", elapsedToGone >= 4000 && elapsedToGone < 8000, `${elapsedToGone}ms`);
+		if (!descendantGone) {
+			try {
+				process.kill(descendantPid, "SIGKILL");
+			} catch {
+				/* already gone */
+			}
+		}
+		} // end POSIX-only stop-flow tests
 	} finally {
 		process.env.PATH = savedEnv.PATH ?? "";
 		process.env.FAKE_PI_LOG = savedEnv.FAKE_PI_LOG ?? "";

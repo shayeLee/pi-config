@@ -1,13 +1,21 @@
-# agent-team 数据流 harness
+# agent-team 自动化 harness
 
-独立的 Node 测试 harness（仓库无现有测试框架），用临时 fake `pi` 可执行文件和 mock
-ExtensionAPI 加载真实的 `../index.ts`，注册并调用 `subagent` 工具，验证数据流语义。
-全程不调用任何真实模型。
+独立的 Node 测试（仓库无现有测试框架），加载真实的扩展源码验证数据流与展示层语义，
+全程不调用任何真实模型。两个入口：
+
+- `run.mjs`：数据流 harness——加载 `../index.ts`，注册并调用 `subagent` 工具，用临时
+  fake `pi` 可执行文件驱动子代理进程（确定性 JSONL 事件）。
+- `presentation.mjs`：展示层 harness——加载 `fleet-view.ts` / `fleet-web.ts`，验证
+  FleetStore、FleetWidget、Web payload 序列化与 FleetWebServer HTTP。
+
+对应 README 的"核心原则：数据与展示分离"：`run.mjs` 守护数据流产物（`content` /
+`details` / `{previous}`），`presentation.mjs` 守护展示层作为只读消费者时的行为。
 
 ## 运行
 
 ```bash
 node agent/extensions/agent-team/harness/run.mjs
+node agent/extensions/agent-team/harness/presentation.mjs
 ```
 
 要求：
@@ -20,7 +28,7 @@ node agent/extensions/agent-team/harness/run.mjs
 
 退出码：全部断言通过为 0，任一失败为 1。
 
-## 工作原理
+## run.mjs（数据流）
 
 1. 在临时目录生成项目级 agent 配置 `.pi/agents/worker.md`（frontmatter 含
    `model`/`tools`，正文为系统提示词）。
@@ -31,79 +39,53 @@ node agent/extensions/agent-team/harness/run.mjs
    `--tools`、`--append-system-prompt`、`Task: ...`），按 task 中的场景标记输出
    确定性 JSONL 事件，并把每次调用的 argv/task/systemPrompt/cwd 追加到
    `$FAKE_PI_LOG` 供断言。
-4. 用 jiti（与 pi 扩展加载器相同的别名，指向 pi 包内的 `pi-coding-agent`/
-   `pi-ai`/`pi-tui`/`pi-agent-core`/`typebox`）加载 `../index.ts`，传入 mock
-   ExtensionAPI 捕获注册，再直接调用 `subagent` 工具的 `execute()`。
+4. 用 jiti（与 pi 扩展加载器相同的别名）加载 `../index.ts`，传入 mock ExtensionAPI
+   捕获注册，再直接调用 `subagent` 工具的 `execute()`。
 
-## 断言
+断言组：
 
-1. **tool_result_end-only**：只经 `tool_result_end` 到达的 toolResult 仍作为
-   durable 消息保留在 `details.results[0].messages`，且只保留一次。
-2. **同 toolCallId 去重**：同一 toolResult 同时经 `tool_result_end` 和
-   `message_end` 到达时，transcript 中只保留一条。
+1. **tool_result_end-only**：只经 `tool_result_end` 到达的 toolResult 仍作为 durable
+   消息保留在 `details.results[0].messages`，且只保留一次。
+2. **同 toolCallId 去重**：同一 toolResult 同时经 `tool_result_end` 和 `message_end`
+   到达时，transcript 中只保留一条。
 3. **transient 事件隔离**：`tool_execution_update` / `tool_execution_end` 不进入
    `content` 或 `details` 的消息记录，最终文本不含 transient 输出。
 4. **chain `{previous}`**：`{previous}` 只被紧邻上一步的最终 assistant 文本替换；
    上一步的工具结果文本（`CHAIN-TOOL-SECRET`）和完整 transcript 不会泄漏进下一步
    的 task。
+5. **父操作中止（single）**：通过 AbortSignal 中止运行中的子代理 → fake `pi` 收到
+   SIGTERM，结果 `exitCode 130`、`stopReason "stopped"`、`errorMessage` 标记父操作
+   中止，部分 assistant 文本保留在 transcript。
+6. **并行中止**：parallel 模式下中止会停止每个运行中的任务（全部 `exitCode 130`）。
+7. **SIGKILL 升级**：对忽略 SIGTERM 的顽固子进程（`SCENARIO:stubborn`），约 5 秒后
+   被 SIGKILL 强制终止，结果仍报告 `exitCode 130` 且 SIGTERM 确实被送达。
+8. **进程组终止覆盖后代**：fake 组长（`SCENARIO:descendant`）spawn 一个同组后代并忽略
+   SIGTERM；组长收到 SIGTERM 退出后，后代必须存活到 5 秒后的进程组 SIGKILL 才被终止——
+   守护 README 中“已退出组长的后代仍会被该进程组信号覆盖”的语义。
 
 另外断言临时 agent 配置确实到达子进程（`--model`/`--tools`/追加系统提示词）、
 `cwd` 转发、扩展注册项（tool/command/shortcut/handler）齐全。
 
-## 真实 Pi 手测清单
+## presentation.mjs（展示层）
 
-自动 harness 不调用真实模型；在发布前，可按本清单手测 TUI、Web UI 和进程生命周期。
-使用临时目录，避免 Edit 修改真实项目：
+0. **依赖边界（静态）**：数据流层 `index.ts` 只从 `fleet-store.ts` 取状态，从
+   `fleet-view.ts` 只 import composition root 用的 UI 符号（`FleetWidget` /
+   `showFleetOverlay`）；`fleet-store.ts` 不 import 任何一层。
+1. **FleetStore 状态容器**：add/finish/stop/markStopping/clear/touch 的状态转换、
+   订阅者通知与退订、32 条上限 prune（只淘汰最老 completed、保留 running）、
+   restore 历史重建（slice 32 + running 保留 + 恢复项 stop 为 no-op）。
+2. **FleetWidget.render**：空 store 渲染为空、最多显示 6 条、运行计数只统计可见项、
+   完成后 15 秒保留（过期隐藏但仍在 store）、长 task 按可见宽度截断（ANSI 感知）。
+3. **Web payload 序列化**：`webRun`/`selectWebRun`/`serializeFleetRun`——消息/文本/
+   content part/工具更新的截断档位、256 KiB payload 上限与降级、超长 id 的最终兜底
+   截断、edit 参数清理与 omission 计数、toolResult diff 截断、深冻结 fixture 验证
+   源数据不被修改（只读快照）。
+4. **FleetWebServer HTTP**：注入 `openBrowser` 桩（不真实打开浏览器）后启动，验证
+   token 鉴权（错误 token 404）、data 端点 JSON 与 revision 递增（变化 +1、不变保持）、
+   no-store 头、HTML 页面、SSE `event: update` 推送（含 store 变更广播）、close 后
+   端口拒绝。
 
-```bash
-mkdir -p /tmp/agent-team-smoke
-cd /tmp/agent-team-smoke
-printf 'before\n' > sample.txt
-pi
-```
+## 真实 Pi 冒烟清单（剩余手测项）
 
-### 1. 基本子代理与 Fleet
-
-在 Pi 中要求主代理：
-
-```text
-使用 subagent 工具调用 worker，任务是：读取当前目录的 sample.txt，并只回复文件内容。
-```
-
-预期：主对话返回 `before`；按 `Ctrl+Alt+F` 或执行 `/subagents` 能打开 Fleet；选中任务后，
-`Enter` 打开本机 Web UI，`i` 打开终端内详情。
-
-### 2. Edit 与实际 diff
-
-```text
-使用 subagent 工具调用 worker，任务是：使用 edit 工具把 sample.txt 中的 before 改为 after，然后读取文件确认结果。
-```
-
-预期：`cat sample.txt` 输出 `after`；Fleet 中仅显示工具返回的 actual diff，删除行为红色、
-新增行为绿色。若工具未返回 canonical diff，则不显示 diff。
-
-### 3. Chain `{previous}`
-
-```text
-使用 subagent 工具执行 chain：
-1. worker：只回复 CHAIN-FIRST。
-2. worker：只回复“收到：{previous}”。
-```
-
-预期：最终输出为 `收到：CHAIN-FIRST`（或等价文本）；不应出现第一步的完整 transcript、工具输出
-或 Fleet 的运行中输出。
-
-### 4. 停止运行中的任务
-
-```text
-使用 subagent 工具调用具有 bash 权限的 agent，任务是：执行 sleep 60，然后回复完成。
-```
-
-任务运行时打开 Fleet，选中任务后连续按两次 `x`（3 秒内）确认停止。首次按下只显示确认提示；
-按其他键或 `Esc` 会取消。预期任务状态变为 `stopped`。POSIX 平台应终止该子代理进程组；Windows
-使用 `taskkill /T`，属于 best-effort，根进程先退出时可能残留后代。
-
-### 5. 兼容事件
-
-`tool_result_end` 兼容和与 `message_end` 的去重由自动 harness 覆盖，真实 Pi 手测无需伪造 JSON
-事件。
+自动 harness 不涉及真实 TUI 渲染与浏览器打开；这两个交互面仍需在发布前手测。手测
+清单见 `agent-team/README.md` 的"真实 Pi 冒烟清单"。
