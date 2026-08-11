@@ -448,6 +448,11 @@ async function main() {
 				return false;
 			}
 		})());
+		const emptyThinking = makeRun({
+			messages: [{ role: "assistant", content: [{ type: "thinking" }, { type: "text", text: "safe narration" }] }],
+		});
+		const emptyThinkingWeb = selectWebRun(emptyThinking, 1);
+		check("thinking parts without text do not crash Web serialization", emptyThinkingWeb?.messages[0]?.content[0]?.type === "text");
 		check("serializers never mutate the source run (deep-frozen fixture)", (() => {
 			const deepFreeze = (value) => {
 				if (value && typeof value === "object" && !Object.isFrozen(value)) {
@@ -503,6 +508,36 @@ async function main() {
 		check("payload stays under 256 KiB", manyBytes <= 256 * 1024, `${manyBytes} bytes`);
 		check("downgrade drops messages and reports omissions", (manyWeb?.omitted.messages ?? 0) > 0 && manyWeb.messages.length < 200);
 		check("downgraded payload still round-trips", JSON.parse(serializeFleetRun(manyWeb, 1)).run.messages.length === manyWeb.messages.length);
+
+		// Assistant narration is higher priority than voluminous tool output. In
+		// particular, text after a thinking part must survive and intermediate
+		// assistant turns must not disappear merely because the tool transcript is large.
+		const narrated = makeRun({
+			messages: Array.from({ length: 96 }, (_, i) => [
+				{
+					role: "assistant",
+					content: [
+						{ type: "thinking", thinking: `private-${i}` },
+						{ type: "text", text: `NARRATION-${i}` },
+						{ type: "toolCall", id: `n${i}`, name: "bash", arguments: { command: "true" } },
+					],
+				},
+				{ role: "toolResult", toolCallId: `n${i}`, toolName: "bash", content: [{ type: "text", text: bigText(16 * 1024) }] },
+			]).flat(),
+		});
+		const narratedWeb = selectWebRun(narrated, 1);
+		const retainedNarration = narratedWeb?.messages
+			.filter((message) => message.role === "assistant")
+			.flatMap((message) => message.content)
+			.filter((part) => part.type === "text")
+			.map((part) => part.text) ?? [];
+		const retainedThinking = narratedWeb?.messages
+			.filter((message) => message.role === "assistant")
+			.flatMap((message) => message.content)
+			.filter((part) => part.type === "thinking")
+			.map((part) => part.text) ?? [];
+		check("large tool transcript retains every intermediate assistant narration", retainedNarration.length === 96 && retainedNarration.includes("NARRATION-0") && retainedNarration.includes("NARRATION-95"));
+		check("thinking is preserved as visible assistant output", retainedThinking.length === 96 && retainedThinking.includes("private-0") && retainedThinking.includes("private-95"));
 
 		// A pathological run forces the minimal tier, which blanks agent/task.
 		const insane = makeRun({

@@ -6,10 +6,12 @@ import type { FleetRun, FleetStore } from "./fleet-store.ts";
 const MAX_WEB_RUN_BYTES = 256 * 1024;
 const WEB_TEXT_TRUNCATION = "\n\n[Fleet Web payload truncated]";
 const WEB_RUN_OPTIONS = Object.freeze([
-	Object.freeze({ textBytes: 24 * 1024, messageLimit: 128, contentPartLimit: 32, updateLimit: 64 }),
-	Object.freeze({ textBytes: 8 * 1024, messageLimit: 64, contentPartLimit: 16, updateLimit: 32 }),
-	Object.freeze({ textBytes: 2 * 1024, messageLimit: 32, contentPartLimit: 8, updateLimit: 16 }),
-	Object.freeze({ textBytes: 512, messageLimit: 0, contentPartLimit: 0, updateLimit: 0 }),
+	Object.freeze({ textBytes: 24 * 1024, messageLimit: 128, assistantMessageLimit: 256, contentPartLimit: 32, updateLimit: 64 }),
+	Object.freeze({ textBytes: 8 * 1024, messageLimit: 64, assistantMessageLimit: 256, contentPartLimit: 16, updateLimit: 32 }),
+	Object.freeze({ textBytes: 2 * 1024, messageLimit: 32, assistantMessageLimit: 256, contentPartLimit: 8, updateLimit: 16 }),
+	// At the final tier, retain concise assistant narration from the whole run;
+	// tool calls/results and live updates are expendable before that narration.
+	Object.freeze({ textBytes: 512, messageLimit: 0, assistantMessageLimit: 128, contentPartLimit: 0, updateLimit: 0 }),
 ] as const);
 export { WEB_RUN_OPTIONS };
 
@@ -24,8 +26,9 @@ type WebToolCall = {
 	argumentText?: string;
 	argumentOmission?: string;
 };
+type WebAssistantContent = { type: "text" | "thinking"; text: string };
 type WebMessage =
-	| { role: "assistant"; content: Array<{ type: "text"; text: string } | WebToolCall> }
+	| { role: "assistant"; content: Array<WebAssistantContent | WebToolCall> }
 	| {
 			role: "toolResult";
 			toolCallId: string;
@@ -238,15 +241,40 @@ function webArguments(name: string, value: unknown, options: WebRunOptions): {
 
 type WebMessageResult = { message?: WebMessage; omittedAssistantContentParts: number };
 
+function assistantOutputText(part: { type: string; text?: unknown; thinking?: unknown }): string | undefined {
+	if (part.type === "text" && typeof part.text === "string") return part.text;
+	if (part.type === "thinking" && typeof part.thinking === "string") return part.thinking;
+	return undefined;
+}
+
+function hasAssistantOutput(message: FleetRun["messages"][number]): boolean {
+	return message.role === "assistant" && message.content.some((part) => Boolean(assistantOutputText(part)?.trim()));
+}
+
+function selectMessages(messages: FleetRun["messages"], options: WebRunOptions): FleetRun["messages"] {
+	// Keep narration from every assistant turn (up to the tier's explicit cap),
+	// then use the normal tail budget for surrounding tool activity. This avoids
+	// a noisy tool transcript hiding the assistant's intermediate explanations.
+	const assistantIndexes = messages.flatMap((message, index) => hasAssistantOutput(message) ? [index] : []);
+	const keptAssistantIndexes = new Set(assistantIndexes.slice(-options.assistantMessageLimit));
+	const tailStart = Math.max(0, messages.length - options.messageLimit);
+	const selectedIndexes = new Set(keptAssistantIndexes);
+	for (let index = tailStart; index < messages.length; index++) selectedIndexes.add(index);
+	return messages.filter((_, index) => selectedIndexes.has(index));
+}
+
 function webMessage(message: FleetRun["messages"][number], options: WebRunOptions): WebMessageResult {
 	if (message.role === "assistant") {
-		const content: Array<{ type: "text"; text: string } | WebToolCall> = [];
+		const content: Array<WebAssistantContent | WebToolCall> = [];
 		let omittedAssistantContentParts = 0;
-		const parts = options.contentPartLimit ? message.content.slice(0, options.contentPartLimit) : [];
-		omittedAssistantContentParts += message.content.length - parts.length;
-		for (const part of parts) {
-			if (part.type === "text" && part.text.trim()) content.push({ type: "text", text: capWebText(part.text, options.textBytes) });
-			else if (part.type === "toolCall") {
+		let keptToolCalls = 0;
+		for (const part of message.content) {
+			// Pi stores visible text and reasoning in distinct fields: text.text and
+			// thinking.thinking. Normalize them for the Web DTO while keeping the type.
+			const outputText = assistantOutputText(part);
+			if (part.type === "text" && outputText?.trim()) content.push({ type: "text", text: capWebText(outputText, options.textBytes) });
+			else if (part.type === "thinking" && outputText?.trim()) content.push({ type: "thinking", text: capWebText(outputText, options.textBytes) });
+			else if (part.type === "toolCall" && keptToolCalls++ < options.contentPartLimit) {
 				const sanitized = webArguments(part.name, part.arguments, options);
 				content.push({ type: "toolCall", id: part.id, name: part.name, ...sanitized });
 			} else {
@@ -273,7 +301,7 @@ function webMessage(message: FleetRun["messages"][number], options: WebRunOption
 
 export function webRun(run: FleetRun | undefined, options: WebRunOptions): WebRun | undefined {
 	if (!run) return undefined;
-	const selectedMessages = options.messageLimit ? run.messages.slice(-options.messageLimit) : [];
+	const selectedMessages = selectMessages(run.messages, options);
 	let omittedMessages = run.messages.length - selectedMessages.length;
 	let omittedAssistantContentParts = 0;
 	const messages: WebMessage[] = [];
@@ -954,7 +982,7 @@ function renderDetail(run, revision) {
 	for (const message of run.messages) {
 		if (message.role === "assistant") {
 			for (const part of message.content) {
-				if (part.type === "text" && part.text.trim()) entries.push({ type: "assistant", text: part.text });
+				if ((part.type === "text" || part.type === "thinking") && part.text.trim()) entries.push({ type: "assistant", text: part.text, thinking: part.type === "thinking" });
 				else if (part.type === "toolCall") {
 					const execution = { call: part, result: undefined };
 					executions.set(part.id, execution);
@@ -971,7 +999,7 @@ function renderDetail(run, revision) {
 		if (!executions.has(id)) entries.push({ type: "unmatchedUpdate", id, update });
 	}
 	for (const entry of entries) {
-		if (entry.type === "assistant") addMarkdownEntry("助手", entry.text);
+		if (entry.type === "assistant") addMarkdownEntry(entry.thinking ? "思考" : "助手", entry.text);
 		else if (entry.type === "execution") addToolExecution(entry.execution.call, entry.execution.result, toolUpdates[entry.execution.call.id], run);
 		else if (entry.type === "unmatchedUpdate") {
 			addToolExecution({ type: "toolCall", id: entry.id, name: entry.update.toolName, arguments: {} }, undefined, entry.update, run, true);
