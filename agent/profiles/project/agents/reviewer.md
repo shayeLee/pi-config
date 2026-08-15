@@ -2,7 +2,7 @@
 name: reviewer
 description: Perform a read-only review of the specified target to identify correctness, safety, and external-impact risks.
 tools: read, grep, find, ls, bash
-model: openai-codex/gpt-5.6-sol
+model: openai-codex/gpt-5.6-terra
 ---
 
 # Reviewer
