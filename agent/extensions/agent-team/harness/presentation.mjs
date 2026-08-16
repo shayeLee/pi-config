@@ -725,7 +725,43 @@ async function main() {
 			"SSE endpoint streams update events",
 			sse.status === 200 && (sse.headers.get("content-type") || "").includes("text/event-stream"),
 		);
-		const decoder = new TextDecoder();
+		// Streaming SSE frame parser: accumulates chunks, decodes UTF-8 across
+		// chunk boundaries, and splits frames on the blank-line separator.
+		class SseParser {
+			constructor() {
+				this.decoder = new TextDecoder();
+				this.buffer = "";
+				this.frames = [];
+			}
+			push(chunk) {
+				this.buffer += this.decoder.decode(chunk.value, { stream: true });
+				let index;
+				while ((index = this.buffer.indexOf("\n\n")) !== -1) {
+					const raw = this.buffer.slice(0, index);
+					this.buffer = this.buffer.slice(index + 2);
+					let event = "message";
+					const dataLines = [];
+					for (const line of raw.split("\n")) {
+						if (line.startsWith("event: ")) event = line.slice(7);
+						else if (line.startsWith("data: ")) dataLines.push(line.slice(6));
+						else if (line.startsWith("data:")) dataLines.push(line.slice(5));
+					}
+					const dataText = dataLines.join("\n");
+					let data;
+					if (dataText) {
+						try {
+							data = JSON.parse(dataText);
+						} catch {
+							data = undefined;
+						}
+					}
+					this.frames.push({ event, data });
+				}
+			}
+			next() {
+				return this.frames.shift();
+			}
+		}
 		const readWithTimeout = async (reader, timeoutMs) => {
 			let timer;
 			try {
@@ -744,36 +780,44 @@ async function main() {
 				if (timer) clearTimeout(timer);
 			}
 		};
+		const readSseEvent = async (reader, parser, timeoutMs) => {
+			const pending = parser.next();
+			if (pending) return pending;
+			const deadline = Date.now() + timeoutMs;
+			while (Date.now() < deadline) {
+				const chunk = await readWithTimeout(reader, deadline - Date.now());
+				parser.push(chunk);
+				const frame = parser.next();
+				if (frame) return frame;
+			}
+			throw new Error("SSE read timeout");
+		};
 		// Connection A: the server pushes an update on connect.
 		const sseA = await fetch(`${base}/events`);
 		const readerA = sseA.body.getReader();
-		const firstA = await readWithTimeout(readerA, 1500);
-		check("SSE first event is an update", decoder.decode(firstA.value).includes("event: update"));
+		const frameA = await readSseEvent(readerA, new SseParser(), 1500);
+		check("SSE first event is an update", frameA.event === "update");
 		await readerA.cancel().catch(() => {});
 		// Connection B: consume the connect-time update, then a store change must
 		// produce a genuinely new broadcast (the old store.finish() debounce fired
 		// long before this connection existed, so it cannot fake this assertion).
 		const sseB = await fetch(`${base}/events`);
 		const readerB = sseB.body.getReader();
-		await readWithTimeout(readerB, 1500);
+		const parserB = new SseParser();
+		await readSseEvent(readerB, parserB, 1500);
 		store.touch();
-		const secondB = await readWithTimeout(readerB, 3000);
-		check("store change broadcasts a new update event", decoder.decode(secondB.value).includes("event: update"));
+		const frameB = await readSseEvent(readerB, parserB, 3000);
+		check("store change broadcasts a new update event", frameB.event === "update");
 		await readerB.cancel().catch(() => {});
 
 		// SSE now carries streaming snapshots/deltas for the requested run.
-		const sseDataOf = (chunk) => {
-			const text = decoder.decode(chunk.value);
-			const match = text.match(/data: ([\s\S]*?)\n\n/);
-			return match ? JSON.parse(match[1]) : undefined;
-		};
 		const streamRun = store.add(makeRun({ agent: "sse-stream" }));
 		streamRun.streamingParts = [{ type: "thinking", text: "thinking-snapshot" }];
 		streamRun.streamingReset = 1;
 		const sseC = await fetch(`${base}/events?run=${streamRun.id}`);
 		const readerC = sseC.body.getReader();
-		const firstC = await readWithTimeout(readerC, 1500);
-		const payloadC = sseDataOf(firstC);
+		const parserC = new SseParser();
+		const payloadC = (await readSseEvent(readerC, parserC, 1500)).data;
 		check(
 			"SSE initial event carries a streaming snapshot",
 			payloadC && Array.isArray(payloadC.snapshot) && payloadC.snapshot[0]?.text === "thinking-snapshot" && payloadC.reset === 1,
@@ -782,8 +826,7 @@ async function main() {
 		streamRun.streamingDeltas.push({ index: 0, type: "thinking", text: "+delta" });
 		streamRun.streamingParts[0].text += "+delta";
 		store.touch();
-		const secondC = await readWithTimeout(readerC, 3000);
-		const payloadC2 = sseDataOf(secondC);
+		const payloadC2 = (await readSseEvent(readerC, parserC, 3000)).data;
 		check(
 			"SSE broadcast carries the new delta",
 			payloadC2 && Array.isArray(payloadC2.deltas) && payloadC2.deltas.length === 1 && payloadC2.deltas[0].text === "+delta" && payloadC2.reset === 1,
@@ -791,8 +834,7 @@ async function main() {
 		);
 		streamRun.streamingDeltas.push({ toolCallId: "tool-1", toolName: "bash", text: "+tool-output" });
 		store.touch();
-		const thirdC = await readWithTimeout(readerC, 3000);
-		const payloadC3 = sseDataOf(thirdC);
+		const payloadC3 = (await readSseEvent(readerC, parserC, 3000)).data;
 		check(
 			"SSE broadcast carries tool output deltas",
 			payloadC3 && Array.isArray(payloadC3.deltas) && payloadC3.deltas[0]?.toolCallId === "tool-1" && payloadC3.deltas[0]?.toolName === "bash" && payloadC3.deltas[0]?.text === "+tool-output",
@@ -808,14 +850,14 @@ async function main() {
 		const sseD2 = await fetch(`${base}/events?run=${multiRun.id}`);
 		const readerD1 = sseD1.body.getReader();
 		const readerD2 = sseD2.body.getReader();
-		await readWithTimeout(readerD1, 1500);
-		await readWithTimeout(readerD2, 1500);
+		const parserD1 = new SseParser();
+		const parserD2 = new SseParser();
+		await readSseEvent(readerD1, parserD1, 1500);
+		await readSseEvent(readerD2, parserD2, 1500);
 		multiRun.streamingDeltas.push({ index: 0, type: "thinking", text: "shared-delta" });
 		store.touch();
-		const d1 = await readWithTimeout(readerD1, 3000);
-		const d2 = await readWithTimeout(readerD2, 3000);
-		const p1 = sseDataOf(d1);
-		const p2 = sseDataOf(d2);
+		const p1 = (await readSseEvent(readerD1, parserD1, 3000)).data;
+		const p2 = (await readSseEvent(readerD2, parserD2, 3000)).data;
 		check(
 			"each client independently receives the same delta",
 			p1 && Array.isArray(p1.deltas) && p1.deltas.length === 1 && p1.deltas[0].text === "shared-delta" && p2 && Array.isArray(p2.deltas) && p2.deltas.length === 1 && p2.deltas[0].text === "shared-delta",
@@ -828,8 +870,7 @@ async function main() {
 		// event), so the client can clear live blocks and stop refreshing.
 		const sseGone = await fetch(`${base}/events?run=does-not-exist`);
 		const readerGone = sseGone.body.getReader();
-		const firstGone = await readWithTimeout(readerGone, 1500);
-		const payloadGone = sseDataOf(firstGone);
+		const payloadGone = (await readSseEvent(readerGone, new SseParser(), 1500)).data;
 		check(
 			"SSE returns gone:true for a missing run",
 			payloadGone && payloadGone.gone === true && payloadGone.reset === 0,
