@@ -1261,6 +1261,12 @@ events.addEventListener("update", (event) => {
 		scheduleRefresh();
 		return;
 	}
+	if (data.gone === true) {
+		clearToolStreamBlocks();
+		applyStreamingSnapshot([]);
+		scheduleRefresh();
+		return;
+	}
 	if (typeof data.reset === "number" && data.reset !== lastStreamingReset) {
 		lastStreamingReset = data.reset;
 		if (Array.isArray(data.deltas)) {
@@ -1461,7 +1467,7 @@ export class FleetWebServer {
 	private streamingPayload(client: ServerResponse, initial: boolean): string {
 		const runId = this.clientRuns.get(client);
 		const run = runId ? this.store.list().find((item) => item.id === runId) : undefined;
-		if (!run) return JSON.stringify({ deltas: [], reset: 0 });
+		if (!run) return JSON.stringify({ deltas: [], reset: 0, gone: true });
 		const cursor = this.clientCursors.get(client);
 		const offset = cursor && cursor.reset === run.streamingReset ? cursor.offset : 0;
 		if (initial) {

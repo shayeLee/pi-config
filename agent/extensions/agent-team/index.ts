@@ -42,6 +42,8 @@ const MAX_FLEET_TRANSIENT_BYTES = 256 * 1024;
 const MAX_FLEET_STREAMING_BYTES = 32 * 1024;
 const MAX_FLEET_STREAMING_PARTS = 64;
 const MAX_FLEET_STREAMING_DELTAS_BYTES = 64 * 1024;
+const MAX_FLEET_STREAMING_DELTA_COUNT = 256;
+const STREAMING_DELTA_METADATA_BYTES = 64;
 const FLEET_TRUNCATION_MARKER = "\n\n[Fleet live output truncated]";
 
 /** Renders a subagent tool row in the opencode style: subtle background + left rail. */
@@ -706,14 +708,18 @@ async function runSingleAgent(
 	};
 
 	const pushStreamingDelta = (delta: FleetStreamingDelta) => {
-		let total = 0;
-		for (const item of fleetRun.streamingDeltas) total += "text" in item ? Buffer.byteLength(item.text) : 0;
-		const bytes = "text" in delta ? Buffer.byteLength(delta.text) : 0;
-		if (fleetRun.streamingDeltas.length > 0 && total + bytes > MAX_FLEET_STREAMING_DELTAS_BYTES) {
+		const bytes = ("text" in delta ? Buffer.byteLength(delta.text) : 0) + STREAMING_DELTA_METADATA_BYTES;
+		if (fleetRun.streamingDeltas.length >= MAX_FLEET_STREAMING_DELTA_COUNT) {
 			clearStreamingDeltas();
 			fleetRun.streamingReset++;
 		}
-		fleetRun.streamingDeltas.push(delta);
+		let total = 0;
+		for (const item of fleetRun.streamingDeltas) total += ("text" in item ? Buffer.byteLength(item.text) : 0) + STREAMING_DELTA_METADATA_BYTES;
+		if (bytes >= MAX_FLEET_STREAMING_DELTAS_BYTES || (fleetRun.streamingDeltas.length > 0 && total + bytes > MAX_FLEET_STREAMING_DELTAS_BYTES)) {
+			clearStreamingDeltas();
+			fleetRun.streamingReset++;
+		}
+		if (bytes < MAX_FLEET_STREAMING_DELTAS_BYTES) fleetRun.streamingDeltas.push(delta);
 	};
 
 	const updateFleetTool = (
