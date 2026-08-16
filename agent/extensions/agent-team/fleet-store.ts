@@ -128,6 +128,7 @@ export class FleetStore {
 		run.endedAt = Date.now();
 		// Bump the streaming reset so the Web UI fetches the final snapshot
 		// (status badge / timeline) even when no further message boundary fires.
+		run.streamingDeltas = [];
 		run.streamingReset++;
 		this.notify();
 	}
@@ -143,6 +144,7 @@ export class FleetStore {
 	markStopping(run: FleetRun): void {
 		if (run.status !== "running" || run.stopping) return;
 		run.stopping = true;
+		run.streamingDeltas = [];
 		run.streamingReset++;
 		this.notify();
 	}

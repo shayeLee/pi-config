@@ -533,6 +533,13 @@ function applyToolStreamSnapshot(toolUpdates) {
 	}
 }
 
+function clearToolStreamBlocks() {
+	for (const [id, block] of toolStreamBlocks) {
+		block.section.remove();
+		toolStreamBlocks.delete(id);
+	}
+}
+
 function scrollToBottom() {
 	autoScrolling = true;
 	detail.scrollTo({ top: detail.scrollHeight });
@@ -1096,6 +1103,7 @@ function renderDetail(run, revision) {
 		applyToolStreamSnapshot(run.toolUpdates || {});
 		applyStreamingSnapshot(run.streaming || []);
 	} else {
+		clearToolStreamBlocks();
 		applyStreamingSnapshot([]);
 	}
 	const changed = String(revision) !== displayedDetail;
@@ -1207,6 +1215,7 @@ async function refresh() {
 	} catch (error) {
 		displayedDetail = "";
 		stable.replaceChildren();
+		clearToolStreamBlocks();
 		const notice = document.createElement("p");
 		notice.className = "notice";
 		text(notice, error instanceof Error ? error.message : String(error));

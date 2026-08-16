@@ -310,6 +310,17 @@ async function main() {
 		);
 		check("result exitCode 0", result9.details.results[0].exitCode === 0);
 
+		// --- (10) malformed contentIndex is ignored without crashing ------------
+		console.log("\n[10] malformed contentIndex is ignored without crashing");
+		const result10 = await run({ agent: "worker", task: "SCENARIO:bad_index" });
+		check(
+			"final content is assistant text",
+			result10.content[0]?.text === "FINAL-ANSWER-BADINDEX",
+			JSON.stringify(result10.content),
+		);
+		check("malformed deltas never enter the transcript", !JSON.stringify(result10.details).includes("BAD-"));
+		check("result exitCode 0", result10.details.results[0].exitCode === 0);
+
 		// --- (5)-(8) stop-flow tests: POSIX-only (production uses taskkill /T on
 		// Windows, which has no process-group SIGTERM/SIGKILL semantics) ---------
 		const isWindows = process.platform === "win32";

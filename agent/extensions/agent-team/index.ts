@@ -29,7 +29,7 @@ import {
 import { Container, Markdown, Spacer, Text, truncateToWidth, type Component, visibleWidth } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { type AgentConfig, type AgentScope, discoverAgents } from "./agents.ts";
-import { FleetStore, type FleetRunStatus, type RestoredFleetRun } from "./fleet-store.ts";
+import { FleetStore, type FleetRunStatus, type FleetStreamingDelta, type RestoredFleetRun } from "./fleet-store.ts";
 import { FleetWidget, showFleetOverlay } from "./fleet-view.ts";
 import { FleetWebServer } from "./fleet-web.ts";
 
@@ -40,6 +40,8 @@ const PER_TASK_OUTPUT_CAP = 50 * 1024;
 const MAX_FLEET_TOOL_UPDATE_BYTES = 48 * 1024;
 const MAX_FLEET_TRANSIENT_BYTES = 256 * 1024;
 const MAX_FLEET_STREAMING_BYTES = 32 * 1024;
+const MAX_FLEET_STREAMING_PARTS = 64;
+const MAX_FLEET_STREAMING_DELTAS_BYTES = 64 * 1024;
 const FLEET_TRUNCATION_MARKER = "\n\n[Fleet live output truncated]";
 
 /** Renders a subagent tool row in the opencode style: subtle background + left rail. */
@@ -699,6 +701,21 @@ async function runSingleAgent(
 	currentResult.runId = fleetRun.id;
 	currentResult.startedAt = fleetRun.startedAt;
 
+	const clearStreamingDeltas = () => {
+		fleetRun.streamingDeltas = [];
+	};
+
+	const pushStreamingDelta = (delta: FleetStreamingDelta) => {
+		let total = 0;
+		for (const item of fleetRun.streamingDeltas) total += "text" in item ? Buffer.byteLength(item.text) : 0;
+		const bytes = "text" in delta ? Buffer.byteLength(delta.text) : 0;
+		if (fleetRun.streamingDeltas.length > 0 && total + bytes > MAX_FLEET_STREAMING_DELTAS_BYTES) {
+			clearStreamingDeltas();
+			fleetRun.streamingReset++;
+		}
+		fleetRun.streamingDeltas.push(delta);
+	};
+
 	const updateFleetTool = (
 		toolCallId: string,
 		toolName: string,
@@ -728,15 +745,16 @@ async function runSingleAgent(
 		if (phase === "streaming") {
 			const newText = fleetToolOutputText(content.content);
 			if (content.truncated || !newText.startsWith(previousText)) {
-				fleetRun.streamingDeltas.push({ toolCallId, toolName, text: newText, replace: true });
+				pushStreamingDelta({ toolCallId, toolName, text: newText, replace: true });
 			} else {
 				const delta = newText.slice(previousText.length);
-				if (delta) fleetRun.streamingDeltas.push({ toolCallId, toolName, text: delta });
+				if (delta) pushStreamingDelta({ toolCallId, toolName, text: delta });
 			}
 		}
 	};
 
 	const appendStreaming = (contentIndex: number, kind: "text" | "thinking", delta: string | undefined, full: string | undefined) => {
+		if (!Number.isSafeInteger(contentIndex) || contentIndex < 0 || contentIndex >= MAX_FLEET_STREAMING_PARTS) return;
 		const parts = fleetRun.streamingParts;
 		while (parts.length <= contentIndex) parts.push({ type: "text", text: "" });
 		const part = parts[contentIndex];
@@ -745,7 +763,7 @@ async function runSingleAgent(
 			const capped = capFleetText(full, MAX_FLEET_STREAMING_BYTES);
 			part.text = capped.text;
 			part.truncated = capped.truncated;
-			fleetRun.streamingDeltas.push({ index: contentIndex, type: kind, text: capped.text, replace: true });
+			pushStreamingDelta({ index: contentIndex, type: kind, text: capped.text, replace: true });
 			return;
 		}
 		if (!delta || part.truncated) return;
@@ -753,11 +771,11 @@ async function runSingleAgent(
 			const capped = capFleetText(part.text + delta, MAX_FLEET_STREAMING_BYTES);
 			part.text = capped.text;
 			part.truncated = true;
-			fleetRun.streamingDeltas.push({ index: contentIndex, type: kind, text: capped.text, replace: true });
+			pushStreamingDelta({ index: contentIndex, type: kind, text: capped.text, replace: true });
 			return;
 		}
 		part.text += delta;
-		fleetRun.streamingDeltas.push({ index: contentIndex, type: kind, text: delta });
+		pushStreamingDelta({ index: contentIndex, type: kind, text: delta });
 	};
 
 	const abortFromParent = () => {
@@ -830,7 +848,7 @@ async function runSingleAgent(
 				// live reasoning; message_end remains the durable authoritative message.
 				if (event.type === "message_start") {
 					fleetRun.streamingParts = [];
-					fleetRun.streamingDeltas = [];
+					clearStreamingDeltas();
 					fleetRun.streamingReset++;
 				}
 
@@ -865,12 +883,13 @@ async function runSingleAgent(
 					if (!appendDurableMessage(msg)) return;
 					if (msg.role === "toolResult") {
 						delete fleetRun.toolUpdates[msg.toolCallId];
+						clearStreamingDeltas();
 						fleetRun.streamingReset++;
 					}
 
 					if (msg.role === "assistant") {
 						fleetRun.streamingParts = [];
-						fleetRun.streamingDeltas = [];
+						clearStreamingDeltas();
 						fleetRun.streamingReset++;
 						currentResult.usage.turns++;
 						const usage = msg.usage;
@@ -899,6 +918,7 @@ async function runSingleAgent(
 					if (appendDurableMessage(msg)) {
 						if (msg.role === "toolResult") {
 							delete fleetRun.toolUpdates[msg.toolCallId];
+							clearStreamingDeltas();
 							fleetRun.streamingReset++;
 						}
 						emitUpdate();
@@ -912,6 +932,7 @@ async function runSingleAgent(
 
 				if (event.type === "tool_execution_end" && event.toolCallId) {
 					updateFleetTool(event.toolCallId, typeof event.toolName === "string" ? event.toolName : "tool", "completed", event.result, Boolean(event.isError));
+					clearStreamingDeltas();
 					fleetRun.streamingReset++;
 					emitUpdate();
 				}

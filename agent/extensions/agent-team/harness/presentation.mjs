@@ -800,6 +800,30 @@ async function main() {
 		);
 		await readerC.cancel().catch(() => {});
 
+		// Two clients on the same run keep independent cursors: each receives the
+		// same delta without one consuming the other's slice.
+		const multiRun = store.add(makeRun({ agent: "sse-multi" }));
+		multiRun.streamingReset = 1;
+		const sseD1 = await fetch(`${base}/events?run=${multiRun.id}`);
+		const sseD2 = await fetch(`${base}/events?run=${multiRun.id}`);
+		const readerD1 = sseD1.body.getReader();
+		const readerD2 = sseD2.body.getReader();
+		await readWithTimeout(readerD1, 1500);
+		await readWithTimeout(readerD2, 1500);
+		multiRun.streamingDeltas.push({ index: 0, type: "thinking", text: "shared-delta" });
+		store.touch();
+		const d1 = await readWithTimeout(readerD1, 3000);
+		const d2 = await readWithTimeout(readerD2, 3000);
+		const p1 = sseDataOf(d1);
+		const p2 = sseDataOf(d2);
+		check(
+			"each client independently receives the same delta",
+			p1 && Array.isArray(p1.deltas) && p1.deltas.length === 1 && p1.deltas[0].text === "shared-delta" && p2 && Array.isArray(p2.deltas) && p2.deltas.length === 1 && p2.deltas[0].text === "shared-delta",
+			JSON.stringify({ p1, p2 }),
+		);
+		await readerD1.cancel().catch(() => {});
+		await readerD2.cancel().catch(() => {});
+
 		await server.close();
 		let refused = false;
 		try {
