@@ -59,6 +59,10 @@ type WebRun = {
 	agent: string;
 	task: string;
 	messages: WebMessage[];
+	/** In-flight assistant text/thinking assembled from message_update deltas. */
+	streaming?: Array<{ index: number; type: "text" | "thinking"; text: string }>;
+	/** Bumped on message boundaries; lets the client reset its live streaming layer. */
+	streamingReset?: number;
 	toolUpdates: Record<string, WebToolUpdate>;
 	omitted: WebOmissions;
 	model?: string;
@@ -334,6 +338,8 @@ export function webRun(run: FleetRun | undefined, options: WebRunOptions): WebRu
 		agent: capWebText(run.agent, options.textBytes),
 		task: capWebText(run.task, options.textBytes),
 		messages,
+		...(run.streamingParts.length ? { streaming: run.streamingParts.map((part, index) => ({ index, type: part.type, text: capWebText(part.text, options.textBytes) })) } : {}),
+		streamingReset: run.streamingReset,
 		toolUpdates,
 		omitted: {
 			messages: omittedMessages,
@@ -370,12 +376,14 @@ const PAGE = `<!doctype html>
 <html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Subagent Fleet</title>
 <style>
-:root{color-scheme:dark;--bg:#0a0c10;--surface:#11141b;--surface-2:#171b24;--inset:#0b0e13;--line:#202634;--line-strong:#2c3444;--text:#e7eaf0;--muted:#98a2b3;--faint:#5d6677;--accent:#6ee7a0;--success:#4ade80;--warning:#f0b429;--error:#f87171;--radius:10px;--mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;--sans:ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif}*{box-sizing:border-box}html,body{height:100%}body{margin:0;background:var(--bg);color:var(--text);font:14px/1.65 var(--sans);overflow:hidden;-webkit-font-smoothing:antialiased}::selection{background:rgba(110,231,160,.3)}header{position:relative;z-index:30;height:52px;padding:0 max(20px,calc((100vw - 920px)/2));display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid var(--line);background:var(--bg);background:color-mix(in srgb,var(--bg) 90%,transparent);backdrop-filter:blur(10px)}.brand{display:flex;align-items:center;gap:9px;font-size:13px;font-weight:650;letter-spacing:-.01em}.brand-mark{color:var(--accent);font-size:14px;line-height:1}.brand-path{color:var(--muted);font-weight:400}.live{display:inline-flex;align-items:center;color:var(--faint);font-size:12px;font-variant-numeric:tabular-nums}.live:not(:empty)::before{content:"●";margin-right:7px;color:var(--accent);font-size:9px}.live.off::before{color:var(--error)}.live.reconnecting::before{color:var(--warning)}main{height:calc(100vh - 52px);min-height:0}article{width:min(920px,100%);height:100%;margin:0 auto;padding:0 26px 110px;overflow:auto;min-height:0;scrollbar-width:thin;scrollbar-color:var(--line-strong) transparent}article::-webkit-scrollbar{width:10px}article::-webkit-scrollbar-thumb{background:var(--line-strong);border-radius:5px;border:2px solid var(--bg)}article::-webkit-scrollbar-thumb:hover{background:var(--faint)}.loading{display:flex;align-items:center;justify-content:center;gap:10px;padding:96px 0;color:var(--muted);font-size:13px}.loading::before{content:"";width:14px;height:14px;border-radius:50%;border:2px solid var(--line-strong);border-top-color:var(--accent);animation:spin .8s linear infinite}.notice{padding:96px 0;text-align:center;color:var(--muted);font-size:13px}.run-header{position:sticky;top:0;z-index:10;margin:0 -26px;padding:22px 26px 16px;background:linear-gradient(180deg,var(--bg) 84%,transparent);backdrop-filter:blur(8px)}.run-header::after{content:"";position:absolute;left:26px;right:26px;bottom:8px;border-top:1px solid var(--line)}.eyebrow{margin:0 0 7px;color:var(--accent);font-size:11px;font-weight:600;letter-spacing:.1em}h1{margin:0;color:var(--text);font-size:23px;line-height:1.3;letter-spacing:-.025em;font-weight:650}.run-meta{display:flex;flex-wrap:wrap;align-items:center;gap:6px 12px;margin-top:12px;color:var(--muted);font-family:var(--mono);font-size:12px}.run-meta span{display:inline-flex;align-items:center;gap:8px}.run-meta span:not(:last-child)::after{content:"";width:3px;height:3px;border-radius:50%;background:var(--faint)}.chip{display:inline-flex;align-items:center;gap:6px;padding:1px 10px;border:1px solid var(--line-strong);border-radius:999px;background:var(--surface-2);font-family:var(--sans);font-size:11px;font-weight:600;letter-spacing:.02em}.chip::before{content:"";width:6px;height:6px;border-radius:50%;background:currentColor}.chip.running{color:var(--accent)}.chip.complete{color:var(--success)}.chip.failed{color:var(--error)}.chip.stopped,.chip.interrupted{color:var(--warning)}.chip.incomplete{color:var(--muted)}.entry{margin:26px 0}.entry h3{margin:0 0 8px;color:var(--faint);font-size:11px;font-weight:600;letter-spacing:.08em}.entry.error h3{color:var(--error)}.markdown{font-family:var(--sans);font-size:15px;line-height:1.75;color:#d4dae3}.markdown p{margin:0 0 14px}.markdown h1,.markdown h2,.markdown h3,.markdown h4,.markdown h5,.markdown h6{margin:26px 0 10px;color:var(--text);line-height:1.3;font-weight:650}.markdown h1{font-size:1.4em}.markdown h2{font-size:1.22em}.markdown h3{font-size:1.08em;letter-spacing:normal}.markdown ul,.markdown ol{margin:0 0 14px;padding-left:24px}.markdown li{margin:2px 0}.markdown code{font-family:var(--mono);font-size:.86em;color:#b8e09a;background:var(--surface-2);border:1px solid var(--line);border-radius:5px;padding:1px 5px}.markdown pre,pre{white-space:pre-wrap;word-break:break-word;margin:8px 0 0;background:var(--inset);border:1px solid var(--line);border-radius:8px;padding:12px 14px;color:#c4cdd9;font:12.5px/1.6 var(--mono)}.entry.collapsible:not(.expanded) pre{max-height:12em;overflow:hidden;mask-image:linear-gradient(to bottom,#000 68%,transparent)}.omissions{display:flex;flex-wrap:wrap;gap:4px 16px;margin:18px 0;padding:9px 14px;background:var(--surface);border:1px dashed var(--line-strong);border-radius:var(--radius)}.omission-chip{color:var(--muted);font-size:11.5px}.omission-chip::before{content:"…";margin-right:6px;color:var(--faint)}.toggle{margin-top:10px;padding:2px 0;border:0;background:none;color:var(--muted);cursor:pointer;font:12px var(--sans);display:inline-flex;align-items:center;gap:5px}.toggle:hover{color:var(--accent)}.toggle::before{content:"▸";color:var(--accent);font-size:10px;transition:transform .15s ease}.entry.expanded .toggle::before,.tool-execution.expanded .toggle::before{transform:rotate(90deg)}.tool-execution{position:relative;margin:14px 0;padding:13px 16px 13px 20px;background:var(--surface);border:1px solid var(--line);border-radius:var(--radius);box-shadow:0 1px 0 rgba(255,255,255,.02)}.tool-execution::before{content:"";position:absolute;top:0;bottom:0;left:0;width:3px;border-radius:var(--radius) 0 0 var(--radius);background:var(--faint)}.tool-execution.complete::before{background:var(--success)}.tool-execution.failed::before{background:var(--error)}.tool-execution.running::before{background:var(--accent);animation:pulse 1.4s ease-in-out infinite}.tool-execution.stopped::before,.tool-execution.interrupted::before{background:var(--warning)}.tool-execution.incomplete::before{background:var(--faint)}.tool-execution h3{display:flex;align-items:center;justify-content:space-between;gap:12px;margin:0;color:var(--text);font-size:12px;font-weight:650}.tool-name{display:flex;align-items:center;gap:8px;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-family:var(--mono);font-weight:600}.tool-name-dot{flex:none;width:7px;height:7px;border-radius:50%;background:var(--faint)}.tool-execution.complete .tool-name-dot{background:var(--success)}.tool-execution.failed .tool-name-dot{background:var(--error)}.tool-execution.running .tool-name-dot{background:var(--accent)}.tool-execution.stopped .tool-name-dot,.tool-execution.interrupted .tool-name-dot{background:var(--warning)}.tool-status{flex:none;display:inline-flex;align-items:center;gap:6px;padding:2px 10px;border:1px solid var(--line-strong);border-radius:999px;background:var(--surface-2);font-size:11px;font-weight:600}.tool-status::before{content:"";width:6px;height:6px;border-radius:50%;background:currentColor}.tool-status.complete{color:var(--success);border-color:rgba(74,222,128,.35)}.tool-status.failed{color:var(--error);border-color:rgba(248,113,113,.35)}.tool-status.running{color:var(--accent);border-color:rgba(110,231,160,.35)}.tool-status.stopped,.tool-status.interrupted{color:var(--warning);border-color:rgba(240,180,41,.35)}.tool-status.incomplete{color:var(--muted)}.tool-input{margin:10px 0 0;padding:10px 12px;background:var(--inset);border:1px solid var(--line);border-radius:8px;color:#c4cdd9;font:12px/1.6 var(--mono)}.tool-divider{border-top:1px solid var(--line);margin:12px 0 10px}.output-label{margin-bottom:6px;color:var(--faint);font-size:10px;font-weight:600;letter-spacing:.1em}.tool-output{margin:0;padding:10px 12px;background:var(--inset);border:1px solid var(--line);border-radius:8px;color:#c4cdd9;font:12px/1.6 var(--mono)}.tool-output.error{color:var(--error)}.tool-execution.collapsible.collapse-ready:not(.expanded) .tool-output{max-height:12em;overflow:hidden;mask-image:linear-gradient(to bottom,#000 68%,transparent)}.tool-edit-diff{margin-top:10px;background:var(--inset);border:1px solid var(--line);border-radius:8px;overflow-x:auto}.tool-edit-path{position:sticky;left:0;display:flex;align-items:center;gap:8px;padding:8px 12px;color:var(--muted);border-bottom:1px solid var(--line);font:12px var(--mono)}.tool-edit-path::before{content:"diff";flex:none;padding:1px 7px;border:1px solid rgba(110,231,160,.3);border-radius:999px;background:rgba(110,231,160,.12);color:var(--accent);font-family:var(--sans);font-size:10px;font-weight:600;letter-spacing:.06em}.tool-edit-block{padding:8px 0}.tool-edit-block+.tool-edit-block{border-top:1px solid var(--line)}.tool-edit-number{display:block;padding:0 12px 6px;color:var(--faint);font-size:11px;font-family:var(--sans)}.diff-line{display:flex;min-height:1.55em;padding:0 12px;white-space:pre;font:12px/1.55 var(--mono)}.diff-prefix{flex:none;display:inline-block;width:1.7em;user-select:none;color:var(--faint)}.diff-line.delete{background:rgba(248,113,113,.1);color:#f2a29e}.diff-line.delete .diff-prefix{color:var(--error)}.diff-line.add{background:rgba(74,222,128,.1);color:#9de7b5}.diff-line.add .diff-prefix{color:var(--success)}.diff-line.context{color:#9aa4b4}@keyframes pulse{50%{opacity:.35}}@keyframes spin{to{transform:rotate(360deg)}}@media(prefers-reduced-motion:reduce){.tool-execution.running::before,.loading::before{animation:none}}@media(max-width:720px){header{padding:0 16px}.brand-path{display:none}article{padding:0 14px 80px}.run-header{margin:0 -14px;padding:18px 14px 14px}.run-header::after{left:14px;right:14px}.run-meta{gap:4px 9px}.tool-execution{padding:12px 12px 12px 16px}h1{font-size:20px}}
+:root{color-scheme:dark;--bg:#0a0c10;--surface:#11141b;--surface-2:#171b24;--inset:#0b0e13;--line:#202634;--line-strong:#2c3444;--text:#e7eaf0;--muted:#98a2b3;--faint:#5d6677;--accent:#6ee7a0;--success:#4ade80;--warning:#f0b429;--error:#f87171;--radius:10px;--mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;--sans:ui-sans-serif,-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif}*{box-sizing:border-box}html,body{height:100%}body{margin:0;background:var(--bg);color:var(--text);font:14px/1.65 var(--sans);overflow:hidden;-webkit-font-smoothing:antialiased}::selection{background:rgba(110,231,160,.3)}header{position:relative;z-index:30;height:52px;padding:0 max(20px,calc((100vw - 920px)/2));display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid var(--line);background:var(--bg);background:color-mix(in srgb,var(--bg) 90%,transparent);backdrop-filter:blur(10px)}.brand{display:flex;align-items:center;gap:9px;font-size:13px;font-weight:650;letter-spacing:-.01em}.brand-mark{color:var(--accent);font-size:14px;line-height:1}.brand-path{color:var(--muted);font-weight:400}.live{display:inline-flex;align-items:center;color:var(--faint);font-size:12px;font-variant-numeric:tabular-nums}.live:not(:empty)::before{content:"●";margin-right:7px;color:var(--accent);font-size:9px}.live.off::before{color:var(--error)}.live.reconnecting::before{color:var(--warning)}main{height:calc(100vh - 52px);min-height:0}article{width:min(920px,100%);height:100%;margin:0 auto;padding:0 26px 110px;overflow:auto;min-height:0;scrollbar-width:thin;scrollbar-color:var(--line-strong) transparent}article::-webkit-scrollbar{width:10px}article::-webkit-scrollbar-thumb{background:var(--line-strong);border-radius:5px;border:2px solid var(--bg)}article::-webkit-scrollbar-thumb:hover{background:var(--faint)}.loading{display:flex;align-items:center;justify-content:center;gap:10px;padding:96px 0;color:var(--muted);font-size:13px}.loading::before{content:"";width:14px;height:14px;border-radius:50%;border:2px solid var(--line-strong);border-top-color:var(--accent);animation:spin .8s linear infinite}.notice{padding:96px 0;text-align:center;color:var(--muted);font-size:13px}.run-header{position:sticky;top:0;z-index:10;margin:0 -26px;padding:22px 26px 16px;background:linear-gradient(180deg,var(--bg) 84%,transparent);backdrop-filter:blur(8px)}.run-header::after{content:"";position:absolute;left:26px;right:26px;bottom:8px;border-top:1px solid var(--line)}.eyebrow{margin:0 0 7px;color:var(--accent);font-size:11px;font-weight:600;letter-spacing:.1em}h1{margin:0;color:var(--text);font-size:23px;line-height:1.3;letter-spacing:-.025em;font-weight:650}.run-meta{display:flex;flex-wrap:wrap;align-items:center;gap:6px 12px;margin-top:12px;color:var(--muted);font-family:var(--mono);font-size:12px}.run-meta span{display:inline-flex;align-items:center;gap:8px}.run-meta span:not(:last-child)::after{content:"";width:3px;height:3px;border-radius:50%;background:var(--faint)}.chip{display:inline-flex;align-items:center;gap:6px;padding:1px 10px;border:1px solid var(--line-strong);border-radius:999px;background:var(--surface-2);font-family:var(--sans);font-size:11px;font-weight:600;letter-spacing:.02em}.chip::before{content:"";width:6px;height:6px;border-radius:50%;background:currentColor}.chip.running{color:var(--accent)}.chip.complete{color:var(--success)}.chip.failed{color:var(--error)}.chip.stopped,.chip.interrupted{color:var(--warning)}.chip.incomplete{color:var(--muted)}.entry{margin:26px 0}.entry h3{margin:0 0 8px;color:var(--faint);font-size:11px;font-weight:600;letter-spacing:.08em}.entry.error h3{color:var(--error)}.markdown{font-family:var(--sans);font-size:15px;line-height:1.75;color:#d4dae3}.streaming-markdown{white-space:pre-wrap;word-break:break-word}.markdown p{margin:0 0 14px}.markdown h1,.markdown h2,.markdown h3,.markdown h4,.markdown h5,.markdown h6{margin:26px 0 10px;color:var(--text);line-height:1.3;font-weight:650}.markdown h1{font-size:1.4em}.markdown h2{font-size:1.22em}.markdown h3{font-size:1.08em;letter-spacing:normal}.markdown ul,.markdown ol{margin:0 0 14px;padding-left:24px}.markdown li{margin:2px 0}.markdown code{font-family:var(--mono);font-size:.86em;color:#b8e09a;background:var(--surface-2);border:1px solid var(--line);border-radius:5px;padding:1px 5px}.markdown pre,pre{white-space:pre-wrap;word-break:break-word;margin:8px 0 0;background:var(--inset);border:1px solid var(--line);border-radius:8px;padding:12px 14px;color:#c4cdd9;font:12.5px/1.6 var(--mono)}.entry.collapsible:not(.expanded) pre{max-height:12em;overflow:hidden;mask-image:linear-gradient(to bottom,#000 68%,transparent)}.omissions{display:flex;flex-wrap:wrap;gap:4px 16px;margin:18px 0;padding:9px 14px;background:var(--surface);border:1px dashed var(--line-strong);border-radius:var(--radius)}.omission-chip{color:var(--muted);font-size:11.5px}.omission-chip::before{content:"…";margin-right:6px;color:var(--faint)}.toggle{margin-top:10px;padding:2px 0;border:0;background:none;color:var(--muted);cursor:pointer;font:12px var(--sans);display:inline-flex;align-items:center;gap:5px}.toggle:hover{color:var(--accent)}.toggle::before{content:"▸";color:var(--accent);font-size:10px;transition:transform .15s ease}.entry.expanded .toggle::before,.tool-execution.expanded .toggle::before{transform:rotate(90deg)}.tool-execution{position:relative;margin:14px 0;padding:13px 16px 13px 20px;background:var(--surface);border:1px solid var(--line);border-radius:var(--radius);box-shadow:0 1px 0 rgba(255,255,255,.02)}.tool-execution::before{content:"";position:absolute;top:0;bottom:0;left:0;width:3px;border-radius:var(--radius) 0 0 var(--radius);background:var(--faint)}.tool-execution.complete::before{background:var(--success)}.tool-execution.failed::before{background:var(--error)}.tool-execution.running::before{background:var(--accent);animation:pulse 1.4s ease-in-out infinite}.tool-execution.stopped::before,.tool-execution.interrupted::before{background:var(--warning)}.tool-execution.incomplete::before{background:var(--faint)}.tool-execution h3{display:flex;align-items:center;justify-content:space-between;gap:12px;margin:0;color:var(--text);font-size:12px;font-weight:650}.tool-name{display:flex;align-items:center;gap:8px;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-family:var(--mono);font-weight:600}.tool-name-dot{flex:none;width:7px;height:7px;border-radius:50%;background:var(--faint)}.tool-execution.complete .tool-name-dot{background:var(--success)}.tool-execution.failed .tool-name-dot{background:var(--error)}.tool-execution.running .tool-name-dot{background:var(--accent)}.tool-execution.stopped .tool-name-dot,.tool-execution.interrupted .tool-name-dot{background:var(--warning)}.tool-status{flex:none;display:inline-flex;align-items:center;gap:6px;padding:2px 10px;border:1px solid var(--line-strong);border-radius:999px;background:var(--surface-2);font-size:11px;font-weight:600}.tool-status::before{content:"";width:6px;height:6px;border-radius:50%;background:currentColor}.tool-status.complete{color:var(--success);border-color:rgba(74,222,128,.35)}.tool-status.failed{color:var(--error);border-color:rgba(248,113,113,.35)}.tool-status.running{color:var(--accent);border-color:rgba(110,231,160,.35)}.tool-status.stopped,.tool-status.interrupted{color:var(--warning);border-color:rgba(240,180,41,.35)}.tool-status.incomplete{color:var(--muted)}.tool-input{margin:10px 0 0;padding:10px 12px;background:var(--inset);border:1px solid var(--line);border-radius:8px;color:#c4cdd9;font:12px/1.6 var(--mono)}.tool-divider{border-top:1px solid var(--line);margin:12px 0 10px}.output-label{margin-bottom:6px;color:var(--faint);font-size:10px;font-weight:600;letter-spacing:.1em}.tool-output{margin:0;padding:10px 12px;background:var(--inset);border:1px solid var(--line);border-radius:8px;color:#c4cdd9;font:12px/1.6 var(--mono)}.tool-output.error{color:var(--error)}.tool-execution.collapsible.collapse-ready:not(.expanded) .tool-output{max-height:12em;overflow:hidden;mask-image:linear-gradient(to bottom,#000 68%,transparent)}.tool-edit-diff{margin-top:10px;background:var(--inset);border:1px solid var(--line);border-radius:8px;overflow-x:auto}.tool-edit-path{position:sticky;left:0;display:flex;align-items:center;gap:8px;padding:8px 12px;color:var(--muted);border-bottom:1px solid var(--line);font:12px var(--mono)}.tool-edit-path::before{content:"diff";flex:none;padding:1px 7px;border:1px solid rgba(110,231,160,.3);border-radius:999px;background:rgba(110,231,160,.12);color:var(--accent);font-family:var(--sans);font-size:10px;font-weight:600;letter-spacing:.06em}.tool-edit-block{padding:8px 0}.tool-edit-block+.tool-edit-block{border-top:1px solid var(--line)}.tool-edit-number{display:block;padding:0 12px 6px;color:var(--faint);font-size:11px;font-family:var(--sans)}.diff-line{display:flex;min-height:1.55em;padding:0 12px;white-space:pre;font:12px/1.55 var(--mono)}.diff-prefix{flex:none;display:inline-block;width:1.7em;user-select:none;color:var(--faint)}.diff-line.delete{background:rgba(248,113,113,.1);color:#f2a29e}.diff-line.delete .diff-prefix{color:var(--error)}.diff-line.add{background:rgba(74,222,128,.1);color:#9de7b5}.diff-line.add .diff-prefix{color:var(--success)}.diff-line.context{color:#9aa4b4}@keyframes pulse{50%{opacity:.35}}@keyframes spin{to{transform:rotate(360deg)}}@media(prefers-reduced-motion:reduce){.tool-execution.running::before,.loading::before{animation:none}}@media(max-width:720px){header{padding:0 16px}.brand-path{display:none}article{padding:0 14px 80px}.run-header{margin:0 -14px;padding:18px 14px 14px}.run-header::after{left:14px;right:14px}.run-meta{gap:4px 9px}.tool-execution{padding:12px 12px 12px 16px}h1{font-size:20px}}
 </style>
-<body><header><div class="brand"><span class="brand-mark">◆</span><span class="brand-name">fleet</span><span class="brand-path">/ 子代理运行</span></div><span id="updated" class="live"></span></header><main><article id="detail"><div class="loading">加载中…</div></article></main>
+<body><header><div class="brand"><span class="brand-mark">◆</span><span class="brand-name">fleet</span><span class="brand-path">/ 子代理运行</span></div><span id="updated" class="live"></span></header><main><article id="detail"><div id="stable"><div class="loading">加载中…</div></div><div id="streaming"></div></article></main>
 <script>
 const base = location.pathname.replace(/\\/$/, "");
 const detail = document.querySelector("#detail");
+const stable = document.querySelector("#stable");
+const streaming = document.querySelector("#streaming");
 const updated = document.querySelector("#updated");
 const selected = decodeURIComponent(location.hash.slice(1));
 let displayedDetail = "";
@@ -389,6 +397,141 @@ let shouldAutoScroll = false;
 let knownToolBlockIds = new Set();
 let previousToolUpdatesFingerprint;
 let hasLoadedRun = false;
+const streamingBlocks = new Map();
+const toolStreamBlocks = new Map();
+let lastStreamingReset = -1;
+
+function ensureStreamingBlock(index, type) {
+	let block = streamingBlocks.get(index);
+	if (block) {
+		if (block.type !== type) {
+			block.type = type;
+			text(block.heading, type === "thinking" ? "思考中…" : "助手");
+		}
+		return block;
+	}
+	const entry = document.createElement("section");
+	entry.className = "entry";
+	const heading = document.createElement("h3");
+	const content = document.createElement("div");
+	content.className = "markdown streaming-markdown";
+	text(heading, type === "thinking" ? "思考中…" : "助手");
+	entry.append(heading, content);
+	streaming.append(entry);
+	block = { entry, heading, content, type, text: "" };
+	streamingBlocks.set(index, block);
+	return block;
+}
+
+function applyStreamingDelta(delta) {
+	if (!delta) return;
+	if (typeof delta.toolCallId === "string") {
+		applyToolStreamDelta(delta);
+		return;
+	}
+	if (typeof delta.index !== "number") return;
+	const type = delta.type === "thinking" ? "thinking" : "text";
+	const block = ensureStreamingBlock(delta.index, type);
+	const textValue = typeof delta.text === "string" ? delta.text : "";
+	if (delta.replace) {
+		block.content.textContent = textValue;
+		block.text = textValue;
+	} else if (textValue) {
+		block.content.append(document.createTextNode(textValue));
+		block.text += textValue;
+	}
+}
+
+function applyStreamingSnapshot(snapshot) {
+	if (!Array.isArray(snapshot)) return;
+	const seen = new Set();
+	for (const part of snapshot) {
+		if (!part || typeof part.index !== "number") continue;
+		seen.add(part.index);
+		const type = part.type === "thinking" ? "thinking" : "text";
+		const block = ensureStreamingBlock(part.index, type);
+		const textValue = typeof part.text === "string" ? part.text : "";
+		if (block.text !== textValue) {
+			block.content.textContent = textValue;
+			block.text = textValue;
+		}
+	}
+	for (const [index, block] of streamingBlocks) {
+		if (!seen.has(index)) {
+			block.entry.remove();
+			streamingBlocks.delete(index);
+		}
+	}
+}
+
+function ensureToolStreamBlock(toolCallId, toolName) {
+	let block = toolStreamBlocks.get(toolCallId);
+	if (block) return block;
+	const section = document.createElement("section");
+	section.className = "tool-execution running";
+	const heading = document.createElement("h3");
+	const label = document.createElement("span");
+	label.className = "tool-name";
+	const dot = document.createElement("span");
+	dot.className = "tool-name-dot";
+	const name = document.createElement("span");
+	text(name, toolName || "tool");
+	label.append(dot, name);
+	const status = document.createElement("span");
+	status.className = "tool-status running";
+	text(status, "运行中");
+	heading.append(label, status);
+	const output = document.createElement("pre");
+	output.className = "tool-output";
+	section.append(heading, output);
+	streaming.append(section);
+	block = { section, output, text: "" };
+	toolStreamBlocks.set(toolCallId, block);
+	return block;
+}
+
+function applyToolStreamDelta(delta) {
+	if (!delta || typeof delta.toolCallId !== "string") return;
+	const block = ensureToolStreamBlock(delta.toolCallId, delta.toolName);
+	const textValue = typeof delta.text === "string" ? delta.text : "";
+	if (delta.replace) {
+		block.output.textContent = textValue;
+		block.text = textValue;
+	} else if (textValue) {
+		block.output.append(document.createTextNode(textValue));
+		block.text += textValue;
+	}
+}
+
+function pruneToolStreamBlocks(run) {
+	if (!run) return;
+	const done = new Set();
+	for (const message of run.messages || []) {
+		if (message.role === "toolResult" && message.toolCallId) done.add(message.toolCallId);
+	}
+	for (const [id, update] of Object.entries(run.toolUpdates || {})) {
+		if (update.phase === "completed") done.add(id);
+	}
+	for (const [id, block] of toolStreamBlocks) {
+		if (done.has(id)) {
+			block.section.remove();
+			toolStreamBlocks.delete(id);
+		}
+	}
+}
+
+function applyToolStreamSnapshot(toolUpdates) {
+	if (!toolUpdates) return;
+	for (const [id, update] of Object.entries(toolUpdates)) {
+		if (update.phase !== "streaming") continue;
+		const block = ensureToolStreamBlock(id, update.toolName);
+		const textValue = (update.content || []).filter((part) => part.type === "text").map((part) => part.text || "").join("");
+		if (block.text !== textValue) {
+			block.output.textContent = textValue;
+			block.text = textValue;
+		}
+	}
+}
 
 function scrollToBottom() {
 	autoScrolling = true;
@@ -527,7 +670,7 @@ function addMarkdownEntry(title, source) {
 		content.append(pre);
 	}
 	flushParagraph();
-	detail.append(entry);
+	stable.append(entry);
 }
 
 function addEntry(title, body, klass = "", collapsible = false) {
@@ -549,7 +692,7 @@ function addEntry(title, body, klass = "", collapsible = false) {
 		};
 		entry.append(toggle);
 	}
-	detail.append(entry);
+	stable.append(entry);
 }
 
 function toolOutput(content, emptyText) {
@@ -570,7 +713,7 @@ function addOmissionNotice(omitted) {
 		text(chip, notice);
 		banner.append(chip);
 	}
-	detail.append(banner);
+	stable.append(banner);
 }
 
 const ansiColors = {
@@ -869,7 +1012,7 @@ function addToolExecution(call, result, update, run, unmatchedUpdate = false) {
 			entry.append(toggle);
 		}
 	}
-	detail.append(entry);
+	stable.append(entry);
 }
 
 function formatToolValue(value) {
@@ -942,15 +1085,28 @@ function runStatus(run) {
 }
 
 function renderDetail(run, revision) {
+	// Align the live streaming layer regardless of the revision guard: it must
+	// reflect the latest snapshot even when the stable transcript is unchanged
+	// (e.g. message_start clears streaming without changing messages).
+	if (run) {
+		if (typeof run.streamingReset === "number" && run.streamingReset !== lastStreamingReset) {
+			lastStreamingReset = run.streamingReset;
+		}
+		pruneToolStreamBlocks(run);
+		applyToolStreamSnapshot(run.toolUpdates || {});
+		applyStreamingSnapshot(run.streaming || []);
+	} else {
+		applyStreamingSnapshot([]);
+	}
 	const changed = String(revision) !== displayedDetail;
 	if (!changed) return false;
 	displayedDetail = String(revision);
-	detail.replaceChildren();
+	stable.replaceChildren();
 	if (!run) {
 		const notice = document.createElement("p");
 		notice.className = "notice";
 		text(notice, "该子代理已不可用");
-		detail.append(notice);
+		stable.append(notice);
 		return changed;
 	}
 	const runHeader = document.createElement("section");
@@ -973,7 +1129,7 @@ function renderDetail(run, revision) {
 	}
 	runHeader.className = "run-header";
 	runHeader.append(eyebrow, title, meta);
-	detail.append(runHeader);
+	stable.append(runHeader);
 	addMarkdownEntry("任务", run.task);
 	addOmissionNotice(run.omitted);
 	const executions = new Map();
@@ -1000,8 +1156,12 @@ function renderDetail(run, revision) {
 	}
 	for (const entry of entries) {
 		if (entry.type === "assistant") addMarkdownEntry(entry.thinking ? "思考" : "助手", entry.text);
-		else if (entry.type === "execution") addToolExecution(entry.execution.call, entry.execution.result, toolUpdates[entry.execution.call.id], run);
-		else if (entry.type === "unmatchedUpdate") {
+		else if (entry.type === "execution") {
+			const update = toolUpdates[entry.execution.call.id];
+			if (update && update.phase === "streaming" && !entry.execution.result) continue;
+			addToolExecution(entry.execution.call, entry.execution.result, update, run);
+		} else if (entry.type === "unmatchedUpdate") {
+			if (entry.update.phase === "streaming") continue;
 			addToolExecution({ type: "toolCall", id: entry.id, name: entry.update.toolName, arguments: {} }, undefined, entry.update, run, true);
 		} else {
 			const outputText = entry.result.content.map((part) => (part.type === "text" ? part.text : "[" + part.type + " output]")).join("\\n") || "(无文本输出)";
@@ -1038,18 +1198,19 @@ async function refresh() {
 		const initialLoad = Boolean(data.run && !hasLoadedRun);
 		if (data.run) hasLoadedRun = true;
 		const hasStreamingToolUpdate = Boolean(data.run && Object.values(data.run.toolUpdates || {}).some((update) => update.phase === "streaming"));
-		shouldAutoScroll = Boolean(data.run && (initialLoad || hasNewToolBlock || hasToolBlockUpdate || (data.run.status === "running" && hasStreamingToolUpdate)));
+		const hasStreamingAssistant = Boolean(data.run && data.run.streaming && data.run.streaming.length > 0);
+		shouldAutoScroll = Boolean(data.run && (initialLoad || hasNewToolBlock || hasToolBlockUpdate || (data.run.status === "running" && (hasStreamingToolUpdate || hasStreamingAssistant))));
 		const detailChanged = renderDetail(data.run, data.revision);
 		if (detailChanged && shouldAutoScroll && Date.now() >= autoScrollPausedUntil) requestAnimationFrame(scrollToBottom);
 		updated.textContent = "实时连接";
 		updated.classList.remove("off", "reconnecting");
 	} catch (error) {
 		displayedDetail = "";
-		detail.replaceChildren();
+		stable.replaceChildren();
 		const notice = document.createElement("p");
 		notice.className = "notice";
 		text(notice, error instanceof Error ? error.message : String(error));
-		detail.append(notice);
+		stable.append(notice);
 		updated.textContent = "已断开";
 		updated.classList.add("off");
 		updated.classList.remove("reconnecting");
@@ -1082,8 +1243,32 @@ function closeFleetPage() {
 }
 
 void refresh();
-const events = new EventSource(base + "/events");
-events.addEventListener("update", scheduleRefresh);
+const events = new EventSource(base + "/events?run=" + encodeURIComponent(selected));
+events.addEventListener("update", (event) => {
+	let data;
+	try {
+		data = JSON.parse(event.data);
+	} catch {
+		scheduleRefresh();
+		return;
+	}
+	if (typeof data.reset === "number" && data.reset !== lastStreamingReset) {
+		lastStreamingReset = data.reset;
+		if (Array.isArray(data.deltas)) {
+			for (const delta of data.deltas) applyStreamingDelta(delta);
+		}
+		scheduleRefresh();
+		return;
+	}
+	if (Array.isArray(data.snapshot)) {
+		applyStreamingSnapshot(data.snapshot);
+		return;
+	}
+	if (Array.isArray(data.deltas)) {
+		for (const delta of data.deltas) applyStreamingDelta(delta);
+		if (shouldAutoScroll && Date.now() >= autoScrollPausedUntil) requestAnimationFrame(scrollToBottom);
+	}
+});
 events.addEventListener("shutdown", closeFleetPage);
 events.onerror = () => {
 	updated.textContent = "正在重连…";
@@ -1103,6 +1288,8 @@ export class FleetWebServer {
 	private port?: number;
 	private readonly token = randomBytes(20).toString("hex");
 	private readonly eventClients = new Set<ServerResponse>();
+	private readonly clientRuns = new Map<ServerResponse, string>();
+	private readonly clientCursors = new Map<ServerResponse, { reset: number; offset: number }>();
 	private readonly pendingEventClients = new Set<ServerResponse>();
 	private readonly drainingEventClients = new Set<ServerResponse>();
 	private readonly runRevisions = new Map<string, { fingerprint: string; revision: number }>();
@@ -1151,6 +1338,8 @@ export class FleetWebServer {
 			this.broadcastTimer = undefined;
 			for (const client of this.eventClients) client.end("event: shutdown\ndata: {}\n\n");
 			this.eventClients.clear();
+			this.clientRuns.clear();
+			this.clientCursors.clear();
 			this.pendingEventClients.clear();
 			this.drainingEventClients.clear();
 			const server = this.server;
@@ -1206,18 +1395,22 @@ export class FleetWebServer {
 				return;
 			}
 			if (url.pathname === `${prefix}/events`) {
+				const requestedId = url.searchParams.get("run") || "";
 				response.writeHead(200, {
 					"Content-Type": "text/event-stream; charset=utf-8",
 					"Cache-Control": "no-cache, no-transform",
 					Connection: "keep-alive",
 				});
 				this.eventClients.add(response);
+				this.clientRuns.set(response, requestedId);
 				response.once("close", () => {
 					this.eventClients.delete(response);
+					this.clientRuns.delete(response);
+					this.clientCursors.delete(response);
 					this.pendingEventClients.delete(response);
 					this.drainingEventClients.delete(response);
 				});
-				this.sendUpdate(response);
+				this.sendUpdate(response, true);
 				return;
 			}
 			if (url.pathname === `${prefix}/` || url.pathname === prefix) {
@@ -1252,13 +1445,33 @@ export class FleetWebServer {
 		this.broadcastTimer = setTimeout(() => {
 			this.broadcastTimer = undefined;
 			for (const client of this.eventClients) this.sendUpdate(client);
-		}, 50);
+		}, 0);
 		this.broadcastTimer.unref?.();
 	}
 
-	private sendUpdate(client: ServerResponse): void {
+	private streamingPayload(client: ServerResponse, initial: boolean): string {
+		const runId = this.clientRuns.get(client);
+		const run = runId ? this.store.list().find((item) => item.id === runId) : undefined;
+		if (!run) return JSON.stringify({ deltas: [], reset: 0 });
+		const cursor = this.clientCursors.get(client);
+		const offset = cursor && cursor.reset === run.streamingReset ? cursor.offset : 0;
+		if (initial) {
+			this.clientCursors.set(client, { reset: run.streamingReset, offset: run.streamingDeltas.length });
+			return JSON.stringify({
+				snapshot: run.streamingParts.map((part, index) => ({ index, type: part.type, text: capWebText(part.text, 8192) })),
+				reset: run.streamingReset,
+			});
+		}
+		const deltas = run.streamingDeltas.slice(offset);
+		this.clientCursors.set(client, { reset: run.streamingReset, offset: run.streamingDeltas.length });
+		return JSON.stringify({ deltas, reset: run.streamingReset });
+	}
+
+	private sendUpdate(client: ServerResponse, initial = false): void {
 		if (client.destroyed) {
 			this.eventClients.delete(client);
+			this.clientRuns.delete(client);
+			this.clientCursors.delete(client);
 			this.pendingEventClients.delete(client);
 			this.drainingEventClients.delete(client);
 			return;
@@ -1267,7 +1480,8 @@ export class FleetWebServer {
 			this.pendingEventClients.add(client);
 			return;
 		}
-		if (client.write("event: update\ndata: {}\n\n")) return;
+		const payload = this.streamingPayload(client, initial);
+		if (client.write(`event: update\ndata: ${payload}\n\n`)) return;
 		this.drainingEventClients.add(client);
 		client.once("drain", () => {
 			this.drainingEventClients.delete(client);

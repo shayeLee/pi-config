@@ -32,6 +32,18 @@ export interface FleetToolUpdate {
 	actualDiff?: string;
 }
 
+/** In-flight assistant text/thinking assembled from message_update deltas. */
+export interface FleetStreamingPart {
+	type: "text" | "thinking";
+	text: string;
+	truncated?: boolean;
+}
+
+/** One live-streaming event pushed to the Web UI over SSE. */
+export type FleetStreamingDelta =
+	| { index: number; type: "text" | "thinking"; text: string; replace?: boolean }
+	| { toolCallId: string; toolName: string; text: string; replace?: boolean };
+
 export interface FleetRun {
 	id: string;
 	mode: "single" | "parallel" | "chain";
@@ -40,6 +52,12 @@ export interface FleetRun {
 	messages: Message[];
 	/** Transient tool output for the live Web UI; terminal messages remain the durable transcript. */
 	toolUpdates: Record<string, FleetToolUpdate>;
+	/** Transient in-flight assistant text/thinking. Never persisted; cleared on message_end. */
+	streamingParts: FleetStreamingPart[];
+	/** Bumped on message_start/message_end so the Web UI knows when to reset its live streaming layer. */
+	streamingReset: number;
+	/** Unpushed streaming deltas; drained by the Web UI over SSE. */
+	streamingDeltas: FleetStreamingDelta[];
 	usage: FleetUsage;
 	model?: string;
 	status: FleetRunStatus;
@@ -49,7 +67,7 @@ export interface FleetRun {
 	stop: () => boolean;
 }
 
-export type RestoredFleetRun = Omit<FleetRun, "id" | "stop" | "status" | "toolUpdates"> & {
+export type RestoredFleetRun = Omit<FleetRun, "id" | "stop" | "status" | "toolUpdates" | "streamingParts" | "streamingReset" | "streamingDeltas"> & {
 	status: Exclude<FleetRunStatus, "running">;
 	toolUpdates?: Record<string, FleetToolUpdate>;
 };
@@ -67,9 +85,12 @@ export class FleetStore {
 	private listeners = new Set<FleetListener>();
 	private nextId = 1;
 
-	add(run: Omit<FleetRun, "id" | "status" | "startedAt">): FleetRun {
+	add(run: Omit<FleetRun, "id" | "status" | "startedAt" | "streamingParts" | "streamingReset" | "streamingDeltas">): FleetRun {
 		const entry: FleetRun = {
 			...run,
+			streamingParts: [],
+			streamingReset: 0,
+			streamingDeltas: [],
 			id: String(this.nextId++),
 			status: "running",
 			startedAt: Date.now(),
@@ -86,6 +107,9 @@ export class FleetStore {
 			...run,
 			id: String(this.nextId++),
 			toolUpdates: run.toolUpdates ?? {},
+			streamingParts: [],
+			streamingReset: 0,
+			streamingDeltas: [],
 			stop: () => false,
 		}));
 		this.runs = [...restoredRuns, ...activeRuns];
@@ -102,6 +126,9 @@ export class FleetStore {
 		run.status = status;
 		run.stopping = false;
 		run.endedAt = Date.now();
+		// Bump the streaming reset so the Web UI fetches the final snapshot
+		// (status badge / timeline) even when no further message boundary fires.
+		run.streamingReset++;
 		this.notify();
 	}
 
@@ -116,6 +143,7 @@ export class FleetStore {
 	markStopping(run: FleetRun): void {
 		if (run.status !== "running" || run.stopping) return;
 		run.stopping = true;
+		run.streamingReset++;
 		this.notify();
 	}
 

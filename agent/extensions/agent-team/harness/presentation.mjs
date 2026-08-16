@@ -104,6 +104,9 @@ function makeRun(overrides = {}) {
 		task: "inspect the repo",
 		messages: [],
 		toolUpdates: {},
+		streamingParts: [],
+		streamingReset: 0,
+		streamingDeltas: [],
 		usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
 		model: "fake/provider",
 		status: "running",
@@ -281,6 +284,11 @@ async function main() {
 			store.finish(r, "completed");
 			return r.status === "completed" && r.endedAt !== undefined && r.stopping === false;
 		})());
+		check("finish bumps streamingReset so the Web UI refreshes", (() => {
+			const r = store.add(makeRun());
+			store.finish(r, "completed");
+			return r.streamingReset === 1;
+		})());
 		check("finish is a no-op on a finished run", (() => {
 			const r = store.add(makeRun());
 			store.finish(r, "completed");
@@ -300,6 +308,13 @@ async function main() {
 			const first = r.stopping;
 			store.markStopping(r);
 			return first === true && r.stopping === true;
+		})());
+		check("markStopping bumps streamingReset once", (() => {
+			const r = store.add(makeRun());
+			store.markStopping(r);
+			const afterFirst = r.streamingReset;
+			store.markStopping(r);
+			return afterFirst === 1 && r.streamingReset === 1;
 		})());
 		check("clear empties the store", (() => {
 			store.add(makeRun());
@@ -635,6 +650,29 @@ async function main() {
 		});
 		const updatesWeb = webRun(updatesRun, WEB_RUN_OPTIONS[0]);
 		check("toolUpdates truncated to updateLimit with omission", Object.keys(updatesWeb?.toolUpdates ?? {}).length === 64 && updatesWeb?.omitted.toolUpdates === 16);
+
+		// In-flight streaming parts surface as a top-level `streaming` array.
+		const streamingRun = makeRun({
+			streamingParts: [
+				{ type: "thinking", text: "live-reasoning" },
+				{ type: "text", text: "live-text" },
+			],
+		});
+		const streamingWeb = webRun(streamingRun, WEB_RUN_OPTIONS[0]);
+		check(
+			"streaming parts are serialized in order with indexes",
+			Array.isArray(streamingWeb?.streaming) &&
+				streamingWeb.streaming.length === 2 &&
+				streamingWeb.streaming[0].index === 0 &&
+				streamingWeb.streaming[0].type === "thinking" &&
+				streamingWeb.streaming[0].text === "live-reasoning" &&
+				streamingWeb.streaming[1].index === 1 &&
+				streamingWeb.streaming[1].type === "text" &&
+				streamingWeb.streaming[1].text === "live-text",
+			JSON.stringify(streamingWeb?.streaming),
+		);
+		check("streamingReset is surfaced in the DTO", streamingWeb?.streamingReset === 0);
+		check("empty streaming parts omit the field", webRun(makeRun(), WEB_RUN_OPTIONS[0])?.streaming === undefined);
 	}
 
 	// ------------------------------------------------------------------------
@@ -722,6 +760,45 @@ async function main() {
 		const secondB = await readWithTimeout(readerB, 3000);
 		check("store change broadcasts a new update event", decoder.decode(secondB.value).includes("event: update"));
 		await readerB.cancel().catch(() => {});
+
+		// SSE now carries streaming snapshots/deltas for the requested run.
+		const sseDataOf = (chunk) => {
+			const text = decoder.decode(chunk.value);
+			const match = text.match(/data: ([\s\S]*?)\n\n/);
+			return match ? JSON.parse(match[1]) : undefined;
+		};
+		const streamRun = store.add(makeRun({ agent: "sse-stream" }));
+		streamRun.streamingParts = [{ type: "thinking", text: "thinking-snapshot" }];
+		streamRun.streamingReset = 1;
+		const sseC = await fetch(`${base}/events?run=${streamRun.id}`);
+		const readerC = sseC.body.getReader();
+		const firstC = await readWithTimeout(readerC, 1500);
+		const payloadC = sseDataOf(firstC);
+		check(
+			"SSE initial event carries a streaming snapshot",
+			payloadC && Array.isArray(payloadC.snapshot) && payloadC.snapshot[0]?.text === "thinking-snapshot" && payloadC.reset === 1,
+			JSON.stringify(payloadC),
+		);
+		streamRun.streamingDeltas.push({ index: 0, type: "thinking", text: "+delta" });
+		streamRun.streamingParts[0].text += "+delta";
+		store.touch();
+		const secondC = await readWithTimeout(readerC, 3000);
+		const payloadC2 = sseDataOf(secondC);
+		check(
+			"SSE broadcast carries the new delta",
+			payloadC2 && Array.isArray(payloadC2.deltas) && payloadC2.deltas.length === 1 && payloadC2.deltas[0].text === "+delta" && payloadC2.reset === 1,
+			JSON.stringify(payloadC2),
+		);
+		streamRun.streamingDeltas.push({ toolCallId: "tool-1", toolName: "bash", text: "+tool-output" });
+		store.touch();
+		const thirdC = await readWithTimeout(readerC, 3000);
+		const payloadC3 = sseDataOf(thirdC);
+		check(
+			"SSE broadcast carries tool output deltas",
+			payloadC3 && Array.isArray(payloadC3.deltas) && payloadC3.deltas[0]?.toolCallId === "tool-1" && payloadC3.deltas[0]?.toolName === "bash" && payloadC3.deltas[0]?.text === "+tool-output",
+			JSON.stringify(payloadC3),
+		);
+		await readerC.cancel().catch(() => {});
 
 		await server.close();
 		let refused = false;

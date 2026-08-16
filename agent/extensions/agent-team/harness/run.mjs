@@ -291,6 +291,25 @@ async function main() {
 		check("system prompt appended via file", step1Call.argv.includes("--append-system-prompt"));
 		check("agent system prompt content reached subagent", step1Call.systemPrompt.includes(SYSTEM_PROMPT_BODY));
 
+		// --- (9) message_update deltas stay out of the durable transcript ------
+		console.log("\n[9] message_update thinking/text deltas stay out of the durable transcript");
+		const result9 = await run({ agent: "worker", task: "SCENARIO:streaming" });
+		const messages9 = result9.details.results[0].messages;
+		const serialized9 = JSON.stringify(messages9);
+		check(
+			"final content is the authoritative message_end text",
+			result9.content[0]?.text === "FINAL-ANSWER-STREAM",
+			JSON.stringify(result9.content),
+		);
+		check("thinking/text deltas never enter the transcript", !serialized9.includes("THINKING-DELTA") && !serialized9.includes("STREAM-"), serialized9);
+		check("authoritative thinking preserved from message_end", serialized9.includes("FULL-THINKING"));
+		check(
+			"transcript has exactly one assistant message and no toolResults",
+			messages9.length === 1 && messages9[0].role === "assistant",
+			JSON.stringify(messages9.map((m) => m.role)),
+		);
+		check("result exitCode 0", result9.details.results[0].exitCode === 0);
+
 		// --- (5)-(8) stop-flow tests: POSIX-only (production uses taskkill /T on
 		// Windows, which has no process-group SIGTERM/SIGKILL semantics) ---------
 		const isWindows = process.platform === "win32";

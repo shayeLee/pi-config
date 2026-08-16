@@ -39,6 +39,7 @@ const COLLAPSED_ITEM_COUNT = 10;
 const PER_TASK_OUTPUT_CAP = 50 * 1024;
 const MAX_FLEET_TOOL_UPDATE_BYTES = 48 * 1024;
 const MAX_FLEET_TRANSIENT_BYTES = 256 * 1024;
+const MAX_FLEET_STREAMING_BYTES = 32 * 1024;
 const FLEET_TRUNCATION_MARKER = "\n\n[Fleet live output truncated]";
 
 /** Renders a subagent tool row in the opencode style: subtle background + left rail. */
@@ -108,6 +109,10 @@ function fleetToolContent(value: unknown, maxBytes: number): { content: Array<{ 
 		}
 	}
 	return { content, truncated };
+}
+
+function fleetToolOutputText(content: Array<{ type: string; text?: string }> | undefined): string {
+	return (content ?? []).filter((part) => part.type === "text").map((part) => part.text ?? "").join("");
 }
 
 function fleetActualEditDiff(result: unknown, maxBytes: number): { text?: string; truncated: boolean } {
@@ -708,6 +713,7 @@ async function runSingleAgent(
 		const diff = phase === "completed" ? fleetActualEditDiff(result, Math.min(16 * 1024, remaining)) : { truncated: false };
 		const contentBudget = Math.max(0, remaining - (diff.text ? Buffer.byteLength(diff.text) : 0));
 		const content = fleetToolContent(isRecord(result) ? result.content : undefined, contentBudget);
+		const previousText = fleetToolOutputText(fleetRun.toolUpdates[toolCallId]?.content);
 		fleetRun.toolUpdates[toolCallId] = {
 			toolName,
 			phase,
@@ -717,6 +723,41 @@ async function runSingleAgent(
 			actualDiffTruncated: diff.truncated,
 			actualDiff: diff.text,
 		};
+		// Stream tool output deltas to the Web UI (partialResult is cumulative,
+		// so diff against the previous snapshot; replace on truncation).
+		if (phase === "streaming") {
+			const newText = fleetToolOutputText(content.content);
+			if (content.truncated || !newText.startsWith(previousText)) {
+				fleetRun.streamingDeltas.push({ toolCallId, toolName, text: newText, replace: true });
+			} else {
+				const delta = newText.slice(previousText.length);
+				if (delta) fleetRun.streamingDeltas.push({ toolCallId, toolName, text: delta });
+			}
+		}
+	};
+
+	const appendStreaming = (contentIndex: number, kind: "text" | "thinking", delta: string | undefined, full: string | undefined) => {
+		const parts = fleetRun.streamingParts;
+		while (parts.length <= contentIndex) parts.push({ type: "text", text: "" });
+		const part = parts[contentIndex];
+		part.type = kind;
+		if (full !== undefined) {
+			const capped = capFleetText(full, MAX_FLEET_STREAMING_BYTES);
+			part.text = capped.text;
+			part.truncated = capped.truncated;
+			fleetRun.streamingDeltas.push({ index: contentIndex, type: kind, text: capped.text, replace: true });
+			return;
+		}
+		if (!delta || part.truncated) return;
+		if (Buffer.byteLength(part.text) + Buffer.byteLength(delta) > MAX_FLEET_STREAMING_BYTES) {
+			const capped = capFleetText(part.text + delta, MAX_FLEET_STREAMING_BYTES);
+			part.text = capped.text;
+			part.truncated = true;
+			fleetRun.streamingDeltas.push({ index: contentIndex, type: kind, text: capped.text, replace: true });
+			return;
+		}
+		part.text += delta;
+		fleetRun.streamingDeltas.push({ index: contentIndex, type: kind, text: delta });
 	};
 
 	const abortFromParent = () => {
@@ -784,12 +825,53 @@ async function runSingleAgent(
 					return;
 				}
 
+				// In-flight assistant text/thinking arrives as delta-only message_update
+				// events. Accumulate them into transient state so the Web UI can show
+				// live reasoning; message_end remains the durable authoritative message.
+				if (event.type === "message_start") {
+					fleetRun.streamingParts = [];
+					fleetRun.streamingDeltas = [];
+					fleetRun.streamingReset++;
+				}
+
+				if (event.type === "message_update" && event.assistantMessageEvent) {
+					const assistantEvent = event.assistantMessageEvent;
+					const contentIndex = typeof assistantEvent.contentIndex === "number" ? assistantEvent.contentIndex : 0;
+					switch (assistantEvent.type) {
+						case "thinking_start":
+							appendStreaming(contentIndex, "thinking", undefined, undefined);
+							break;
+						case "thinking_delta":
+							appendStreaming(contentIndex, "thinking", typeof assistantEvent.delta === "string" ? assistantEvent.delta : "", undefined);
+							break;
+						case "thinking_end":
+							appendStreaming(contentIndex, "thinking", undefined, typeof assistantEvent.content === "string" ? assistantEvent.content : undefined);
+							break;
+						case "text_start":
+							appendStreaming(contentIndex, "text", undefined, undefined);
+							break;
+						case "text_delta":
+							appendStreaming(contentIndex, "text", typeof assistantEvent.delta === "string" ? assistantEvent.delta : "", undefined);
+							break;
+						case "text_end":
+							appendStreaming(contentIndex, "text", undefined, typeof assistantEvent.content === "string" ? assistantEvent.content : undefined);
+							break;
+					}
+					emitUpdate();
+				}
+
 				if (event.type === "message_end" && event.message) {
 					const msg = event.message as Message;
 					if (!appendDurableMessage(msg)) return;
-					if (msg.role === "toolResult") delete fleetRun.toolUpdates[msg.toolCallId];
+					if (msg.role === "toolResult") {
+						delete fleetRun.toolUpdates[msg.toolCallId];
+						fleetRun.streamingReset++;
+					}
 
 					if (msg.role === "assistant") {
+						fleetRun.streamingParts = [];
+						fleetRun.streamingDeltas = [];
+						fleetRun.streamingReset++;
 						currentResult.usage.turns++;
 						const usage = msg.usage;
 						if (usage) {
@@ -815,7 +897,10 @@ async function runSingleAgent(
 				if (event.type === "tool_result_end" && event.message) {
 					const msg = event.message as Message;
 					if (appendDurableMessage(msg)) {
-						if (msg.role === "toolResult") delete fleetRun.toolUpdates[msg.toolCallId];
+						if (msg.role === "toolResult") {
+							delete fleetRun.toolUpdates[msg.toolCallId];
+							fleetRun.streamingReset++;
+						}
 						emitUpdate();
 					}
 				}
@@ -827,6 +912,7 @@ async function runSingleAgent(
 
 				if (event.type === "tool_execution_end" && event.toolCallId) {
 					updateFleetTool(event.toolCallId, typeof event.toolName === "string" ? event.toolName : "tool", "completed", event.result, Boolean(event.isError));
+					fleetRun.streamingReset++;
 					emitUpdate();
 				}
 			};

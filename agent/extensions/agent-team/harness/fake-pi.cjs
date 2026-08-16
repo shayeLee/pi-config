@@ -183,6 +183,32 @@ if (task.includes("SCENARIO:tool_result_end_only")) {
 	} else {
 		emit(assistant("CHAIN-SECOND-ANSWER"));
 	}
+} else if (task.includes("SCENARIO:streaming")) {
+	// (5) In-flight assistant text/thinking arrives as delta-only message_update
+	// events (message_start -> *_delta -> *_end -> message_end). The extension
+	// must accumulate the deltas into transient Fleet state and keep them out of
+	// the durable transcript; message_end stays authoritative.
+	emit({ type: "message_start", message: { role: "assistant", content: [] } });
+	emit({ type: "message_update", assistantMessageEvent: { type: "thinking_start", contentIndex: 0 } });
+	emit({ type: "message_update", assistantMessageEvent: { type: "thinking_delta", contentIndex: 0, delta: "THINKING-DELTA-0" } });
+	emit({ type: "message_update", assistantMessageEvent: { type: "thinking_delta", contentIndex: 0, delta: "THINKING-DELTA-1" } });
+	emit({ type: "message_update", assistantMessageEvent: { type: "thinking_end", contentIndex: 0, content: "FULL-THINKING" } });
+	emit({ type: "message_update", assistantMessageEvent: { type: "text_start", contentIndex: 1 } });
+	emit({ type: "message_update", assistantMessageEvent: { type: "text_delta", contentIndex: 1, delta: "STREAM-" } });
+	emit({ type: "message_update", assistantMessageEvent: { type: "text_end", contentIndex: 1, content: "FINAL-ANSWER-STREAM" } });
+	emit({
+		type: "message_end",
+		message: {
+			role: "assistant",
+			content: [
+				{ type: "thinking", thinking: "FULL-THINKING" },
+				{ type: "text", text: "FINAL-ANSWER-STREAM" },
+			],
+			usage: { input: 10, output: 5, cacheRead: 1, cacheWrite: 0, totalTokens: 15, cost: { total: 0.0001 } },
+			model: "fake/provider",
+			stopReason: "end",
+		},
+	});
 } else {
 	emit(assistant("UNKNOWN-TASK-ANSWER"));
 }
