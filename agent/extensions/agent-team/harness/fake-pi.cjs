@@ -216,6 +216,7 @@ if (task.includes("SCENARIO:tool_result_end_only")) {
 	emit({ type: "message_update", assistantMessageEvent: { type: "thinking_delta", contentIndex: 1e9, delta: "BAD-BIG" } });
 	emit({ type: "message_update", assistantMessageEvent: { type: "text_delta", contentIndex: -5, delta: "BAD-NEG" } });
 	emit({ type: "message_update", assistantMessageEvent: { type: "thinking_delta", contentIndex: 1.5, delta: "BAD-FRAC" } });
+	emit({ type: "tool_execution_update", toolCallId: 1, toolName: "bash", partialResult: { content: [{ type: "text", text: "BAD-TOOL" }] } });
 	emit(assistant("FINAL-ANSWER-BADINDEX"));
 } else {
 	emit(assistant("UNKNOWN-TASK-ANSWER"));

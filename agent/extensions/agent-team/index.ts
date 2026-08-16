@@ -714,11 +714,13 @@ async function runSingleAgent(
 	};
 
 	const pushStreamingDelta = (delta: FleetStreamingDelta) => {
-		// Defensive metadata cap so an oversized toolCallId/toolName cannot
-		// bypass the byte budget.
-		if ("toolCallId" in delta) {
-			if (delta.toolCallId.length > 128) delta.toolCallId = delta.toolCallId.slice(0, 128);
-			if (delta.toolName.length > 64) delta.toolName = delta.toolName.slice(0, 64);
+		// An oversized toolCallId/toolName is treated as malformed: drop the delta
+		// and force a resync instead of truncating, because truncation would break
+		// the identity the frontend uses to match blocks against toolUpdates.
+		if ("toolCallId" in delta && (delta.toolCallId.length > 128 || delta.toolName.length > 64)) {
+			clearStreamingDeltas();
+			fleetRun.streamingReset++;
+			return;
 		}
 		const bytes = deltaByteSize(delta);
 		if (fleetRun.streamingDeltas.length >= MAX_FLEET_STREAMING_DELTA_COUNT) {
@@ -943,12 +945,12 @@ async function runSingleAgent(
 					}
 				}
 
-				if (event.type === "tool_execution_update" && event.toolCallId) {
+				if (event.type === "tool_execution_update" && typeof event.toolCallId === "string") {
 					updateFleetTool(event.toolCallId, typeof event.toolName === "string" ? event.toolName : "tool", "streaming", event.partialResult);
 					emitUpdate();
 				}
 
-				if (event.type === "tool_execution_end" && event.toolCallId) {
+				if (event.type === "tool_execution_end" && typeof event.toolCallId === "string") {
 					updateFleetTool(event.toolCallId, typeof event.toolName === "string" ? event.toolName : "tool", "completed", event.result, Boolean(event.isError));
 					clearStreamingDeltas();
 					fleetRun.streamingReset++;
