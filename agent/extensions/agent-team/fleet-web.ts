@@ -1265,6 +1265,7 @@ events.addEventListener("update", (event) => {
 		clearToolStreamBlocks();
 		applyStreamingSnapshot([]);
 		scheduleRefresh();
+		events.close();
 		return;
 	}
 	if (typeof data.reset === "number" && data.reset !== lastStreamingReset) {

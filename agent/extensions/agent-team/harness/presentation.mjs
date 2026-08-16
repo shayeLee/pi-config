@@ -824,6 +824,19 @@ async function main() {
 		await readerD1.cancel().catch(() => {});
 		await readerD2.cancel().catch(() => {});
 
+		// A missing run is reported as a terminal gone:true (not a silent empty
+		// event), so the client can clear live blocks and stop refreshing.
+		const sseGone = await fetch(`${base}/events?run=does-not-exist`);
+		const readerGone = sseGone.body.getReader();
+		const firstGone = await readWithTimeout(readerGone, 1500);
+		const payloadGone = sseDataOf(firstGone);
+		check(
+			"SSE returns gone:true for a missing run",
+			payloadGone && payloadGone.gone === true && payloadGone.reset === 0,
+			JSON.stringify(payloadGone),
+		);
+		await readerGone.cancel().catch(() => {});
+
 		await server.close();
 		let refused = false;
 		try {

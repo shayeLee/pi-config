@@ -707,14 +707,26 @@ async function runSingleAgent(
 		fleetRun.streamingDeltas = [];
 	};
 
+	const deltaByteSize = (delta: FleetStreamingDelta): number => {
+		let size = STREAMING_DELTA_METADATA_BYTES + ("text" in delta ? Buffer.byteLength(delta.text) : 0);
+		if ("toolCallId" in delta) size += Buffer.byteLength(delta.toolCallId) + Buffer.byteLength(delta.toolName);
+		return size;
+	};
+
 	const pushStreamingDelta = (delta: FleetStreamingDelta) => {
-		const bytes = ("text" in delta ? Buffer.byteLength(delta.text) : 0) + STREAMING_DELTA_METADATA_BYTES;
+		// Defensive metadata cap so an oversized toolCallId/toolName cannot
+		// bypass the byte budget.
+		if ("toolCallId" in delta) {
+			if (delta.toolCallId.length > 128) delta.toolCallId = delta.toolCallId.slice(0, 128);
+			if (delta.toolName.length > 64) delta.toolName = delta.toolName.slice(0, 64);
+		}
+		const bytes = deltaByteSize(delta);
 		if (fleetRun.streamingDeltas.length >= MAX_FLEET_STREAMING_DELTA_COUNT) {
 			clearStreamingDeltas();
 			fleetRun.streamingReset++;
 		}
 		let total = 0;
-		for (const item of fleetRun.streamingDeltas) total += ("text" in item ? Buffer.byteLength(item.text) : 0) + STREAMING_DELTA_METADATA_BYTES;
+		for (const item of fleetRun.streamingDeltas) total += deltaByteSize(item);
 		if (bytes >= MAX_FLEET_STREAMING_DELTAS_BYTES || (fleetRun.streamingDeltas.length > 0 && total + bytes > MAX_FLEET_STREAMING_DELTAS_BYTES)) {
 			clearStreamingDeltas();
 			fleetRun.streamingReset++;
