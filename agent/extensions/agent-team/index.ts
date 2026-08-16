@@ -43,6 +43,7 @@ const MAX_FLEET_STREAMING_BYTES = 32 * 1024;
 const MAX_FLEET_STREAMING_PARTS = 64;
 const MAX_FLEET_STREAMING_DELTAS_BYTES = 64 * 1024;
 const MAX_FLEET_STREAMING_DELTA_COUNT = 256;
+const MAX_FLEET_TOOL_UPDATES = 64;
 const STREAMING_DELTA_METADATA_BYTES = 64;
 const FLEET_TRUNCATION_MARKER = "\n\n[Fleet live output truncated]";
 
@@ -117,6 +118,14 @@ function fleetToolContent(value: unknown, maxBytes: number): { content: Array<{ 
 
 function fleetToolOutputText(content: Array<{ type: string; text?: string }> | undefined): string {
 	return (content ?? []).filter((part) => part.type === "text").map((part) => part.text ?? "").join("");
+}
+
+function isToolId(value: unknown): value is string {
+	return typeof value === "string" && value.length > 0 && value.length <= 128 && value !== "__proto__" && value !== "constructor" && value !== "prototype";
+}
+
+function isToolName(value: unknown): value is string {
+	return typeof value === "string" && value.length > 0 && value.length <= 64;
 }
 
 function fleetActualEditDiff(result: unknown, maxBytes: number): { text?: string; truncated: boolean } {
@@ -743,6 +752,7 @@ async function runSingleAgent(
 		result: unknown,
 		isError = false,
 	) => {
+		if (phase === "streaming" && !(toolCallId in fleetRun.toolUpdates) && Object.keys(fleetRun.toolUpdates).length >= MAX_FLEET_TOOL_UPDATES) return;
 		const usedBytes = Object.entries(fleetRun.toolUpdates)
 			.filter(([id]) => id !== toolCallId)
 			.reduce((total, [, update]) => total + fleetToolUpdateBytes(update), 0);
@@ -862,6 +872,7 @@ async function runSingleAgent(
 				} catch {
 					return;
 				}
+				if (!event || typeof event !== "object" || Array.isArray(event)) return;
 
 				// In-flight assistant text/thinking arrives as delta-only message_update
 				// events. Accumulate them into transient state so the Web UI can show
@@ -898,7 +909,7 @@ async function runSingleAgent(
 					emitUpdate();
 				}
 
-				if (event.type === "message_end" && event.message) {
+				if (event.type === "message_end" && isRecord(event.message)) {
 					const msg = event.message as Message;
 					if (!appendDurableMessage(msg)) return;
 					if (msg.role === "toolResult") {
@@ -933,7 +944,7 @@ async function runSingleAgent(
 				// Tool execution events below are Fleet-only transient state and cannot
 				// affect content, details, or chain {previous}.
 
-				if (event.type === "tool_result_end" && event.message) {
+				if (event.type === "tool_result_end" && isRecord(event.message)) {
 					const msg = event.message as Message;
 					if (appendDurableMessage(msg)) {
 						if (msg.role === "toolResult") {
@@ -945,13 +956,13 @@ async function runSingleAgent(
 					}
 				}
 
-				if (event.type === "tool_execution_update" && typeof event.toolCallId === "string") {
-					updateFleetTool(event.toolCallId, typeof event.toolName === "string" ? event.toolName : "tool", "streaming", event.partialResult);
+				if (event.type === "tool_execution_update" && isToolId(event.toolCallId)) {
+					updateFleetTool(event.toolCallId, isToolName(event.toolName) ? event.toolName : "tool", "streaming", event.partialResult);
 					emitUpdate();
 				}
 
-				if (event.type === "tool_execution_end" && typeof event.toolCallId === "string") {
-					updateFleetTool(event.toolCallId, typeof event.toolName === "string" ? event.toolName : "tool", "completed", event.result, Boolean(event.isError));
+				if (event.type === "tool_execution_end" && isToolId(event.toolCallId)) {
+					updateFleetTool(event.toolCallId, isToolName(event.toolName) ? event.toolName : "tool", "completed", event.result, Boolean(event.isError));
 					clearStreamingDeltas();
 					fleetRun.streamingReset++;
 					emitUpdate();
