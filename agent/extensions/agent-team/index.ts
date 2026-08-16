@@ -752,7 +752,7 @@ async function runSingleAgent(
 		result: unknown,
 		isError = false,
 	) => {
-		if (phase === "streaming" && !(toolCallId in fleetRun.toolUpdates) && Object.keys(fleetRun.toolUpdates).length >= MAX_FLEET_TOOL_UPDATES) return;
+		if (!(toolCallId in fleetRun.toolUpdates) && Object.keys(fleetRun.toolUpdates).length >= MAX_FLEET_TOOL_UPDATES) return;
 		const usedBytes = Object.entries(fleetRun.toolUpdates)
 			.filter(([id]) => id !== toolCallId)
 			.reduce((total, [, update]) => total + fleetToolUpdateBytes(update), 0);
