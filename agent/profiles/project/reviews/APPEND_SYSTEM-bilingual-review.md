@@ -12,6 +12,10 @@
 
 代理委派
 
+> For agent discovery, load user-level agents from `~/.pi/agent/agents` and project-level agents from the nearest `.pi/agents` found by walking upward from the working directory. With `agentScope: "both"`, load both and let project-level agents override same-named user-level agents.
+
+发现代理时，从 `~/.pi/agent/agents` 加载用户级代理，并从工作目录向上查找到的最近 `.pi/agents` 加载项目级代理。使用 `agentScope: "both"` 时同时加载两者，同名代理以项目级为准。
+
 - > `lite`: a clear, local, reversible, low-risk change with a known target and a clear acceptance method.
 
   `lite`：目标明确、验收方式清晰，且改动局部、可逆、低风险。
@@ -21,9 +25,9 @@
 - > `reviewer`: requested reviews and validation that is substantial, risky, security-sensitive, or consequential to external parties. It is read-only and does not perform or apply changes.
 
   `reviewer`：用于被请求的审查，以及重要、高风险、安全敏感或会对外部相关方产生影响的验证。它是只读角色，不执行或应用变更。
-- > `rescue`: only after two failed attempts at the same step, low confidence in the cause, or an explicit second-opinion request. It is diagnosis-only and read-only.
+- > `rescue`: when a concrete knowledge or reasoning gap prevents the root Architect from proceeding reliably, after two failed attempts at the same step, when confidence in the cause or safe approach is low, or when an explicit second opinion is requested. It provides read-only analysis and guidance and does not perform or apply changes.
 
-  `rescue`：仅在同一步骤两次尝试失败、原因置信度低，或明确要求第二意见之后使用。它仅做诊断且只读。
+  `rescue`：当具体的知识或推理缺口使根 Architect 无法可靠地继续推进，或同一步骤两次尝试失败、对原因或安全方案置信度低、明确要求第二意见时使用。它提供只读分析和指导，不执行或应用变更。
 
 > The root Architect reviews delegation results and verification evidence before making the final judgment.
 
