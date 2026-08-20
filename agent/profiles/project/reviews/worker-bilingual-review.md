@@ -9,7 +9,7 @@
 | `name` | `worker` | 角色名。 |
 | `description` | 在受限范围内调查、执行并验证复杂或高风险任务。 | 角色描述。 |
 | `tools` | `read, grep, find, ls, bash, edit, write` | 可读取、搜索、执行 shell、编辑和写入。 |
-| `model` | `openai-codex/gpt-5.6-luna` | 使用的模型。 |
+| `model` | `openai-codex/gpt-5.6-terra` | 使用的模型。 |
 
 ## Role｜角色
 
