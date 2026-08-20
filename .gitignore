@@ -1,3 +1,5 @@
+node_modules
+
 agent/auth.json
 agent/models-store.json
 agent/settings.json

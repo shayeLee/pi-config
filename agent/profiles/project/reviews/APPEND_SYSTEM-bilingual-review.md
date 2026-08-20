@@ -37,6 +37,22 @@
 
 并行执行相互独立且不冲突的委派；可能相互干扰或依赖先前结果的委派应按顺序执行。
 
+> Node Toolchain Commands
+
+Node 工具链命令
+
+> Prefix each top-level Node toolchain command (`node`, `npm`, `npx`, `yarn`, `yarnpkg`, `pnpm`, or `pnpx`) with `volta run`, for example, `volta run yarn test:unit`.
+
+为每个最外层 Node 工具链命令（`node`、`npm`、`npx`、`yarn`、`yarnpkg`、`pnpm` 或 `pnpx`）加上 `volta run` 前缀，例如 `volta run yarn test:unit`。
+
+> Do not repeat the prefix for commands invoked within scripts, such as `vue-cli-service`, `cross-env`, or `patch-package`.
+
+脚本内部调用的命令（如 `vue-cli-service`、`cross-env` 或 `patch-package`）无需重复添加前缀。
+
+> In command chains, prefix each top-level command: `volta run yarn build && volta run yarn lint`.
+
+在命令链中，为每个最外层命令分别添加前缀：`volta run yarn build && volta run yarn lint`。
+
 > Always respond in Chinese unless the user explicitly requests another language.
 
 除非用户明确要求其他语言，否则始终使用中文回复。

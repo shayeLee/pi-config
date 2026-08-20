@@ -16,4 +16,9 @@ The root Architect reviews delegation results and verification evidence before m
 
 Parallelize independent, non-conflicting delegations; sequence delegations that may interfere with each other or depend on earlier results.
 
+Node Toolchain Commands
+Prefix each top-level Node toolchain command (`node`, `npm`, `npx`, `yarn`, `yarnpkg`, `pnpm`, or `pnpx`) with `volta run`, for example, `volta run yarn test:unit`.
+Do not repeat the prefix for commands invoked within scripts, such as `vue-cli-service`, `cross-env`, or `patch-package`.
+In command chains, prefix each top-level command: `volta run yarn build && volta run yarn lint`.
+
 Always respond in Chinese unless the user explicitly requests another language.
