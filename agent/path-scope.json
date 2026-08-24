@@ -1,0 +1,5 @@
+{
+  "enabled": true,
+  "extraRoots": ["~/.volta","~/Downloads"],
+  "noUI": "deny"
+}

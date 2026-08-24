@@ -5,13 +5,14 @@
       "npmjs.org",
       "*.npmjs.org",
       "*.azureedge.net",
+      "*.figma.com",
+      "*.amazonaws.com",
       "registry.npmjs.org",
       "registry.yarnpkg.com",
       "github.com",
       "*.github.com",
       "api.github.com",
       "raw.githubusercontent.com",
-      "127.0.0.1:3007",
       "127.0.0.1",
       "localhost",
       "10.0.0.205"
@@ -29,7 +30,8 @@
       "~/.cache",
       "~/Library/Caches",
       "/tmp",
-      "/private/tmp"
+      "/private/tmp",
+      "/Users/mz/Downloads"
     ],
     "denyWrite": [".env", ".env.*", "*.pem", "*.key"]
   }

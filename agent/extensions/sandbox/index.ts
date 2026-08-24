@@ -1,56 +1,39 @@
 /**
- * Sandbox Extension - OS-level sandboxing for bash commands
+ * Sandbox Extension - OS-level sandboxing for bash commands.
  *
- * Uses @anthropic-ai/sandbox-runtime to enforce filesystem and network
- * restrictions on bash commands at the OS level (sandbox-exec on macOS,
- * bubblewrap on Linux).
- *
- * Note: this example intentionally overrides the built-in `bash` tool to show
- * how built-in tools can be replaced. Alternatively, you could sandbox `bash`
- * via `tool_call` input mutation without replacing the tool.
- *
- * Config files (merged, project takes precedence):
- * - ~/.pi/agent/extensions/sandbox.json (global)
- * - <cwd>/.pi/sandbox.json (project-local)
- *
- * Example .pi/sandbox.json:
- * ```json
- * {
- *   "enabled": true,
- *   "network": {
- *     "allowedDomains": ["github.com", "*.github.com"],
- *     "deniedDomains": []
- *   },
- *   "filesystem": {
- *     "denyRead": ["~/.ssh", "~/.aws"],
- *     "allowWrite": [".", "/tmp"],
- *     "denyWrite": [".env"]
- *   }
- * }
- * ```
- *
- * Usage:
- * - `pi -e ./sandbox` - sandbox enabled with default/config settings
- * - `pi -e ./sandbox --no-sandbox` - disable sandboxing
- * - `/sandbox` - show current sandbox configuration
- *
- * Setup:
- * 1. Copy sandbox/ directory to ~/.pi/agent/extensions/
- * 2. Run `npm install` in ~/.pi/agent/extensions/sandbox/
- *
- * Linux also requires: bubblewrap, socat, ripgrep
+ * Project-local sandbox.json is deliberately treated as executable security
+ * policy: it is loaded only for a trusted project which has Pi-recognized
+ * trust-requiring resources, or which has an explicit true entry in Pi's
+ * trust.json. A trusted project may therefore widen its own bash permissions;
+ * do not trust repositories whose .pi configuration you have not reviewed.
  */
 
 import { spawn } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
-import { join } from "node:path";
-import { SandboxManager, type SandboxRuntimeConfig } from "@anthropic-ai/sandbox-runtime";
+import { existsSync, readFileSync, realpathSync } from "node:fs";
+import { isAbsolute, join, resolve } from "node:path";
+import {
+	FilesystemConfigSchema,
+	NetworkConfigSchema,
+	RipgrepConfigSchema,
+	SandboxManager,
+	SandboxRuntimeConfigSchema,
+	type SandboxRuntimeConfig,
+} from "@anthropic-ai/sandbox-runtime";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { type BashOperations, CONFIG_DIR_NAME, createBashTool, getAgentDir } from "@earendil-works/pi-coding-agent";
+import {
+	CONFIG_DIR_NAME,
+	createBashToolDefinition,
+	getAgentDir,
+	hasTrustRequiringProjectResources,
+	ProjectTrustStore,
+	type BashOperations,
+} from "@earendil-works/pi-coding-agent";
 
 interface SandboxConfig extends SandboxRuntimeConfig {
 	enabled?: boolean;
 }
+
+type ConfigLayer = Partial<SandboxConfig>;
 
 const DEFAULT_CONFIG: SandboxConfig = {
 	enabled: true,
@@ -76,78 +59,200 @@ const DEFAULT_CONFIG: SandboxConfig = {
 	},
 };
 
-function loadConfig(cwd: string): SandboxConfig {
+// The published schemas are strip schemas. Rebuild the object portions as
+// strict schemas so a typo or a newly invented permission is never ignored.
+const StrictSeccompConfigSchema = SandboxRuntimeConfigSchema.shape.seccomp.unwrap().strict();
+const StrictRuntimeConfigSchema = SandboxRuntimeConfigSchema.strict().extend({
+	network: NetworkConfigSchema.strict(),
+	filesystem: FilesystemConfigSchema.strict(),
+	ripgrep: RipgrepConfigSchema.strict().optional(),
+	seccomp: StrictSeccompConfigSchema.optional(),
+});
+const RuntimeLayerSchema = StrictRuntimeConfigSchema.partial().extend({
+	network: NetworkConfigSchema.partial().strict().optional(),
+	filesystem: FilesystemConfigSchema.partial().strict().optional(),
+	ripgrep: RipgrepConfigSchema.strict().optional(),
+	seccomp: StrictSeccompConfigSchema.optional(),
+});
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function validateLayer(value: unknown, source: string): ConfigLayer {
+	if (!isRecord(value)) throw new Error(`${source}: expected a JSON object`);
+	const { enabled, ...runtimeValue } = value;
+	if (enabled !== undefined && typeof enabled !== "boolean") {
+		throw new Error(`${source}.enabled: expected a boolean`);
+	}
+	try {
+		const parsed = RuntimeLayerSchema.parse(runtimeValue) as ConfigLayer;
+		return enabled === undefined ? parsed : { ...parsed, enabled };
+	} catch (error) {
+		throw new Error(`${source}: invalid sandbox configuration: ${error instanceof Error ? error.message : String(error)}`);
+	}
+}
+
+function readConfigFile(path: string): ConfigLayer {
+	try {
+		return validateLayer(JSON.parse(readFileSync(path, "utf8")), path);
+	} catch (error) {
+		if (error instanceof SyntaxError) throw new Error(`${path}: invalid JSON: ${error.message}`);
+		throw error;
+	}
+}
+
+function mergeValues(base: unknown, override: unknown, additiveArrays: boolean): unknown {
+	if (Array.isArray(base) && Array.isArray(override)) {
+		return additiveArrays ? [...new Set([...base, ...override])] : [...override];
+	}
+	if (isRecord(base) && isRecord(override)) {
+		const result: Record<string, unknown> = { ...base };
+		for (const [key, value] of Object.entries(override)) {
+			result[key] = key in result ? mergeValues(result[key], value, additiveArrays) : value;
+		}
+		return result;
+	}
+	return override;
+}
+
+function mergeConfig(base: ConfigLayer, override: ConfigLayer, additiveArrays: boolean): ConfigLayer {
+	return mergeValues(base, override, additiveArrays) as ConfigLayer;
+}
+
+interface LoadedConfig {
+	config: SandboxConfig;
+	projectConfigApplied: boolean;
+}
+
+function loadConfig(cwd: string, isProjectTrusted: boolean): LoadedConfig {
 	const projectConfigPath = join(cwd, CONFIG_DIR_NAME, "sandbox.json");
 	const globalConfigPath = join(getAgentDir(), "extensions", "sandbox.json");
 
-	let globalConfig: Partial<SandboxConfig> = {};
-	let projectConfig: Partial<SandboxConfig> = {};
-
-	if (existsSync(globalConfigPath)) {
-		try {
-			globalConfig = JSON.parse(readFileSync(globalConfigPath, "utf-8"));
-		} catch (e) {
-			console.error(`Warning: Could not parse ${globalConfigPath}: ${e}`);
+	// Project sandbox policy is not itself a trust-requiring resource. This
+	// prevents a repository containing only .pi/sandbox.json from changing the
+	// policy merely because it was opened. The second condition is an explicit
+	// persisted trust decision, not just a session/UI indication of trust.
+	let projectConfigApplied = false;
+	let projectConfig: ConfigLayer = {};
+	if (existsSync(projectConfigPath) && isProjectTrusted) {
+		const explicitlyTrusted = new ProjectTrustStore(getAgentDir()).getEntry(cwd)?.decision === true;
+		if (hasTrustRequiringProjectResources(cwd) || explicitlyTrusted) {
+			projectConfig = readConfigFile(projectConfigPath);
+			projectConfigApplied = true;
 		}
 	}
 
-	if (existsSync(projectConfigPath)) {
-		try {
-			projectConfig = JSON.parse(readFileSync(projectConfigPath, "utf-8"));
-		} catch (e) {
-			console.error(`Warning: Could not parse ${projectConfigPath}: ${e}`);
-		}
+	const defaultConfig = validateLayer(DEFAULT_CONFIG, "built-in defaults");
+	const globalConfig = existsSync(globalConfigPath) ? readConfigFile(globalConfigPath) : {};
+	const globalMerged = mergeConfig(defaultConfig, globalConfig, false);
+	const merged = mergeConfig(globalMerged, projectConfig, true);
+	const { enabled, ...runtimeConfig } = merged;
+	if (enabled !== undefined && typeof enabled !== "boolean") {
+		throw new Error("merged sandbox configuration: enabled must be a boolean");
 	}
-
-	return deepMerge(deepMerge(DEFAULT_CONFIG, globalConfig), projectConfig);
+	try {
+		const validatedRuntime = StrictRuntimeConfigSchema.parse(runtimeConfig) as SandboxRuntimeConfig;
+		return { config: { ...validatedRuntime, enabled: enabled ?? true }, projectConfigApplied };
+	} catch (error) {
+		throw new Error(`merged sandbox configuration is invalid: ${error instanceof Error ? error.message : String(error)}`);
+	}
 }
 
-function deepMerge(base: SandboxConfig, overrides: Partial<SandboxConfig>): SandboxConfig {
-	const result: SandboxConfig = { ...base };
+function expandHome(value: string): string {
+	if (value === "~") return process.env.HOME ?? value;
+	if (value.startsWith("~/")) return join(process.env.HOME ?? "~", value.slice(2));
+	return value;
+}
 
-	if (overrides.enabled !== undefined) result.enabled = overrides.enabled;
-	if (overrides.network) {
-		result.network = { ...base.network, ...overrides.network };
-	}
-	if (overrides.filesystem) {
-		result.filesystem = { ...base.filesystem, ...overrides.filesystem };
-	}
+function absoluteConfigPath(value: string, cwd: string): string {
+	const expanded = expandHome(value);
+	return isAbsolute(expanded) ? expanded : resolve(cwd, expanded);
+}
 
-	const extOverrides = overrides as {
-		ignoreViolations?: Record<string, string[]>;
-		enableWeakerNestedSandbox?: boolean;
+function isSameDirectory(left: string, right: string): boolean {
+	try {
+		return realpathSync(left) === realpathSync(right);
+	} catch {
+		return resolve(left) === resolve(right);
+	}
+}
+
+function absolutizeConfigPaths(config: SandboxRuntimeConfig, cwd: string): SandboxRuntimeConfig {
+	return {
+		...config,
+		network: config.network
+			? {
+					...config.network,
+					allowUnixSockets: config.network.allowUnixSockets?.map((value) => absoluteConfigPath(value, cwd)),
+				}
+			: config.network,
+		filesystem: {
+			...config.filesystem,
+			denyRead: config.filesystem.denyRead.map((value) => absoluteConfigPath(value, cwd)),
+			allowWrite: config.filesystem.allowWrite.map((value) => absoluteConfigPath(value, cwd)),
+			denyWrite: config.filesystem.denyWrite.map((value) => absoluteConfigPath(value, cwd)),
+		},
+		ignoreViolations: config.ignoreViolations
+			? Object.fromEntries(
+					Object.entries(config.ignoreViolations).map(([command, paths]) => [
+						command,
+						paths.map((value) => absoluteConfigPath(value, cwd)),
+					]),
+				)
+			: config.ignoreViolations,
+		ripgrep: config.ripgrep
+			? {
+					...config.ripgrep,
+					command:
+						config.ripgrep.command.startsWith(".") || config.ripgrep.command.startsWith("/") || config.ripgrep.command.startsWith("~")
+							? absoluteConfigPath(config.ripgrep.command, cwd)
+							: config.ripgrep.command,
+				}
+			: config.ripgrep,
+		seccomp: config.seccomp
+			? {
+					...config.seccomp,
+					bpfPath: config.seccomp.bpfPath ? absoluteConfigPath(config.seccomp.bpfPath, cwd) : undefined,
+					applyPath: config.seccomp.applyPath ? absoluteConfigPath(config.seccomp.applyPath, cwd) : undefined,
+				}
+			: config.seccomp,
 	};
-	const extResult = result as { ignoreViolations?: Record<string, string[]>; enableWeakerNestedSandbox?: boolean };
+}
 
-	if (extOverrides.ignoreViolations) {
-		extResult.ignoreViolations = extOverrides.ignoreViolations;
-	}
-	if (extOverrides.enableWeakerNestedSandbox !== undefined) {
-		extResult.enableWeakerNestedSandbox = extOverrides.enableWeakerNestedSandbox;
-	}
+function osc777Field(value: string): string {
+	// C0/C1 controls include BEL; explicitly reject ESC, ST (0x9c), and OSC
+	// separators too. Dynamic text must never be able to terminate or add OSC fields.
+	return value.replace(/[\u0000-\u001f\u007f-\u009f\u001b;]/g, " ").replace(/\s+/g, " ").trim();
+}
 
-	return result;
+function notifyOSC777(ctx: { mode: string }, title: string, body: string): void {
+	if (ctx.mode !== "tui") return;
+	process.stdout.write(`\x1b]777;notify;${osc777Field(title)};${osc777Field(body)}\x07`);
+}
+
+function createBlockedBashOps(reason: string): BashOperations {
+	return {
+		exec: async () => {
+			throw new Error(reason);
+		},
+	};
 }
 
 function createSandboxedBashOps(): BashOperations {
 	return {
-		async exec(command, cwd, { onData, signal, timeout }) {
-			if (!existsSync(cwd)) {
-				throw new Error(`Working directory does not exist: ${cwd}`);
-			}
-
-			const wrappedCommand = await SandboxManager.wrapWithSandbox(command);
-
-			return new Promise((resolve, reject) => {
+		async exec(command, cwd, { onData, signal, timeout, env }) {
+			if (!existsSync(cwd)) throw new Error(`Working directory does not exist: ${cwd}`);
+			const wrappedCommand = await SandboxManager.wrapWithSandbox(command, undefined, undefined, signal);
+			return new Promise((resolveResult, reject) => {
 				const child = spawn("bash", ["-c", wrappedCommand], {
 					cwd,
 					detached: true,
+					env: env ?? process.env,
 					stdio: ["ignore", "pipe", "pipe"],
 				});
-
 				let timedOut = false;
 				let timeoutHandle: NodeJS.Timeout | undefined;
-
 				if (timeout !== undefined && timeout > 0) {
 					timeoutHandle = setTimeout(() => {
 						timedOut = true;
@@ -160,15 +265,8 @@ function createSandboxedBashOps(): BashOperations {
 						}
 					}, timeout * 1000);
 				}
-
 				child.stdout?.on("data", onData);
 				child.stderr?.on("data", onData);
-
-				child.on("error", (err) => {
-					if (timeoutHandle) clearTimeout(timeoutHandle);
-					reject(err);
-				});
-
 				const onAbort = () => {
 					if (child.pid) {
 						try {
@@ -178,20 +276,18 @@ function createSandboxedBashOps(): BashOperations {
 						}
 					}
 				};
-
 				signal?.addEventListener("abort", onAbort, { once: true });
-
+				child.on("error", (error) => {
+					if (timeoutHandle) clearTimeout(timeoutHandle);
+					signal?.removeEventListener("abort", onAbort);
+					reject(error);
+				});
 				child.on("close", (code) => {
 					if (timeoutHandle) clearTimeout(timeoutHandle);
 					signal?.removeEventListener("abort", onAbort);
-
-					if (signal?.aborted) {
-						reject(new Error("aborted"));
-					} else if (timedOut) {
-						reject(new Error(`timeout:${timeout}`));
-					} else {
-						resolve({ exitCode: code });
-					}
+					if (signal?.aborted) reject(new Error("aborted"));
+					else if (timedOut) reject(new Error(`timeout:${timeout}`));
+					else resolveResult({ exitCode: code });
 				});
 			});
 		},
@@ -205,129 +301,166 @@ export default function (pi: ExtensionAPI) {
 		default: false,
 	});
 
-	const localCwd = process.cwd();
-	const localBash = createBashTool(localCwd);
-
-	let sandboxEnabled = false;
-	let sandboxInitialized = false;
+	type SandboxState = "blocked" | "disabled" | "enabled";
+	let sandboxState: SandboxState = "blocked";
+	let initializedConfig: SandboxRuntimeConfig | undefined;
+	let initializedCwd: string | undefined;
+	let projectConfigApplied = false;
+	let violationUnsubscribe: (() => void) | undefined;
+	const toolTemplate = createBashToolDefinition(".");
 
 	pi.registerTool({
-		...localBash,
+		...toolTemplate,
 		label: "bash (sandboxed)",
-		async execute(id, params, signal, onUpdate, _ctx) {
-			if (!sandboxEnabled || !sandboxInitialized) {
-				return localBash.execute(id, params, signal, onUpdate);
+		async execute(id, params, signal, onUpdate, ctx) {
+			if (sandboxState === "blocked") {
+				throw new Error("Sandbox is unavailable; bash is blocked until initialization succeeds (use --no-sandbox or enabled:false to explicitly disable it).");
 			}
-
-			const sandboxedBash = createBashTool(localCwd, {
-				operations: createSandboxedBashOps(),
-			});
-			return sandboxedBash.execute(id, params, signal, onUpdate);
+			const bash = createBashToolDefinition(ctx.cwd, sandboxState === "enabled" ? { operations: createSandboxedBashOps() } : undefined);
+			return bash.execute(id, params, signal, onUpdate, ctx);
 		},
 	});
 
-	pi.on("user_bash", () => {
-		if (!sandboxEnabled || !sandboxInitialized) return;
-		return { operations: createSandboxedBashOps() };
+	pi.on("user_bash", (_event, _ctx) => {
+		if (sandboxState === "enabled") return { operations: createSandboxedBashOps() };
+		if (sandboxState === "blocked") {
+			return { operations: createBlockedBashOps("Sandbox is unavailable; user bash is blocked until initialization succeeds.") };
+		}
+		return undefined;
 	});
 
 	pi.on("session_start", async (_event, ctx) => {
-		const noSandbox = pi.getFlag("no-sandbox") as boolean;
+		sandboxState = "blocked";
+		initializedConfig = undefined;
+		initializedCwd = undefined;
+		projectConfigApplied = false;
+		violationUnsubscribe?.();
+		violationUnsubscribe = undefined;
 
-		if (noSandbox) {
-			sandboxEnabled = false;
-			ctx.ui.notify("Sandbox disabled via --no-sandbox", "warning");
+		if (pi.getFlag("no-sandbox") === true) {
+			sandboxState = "disabled";
+			ctx.ui.notify("Sandbox disabled via --no-sandbox; ordinary bash is allowed.", "warning");
 			return;
 		}
 
-		const config = loadConfig(ctx.cwd);
-
-		if (!config.enabled) {
-			sandboxEnabled = false;
-			ctx.ui.notify("Sandbox disabled via config", "info");
+		let loaded: LoadedConfig;
+		try {
+			loaded = loadConfig(ctx.cwd, ctx.isProjectTrusted());
+		} catch (error) {
+			ctx.ui.notify(`Sandbox configuration failed; bash is blocked: ${error instanceof Error ? error.message : String(error)}`, "error");
+			return;
+		}
+		if (loaded.config.enabled === false) {
+			sandboxState = "disabled";
+			ctx.ui.notify("Sandbox disabled via explicit enabled:false; ordinary bash is allowed.", "info");
 			return;
 		}
 
-		const platform = process.platform;
-		if (platform !== "darwin" && platform !== "linux") {
-			sandboxEnabled = false;
-			ctx.ui.notify(`Sandbox not supported on ${platform}`, "warning");
+		const runtimePlatform = process.platform === "darwin" ? "macos" : process.platform === "linux" ? "linux" : "unknown";
+		if (!SandboxManager.isSupportedPlatform(runtimePlatform)) {
+			ctx.ui.notify(`Sandbox is not supported on ${process.platform}; bash is blocked.`, "error");
+			return;
+		}
+		// sandbox-runtime 0.0.26 builds Linux mandatory-deny rules from
+		// process.cwd(), not the command/session cwd. Refuse a cross-cwd session
+		// rather than silently omitting protections for the active project.
+		if (process.platform === "linux" && !isSameDirectory(ctx.cwd, process.cwd())) {
+			ctx.ui.notify(
+				`Sandbox cannot safely initialize for ${ctx.cwd}: Linux runtime is anchored to ${process.cwd()}; bash is blocked. Restart pi in the session directory.`,
+				"error",
+			);
 			return;
 		}
 
 		try {
-			const configExt = config as unknown as {
-				ignoreViolations?: Record<string, string[]>;
-				enableWeakerNestedSandbox?: boolean;
-			};
-
+			// `enabled` belongs to this extension, not sandbox-runtime. Remove it
+			// before strict runtime validation/initialization.
+			const runtimeConfig = { ...loaded.config };
+			delete runtimeConfig.enabled;
+			const config = absolutizeConfigPaths(runtimeConfig, ctx.cwd);
+			// Validate once more after path normalization, immediately before init.
+			const finalConfig = StrictRuntimeConfigSchema.parse(config) as SandboxRuntimeConfig;
 			const askNetwork = async ({ host, port }: { host: string; port?: number }) => {
 				if (!ctx.hasUI) return false;
-				const ok = await ctx.ui.confirm(
-					`沙箱网络请求未列入白名单:\n\n  ${host}${port ? `:${port}` : ""}\n\n允许连接吗？`,
-					ctx.cwd,
-				);
-				return Boolean(ok);
+				const target = osc777Field(`${host}${port ? `:${port}` : ""}`);
+				if (ctx.mode === "tui") notifyOSC777(ctx, "Pi 需要授权", `沙箱请求连接 ${target}`);
+				else ctx.ui.notify(`沙箱网络请求未列入白名单：${target}`, "warning");
+				return Boolean(await ctx.ui.confirm(`沙箱网络请求未列入白名单：\n\n  ${target}\n\n允许连接吗？`, ctx.cwd));
 			};
 
-			await SandboxManager.initialize(
-				{
-					network: config.network,
-					filesystem: config.filesystem,
-					ignoreViolations: configExt.ignoreViolations,
-					enableWeakerNestedSandbox: configExt.enableWeakerNestedSandbox,
-				},
-				askNetwork,
-			);
+			await SandboxManager.initialize(finalConfig, askNetwork);
+			sandboxState = "enabled";
+			initializedConfig = JSON.parse(JSON.stringify(SandboxManager.getConfig() ?? finalConfig)) as SandboxRuntimeConfig;
+			initializedCwd = ctx.cwd;
+			projectConfigApplied = loaded.projectConfigApplied;
 
-			sandboxEnabled = true;
-			sandboxInitialized = true;
+			try {
+				const store = SandboxManager.getSandboxViolationStore();
+				let lastLine = "";
+				let lastTs = 0;
+				violationUnsubscribe = store.subscribe((violations) => {
+					const violation = violations[violations.length - 1];
+					if (!violation) return;
+					const now = Date.now();
+					if (violation.line === lastLine && now - lastTs < 1000) return;
+					lastLine = violation.line;
+					lastTs = now;
+					const snippet = osc777Field(violation.line.slice(0, 120));
+					if (ctx.mode === "tui") notifyOSC777(ctx, "Pi 沙箱拦截", snippet);
+					else if (ctx.hasUI) ctx.ui.notify(`沙箱拦截：${snippet}`, "warning");
+				});
+			} catch {
+				// Monitoring is optional; sandbox enforcement remains active.
+			}
 
-			const networkCount = config.network?.allowedDomains?.length ?? 0;
-			const writeCount = config.filesystem?.allowWrite?.length ?? 0;
-			ctx.ui.setStatus(
-				"sandbox",
-				ctx.ui.theme.fg("accent", `🔒 Sandbox: ${networkCount} domains, ${writeCount} write paths`),
+			const networkCount = finalConfig.network.allowedDomains.length;
+			const writeCount = finalConfig.filesystem.allowWrite.length;
+			ctx.ui.setStatus("sandbox", ctx.ui.theme.fg("accent", `🔒 Sandbox: ${networkCount} domains, ${writeCount} write paths`));
+			ctx.ui.notify(
+				`Sandbox initialized in ${ctx.cwd}${projectConfigApplied ? "\n警告：已加载受信任项目配置；项目配置可放宽 bash 权限，请确保仓库可信。" : ""}`,
+				"info",
 			);
-			ctx.ui.notify("Sandbox initialized", "info");
-		} catch (err) {
-			sandboxEnabled = false;
-			ctx.ui.notify(`Sandbox initialization failed: ${err instanceof Error ? err.message : err}`, "error");
+		} catch (error) {
+			sandboxState = "blocked";
+			initializedConfig = undefined;
+			try {
+				await SandboxManager.reset();
+			} catch {
+				// Keep the fail-closed state even if partial cleanup fails.
+			}
+			ctx.ui.notify(`Sandbox initialization failed; bash is blocked: ${error instanceof Error ? error.message : String(error)}`, "error");
 		}
 	});
 
 	pi.on("session_shutdown", async () => {
-		if (sandboxInitialized) {
+		violationUnsubscribe?.();
+		violationUnsubscribe = undefined;
+		if (sandboxState === "enabled") {
 			try {
 				await SandboxManager.reset();
 			} catch {
-				// Ignore cleanup errors
+				// Ignore cleanup errors; no subsequent command is allowed by this state.
 			}
 		}
+		sandboxState = "blocked";
+		initializedConfig = undefined;
+		initializedCwd = undefined;
 	});
 
 	pi.registerCommand("sandbox", {
-		description: "Show sandbox configuration",
+		description: "Show the initialized sandbox configuration",
 		handler: async (_args, ctx) => {
-			if (!sandboxEnabled) {
-				ctx.ui.notify("Sandbox is disabled", "info");
+			if (sandboxState !== "enabled" || !initializedConfig) {
+				ctx.ui.notify(sandboxState === "blocked" ? "Sandbox is blocked (not initialized)." : "Sandbox is disabled.", "info");
 				return;
 			}
-
-			const config = loadConfig(ctx.cwd);
-			const lines = [
-				"Sandbox Configuration:",
-				"",
-				"Network:",
-				`  Allowed: ${config.network?.allowedDomains?.join(", ") || "(none)"}`,
-				`  Denied: ${config.network?.deniedDomains?.join(", ") || "(none)"}`,
-				"",
-				"Filesystem:",
-				`  Deny Read: ${config.filesystem?.denyRead?.join(", ") || "(none)"}`,
-				`  Allow Write: ${config.filesystem?.allowWrite?.join(", ") || "(none)"}`,
-				`  Deny Write: ${config.filesystem?.denyWrite?.join(", ") || "(none)"}`,
-			];
-			ctx.ui.notify(lines.join("\n"), "info");
+			const securityNote = projectConfigApplied
+				? "\nSecurity: trusted project policy was applied and may widen permissions."
+				: "\nSecurity: project policy was not applied.";
+			ctx.ui.notify(
+				`Sandbox initialized configuration (cwd: ${initializedCwd ?? ctx.cwd}):\n${JSON.stringify(initializedConfig, null, 2)}${securityNote}`,
+				"info",
+			);
 		},
 	});
 }
