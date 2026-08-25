@@ -6,8 +6,8 @@
  *   - Path inside the project working directory  -> allowed (no prompt)
  *   - Path outside the project                     -> ask the user to allow;
  *                                                      denied if declined
- *   - bash is intentionally NOT restricted here: it is handled by the
- *     separate `sandbox` extension (OS-level sandbox-exec), to avoid overlap.
+ *   - bash is intentionally NOT restricted here and runs without path-scope
+ *     checks.
  *
  * Once a path is approved, it stays approved for the rest of the session.
  *
