@@ -13,6 +13,7 @@ import { isAbsolute, join, resolve } from "node:path";
 export interface SandboxBashConfig {
 	enabled?: boolean;
 	allowWrite?: string[];
+	denyRead?: string[];
 }
 
 export type ConfigValidation =
@@ -26,7 +27,7 @@ export function validateSandboxBashConfig(value: unknown): ConfigValidation {
 		return { error: "expected a JSON object" };
 	}
 
-	const allowedKeys = new Set(["enabled", "allowWrite"]);
+	const allowedKeys = new Set(["enabled", "allowWrite", "denyRead"]);
 	for (const key of Object.keys(value)) {
 		if (!allowedKeys.has(key)) return { error: `unknown property ${JSON.stringify(key)}` };
 	}
@@ -35,14 +36,17 @@ export function validateSandboxBashConfig(value: unknown): ConfigValidation {
 	if (candidate.enabled !== undefined && typeof candidate.enabled !== "boolean") {
 		return { error: "enabled must be a boolean" };
 	}
-	const arr = candidate.allowWrite;
-	if (arr !== undefined && (!Array.isArray(arr) || !arr.every((s) => typeof s === "string" && s.trim().length > 0))) {
-		return { error: "allowWrite must be an array of non-empty strings" };
+	for (const field of ["allowWrite", "denyRead"] as const) {
+		const arr = candidate[field];
+		if (arr !== undefined && (!Array.isArray(arr) || !arr.every((s) => typeof s === "string" && s.trim().length > 0))) {
+			return { error: `${field} must be an array of non-empty strings` };
+		}
 	}
 
 	const config: SandboxBashConfig = {};
 	if (candidate.enabled !== undefined) config.enabled = candidate.enabled as boolean;
 	if (candidate.allowWrite !== undefined) config.allowWrite = candidate.allowWrite as string[];
+	if (candidate.denyRead !== undefined) config.denyRead = candidate.denyRead as string[];
 	return { config };
 }
 
@@ -86,29 +90,40 @@ function realpathOrSelf(value: string): string {
 	}
 }
 
+/** Absolute path without resolving symlinks (raw/literal form). */
+export function absolutePath(value: string): string {
+	const expanded = normalizeConfigPath(value);
+	return isAbsolute(expanded) ? expanded : resolve(expanded);
+}
+
 /**
- * Build a Seatbelt profile that restricts WRITE only:
+ * Build a Seatbelt profile that restricts WRITE (and, optionally, sensitive
+ * READS via denyRead):
  *   - write: deny everything, then allow only the authorized roots, plus the
  *            /dev/null and /dev/zero device nodes (git and most tools need
  *            them; devfs nodes must be re-allowed by `literal`, not `subpath`).
- *   - read / exec / network: allowed (allow default).
+ *   - read:  allowed by default (allow default), except the denyRead paths
+ *            which are denied entirely (data + metadata).
+ *   - exec / network: allowed.
  *
  * Authorized write roots = cwd + extraRoots (path-scope roots) + /tmp +
  * /private/tmp + the platform temp dir (os.tmpdir(), e.g. /var/folders on
  * macOS, which differs from /tmp).
  */
-export function buildProfile(cwd: string, extraRoots: string[]): string {
+export function buildProfile(cwd: string, extraRoots: string[], denyRead: string[]): string {
 	const tempDir = tmpdir();
 	const authorized = [
+		// Both the raw path and its realpath are listed. Directory symlinks
+		// (e.g. /var -> /private/var) are NOT resolved during matching, so the
+		// raw form is required; file symlinks ARE resolved (a write through a
+		// symlink to outside an authorized root is denied — verified).
+		absolutePath(cwd),
 		canonicalPath(cwd),
 		"/tmp",
 		"/private/tmp",
-		// Seatbelt subpath matches literally without resolving symlinks, so the
-		// temp dir must be listed under BOTH its raw path (/var/folders/…) and
-		// its realpath (/private/var/folders/…), like /tmp and /private/tmp.
 		tempDir,
 		realpathOrSelf(tempDir),
-		...extraRoots.map((entry) => canonicalPath(entry)),
+		...extraRoots.flatMap((entry) => [absolutePath(entry), canonicalPath(entry)]),
 	].filter((p): p is string => Boolean(p));
 	const unique = [...new Set(authorized)];
 
@@ -119,9 +134,16 @@ export function buildProfile(cwd: string, extraRoots: string[]): string {
 		"(deny file-write*)",
 		// device nodes: deny file-write* would also block /dev/null, which breaks
 		// git and countless tools. Devfs nodes must be re-allowed by literal
-		// (subpath cannot match them) and with file-write-data (not file-write*).
-		'(allow file-write-data (literal "/dev/null") (literal "/dev/zero"))',
+		// (subpath cannot match them). file-write* (not just file-write-data)
+		// covers >> / touch / chmod variants; devfs nodes cannot be unlinked by
+		// non-root, so the wider grant is safe.
+		'(allow file-write* (literal "/dev/null") (literal "/dev/zero"))',
 		...unique.map((p) => `(allow file-write* (subpath "${escapeProfilePath(p)}"))`),
+		// optional sensitive-read denylist (last, so it wins over everything)
+		...denyRead
+			.map((entry) => canonicalPath(entry))
+			.filter((p): p is string => Boolean(p))
+			.map((p) => `(deny file-read* (subpath "${escapeProfilePath(p)}"))`),
 	];
 	return parts.join("");
 }

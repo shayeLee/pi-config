@@ -18,21 +18,22 @@
 
 ## 行为
 
-写授权根 = **cwd（项目目录） + `path-scope.json` 的 `extraRoots` + `/tmp` + `/private/tmp` + `os.tmpdir()`**（自动包含）。
+写授权根 = **cwd（项目目录） + `path-scope.json` 的 `extraRoots` + `/tmp` + `/private/tmp` + `os.tmpdir()`**，再**减去 `~/.pi` 及其子目录**（凭据/配置目录，永不授权）。每个根同时列「原始路径 + realpath」双变体，以兼容目录符号链接（如 `/var`→`/private/var`）。
 
 | 操作 | 结果 |
 |------|------|
 | 写授权根内 | 放行 |
 | 写授权根外任何路径 | **内核拒绝** |
-| 写 `/dev/null`、`/dev/zero` | 放行（git 等工具依赖，devfs 节点用 `literal` 放行） |
+| 写 `/dev/null`、`/dev/zero` | 放行（`file-write*`，覆盖 `>`、`>>`、`touch` 等变体，git 等工具依赖） |
 | 读 / 执行 / 网络 | **完全放行** |
+| 读 `denyRead` 配置的路径 | **内核拒绝**（data + metadata） |
 
 ## 设计取舍（重要）
 
 **为什么只做写隔离，不碰读和网络？**
 
 - **写是最高危害面**：`rm -rf /`、覆盖配置、越界写文件外泄数据——这些是 read/write 工具之外的破坏面，值得用内核硬拦。
-- **读隔离性价比低**：模型想读文件，用 `read` 工具就行（path-scope 只弹窗、非硬拦），bash 里 `cat` 被拦挡不住它。强行读隔离反而会让 git（读 `~/.gitconfig`）、node（读家目录 metadata）等大量工具崩。
+- **读默认放行**：模型想读文件用 `read` 工具就行（path-scope 只弹窗、非硬拦），bash 里 `cat` 被拦挡不住它。但敏感目录（密钥、凭证）仍可用 `denyRead` **黑名单**精确拦截——这是可选的双保险。
 - **网络不碰**：之前基于 `@anthropic-ai/sandbox-runtime` 的 `sandbox` 扩展（已删除）在 macOS 上失败，根因就是 SOCKS 代理式网络白名单导致 DNS/直连被挡。
 
 需要更强管控（网络、进程、凭证、读）时，请用容器/VM（见 pi 的 `containerization.md`）。
@@ -44,7 +45,8 @@
 ```json
 {
   "enabled": true,
-  "allowWrite": ["~/Downloads"]
+  "allowWrite": ["~/Downloads"],
+  "denyRead": ["~/.ssh", "~/.aws", "~/.gnupg"]
 }
 ```
 
@@ -52,17 +54,14 @@
 |------|------|------|------|
 | `enabled` | boolean | `true` | `false` 完全禁用（回到普通 bash） |
 | `allowWrite` | string[] | `[]` | 额外写授权根，绝对/`~` 路径。cwd、`/tmp`、`/private/tmp`、`os.tmpdir()` 恒定包含 |
+| `denyRead` | string[] | `[]` | 禁止读的敏感路径（data + metadata），绝对/`~` 路径。读默认全放行，仅这些路径被内核拒绝 |
 
-写授权根的来源：**cwd + `/tmp` + `/private/tmp` + `os.tmpdir()` 恒定**，再叠加 `path-scope.json` 的 `extraRoots` 和本配置的 `allowWrite`。改任一配置后 `/reload` 重读。
+写授权根的来源：**cwd + `/tmp` + `/private/tmp` + `os.tmpdir()` 恒定**，再叠加 `path-scope.json` 的 `extraRoots` 和本配置的 `allowWrite`，但**自动过滤掉 `~/.pi`（含 `~/.pi/agent`）及其子路径**——这些目录存有 `auth.json`、`settings.json`、扩展自身代码，绝不能成为 bash 写授权根。改任一配置后 `/reload` 重读。
 
 ## 环境要求
 
 - macOS，且 `/usr/bin/sandbox-exec` 存在（系统自带）。
 - 非 macOS 平台：扩展**静默不干预**，内置 bash 工具照常工作。
-
-## volta 工具链
-
-`shellCommandPrefix`（`~/.pi/agent/settings.json`）会在沙箱前被前置进命令，因此 `node`/`yarn` 的 volta 包装在沙箱内仍生效。
 
 ## 单元 / 集成测试
 
@@ -71,10 +70,10 @@ cd ~/.pi/agent/extensions/sandbox-bash
 volta run node --test core.test.ts
 ```
 
-纯函数测试（schema、path 转义/规范化、profile 生成）任何时候可跑；4 个 `sandbox-exec` 集成测试在非 macOS 自动跳过，覆盖「cwd 内可写 / `/dev/null` 可写 / cwd 外写被拒 / 读任意路径放行」。
+纯函数测试（schema、path 转义/规范化、profile 生成、双变体）任何时候可跑；6 个 `sandbox-exec` 集成测试在非 macOS 自动跳过，覆盖「cwd 内可写 / `/dev/null` 可写（`>` 与 `>>`/`touch`）/ cwd 外写被拒 / 读任意路径放行 / denyRead 被拒」。
 
 ## 已知局限
 
-1. **只限写，不限读/网络**。这是刻意的取舍，见「设计取舍」。
-2. **写授权根是路径前缀匹配**（Seatbelt `subpath`），对符号链接不解析；已列 `/tmp`、`/private/tmp`、`os.tmpdir()` 三个临时目录别名。
+1. **写隔离 + 读黑名单（denyRead）**，读默认放行、网络不碰。这是刻意的取舍，见「设计取舍」。
+2. **目录符号链接（如 `/var`→`/private/var`）不解析**，故每个根同时列 raw + realpath 双变体；**文件符号链接会被解析**（写指向授权根外的符号链接被内核拒绝，已实测）。
 3. **这是护栏，不是完整安全边界**：不可信/对抗性代码请用容器或 VM。
