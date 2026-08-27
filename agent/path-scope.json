@@ -1,5 +1,12 @@
 {
   "enabled": true,
-  "extraRoots": ["~/.volta","~/Downloads"],
+  "extraRoots": [
+    "/tmp",
+    "/private/tmp",
+    "~/.volta",
+    "~/.agents",
+    "~/.pi",
+    "~/Downloads"
+  ],
   "noUI": "deny"
 }
