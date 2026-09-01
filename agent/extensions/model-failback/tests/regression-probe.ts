@@ -237,6 +237,19 @@ async function runRegressionTests(): Promise<TestResult[]> {
     expect(verdict.scope === "cross-provider", `unexpected scope: ${verdict.scope}`);
   }));
 
+  results.push(await runTest("modelscope insufficient balance is detected", () => {
+    const verdict = modelscopeHandler.inspect(
+      assistantFailure(
+        "modelscope",
+        "Qwen/Qwen3.8-Flash-Next",
+        '429: {"message":"insufficient balance","request_id":"b28841ac-1751-4d0b-83ad-f73965c570ac"}',
+      ),
+    );
+    expect(verdict, "modelscope insufficient balance was not detected");
+    expect(verdict.reason === "quota_exhausted", `unexpected reason: ${verdict.reason}`);
+    expect(verdict.scope === "cross-provider", `unexpected scope: ${verdict.scope}`);
+  }));
+
   results.push(await runTest("modelscope transient/auth errors do not match", () => {
     const auth = modelscopeHandler.inspect(
       assistantFailure("modelscope", "x", "401: InvalidApiKey"),

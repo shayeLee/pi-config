@@ -8,6 +8,7 @@
  * 实测错误形状:
  *   429: {"code":"insufficient_quota","message":"You exceeded your current
  *        quota, please check your plan and billing details...","type":"insufficient_quota"}
+ *   429: {"message":"insufficient balance","request_id":"..."}
  */
 
 import type { ProviderFailbackHandler, TerminalVerdict } from "./types";
@@ -31,6 +32,7 @@ function isQuotaExhausted(text: string): boolean {
     /insufficient_quota/i.test(text) ||
     /you exceeded your current quota/i.test(text) ||
     /free\s+allocated\s+quota/i.test(text) ||
+    /insufficient\s+balance/i.test(text) ||
     /out\s+of\s+budget/i.test(text)
   );
 }

@@ -46,7 +46,7 @@ message_end(assistant, error)
 
 ## 工作原理(modelscope)
 
-`modelscope` 推理 API 底层为阿里云百炼(Model Studio)的 OpenAI-compatible completions 端点。仅覆盖账户/计划额度耗尽终态:命中 `insufficient_quota`、`You exceeded your current quota`、`Free allocated quota exceeded`,或 `out of budget` 时,判定为 `reason: "quota_exhausted"`、`scope: "cross-provider"`。
+`modelscope` 推理 API 底层为阿里云百炼(Model Studio)的 OpenAI-compatible completions 端点。仅覆盖账户/计划额度耗尽终态:命中 `insufficient_quota`、`You exceeded your current quota`、`Free allocated quota exceeded`、`insufficient balance`,或 `out of budget` 时,判定为 `reason: "quota_exhausted"`、`scope: "cross-provider"`。
 
 瞬时频率/并发限流(`Throttling.RateQuota`、`BurstRate`、`Concurrency`)与鉴权错误(`InvalidApiKey`)**不会**触发——前者交给 pi 的退避重试,后者属配置问题换 provider 也无效。
 
@@ -169,7 +169,8 @@ export const myProviderHandler: ProviderFailbackHandler = {
 - 四个 provider 的终态判定、provider 隔离和无关错误过滤
 - Codex 流式原文 `Codex error: The usage limit has been reached`
 - OpenCode `CreditsError / Insufficient balance`
-- ModelScope `insufficient_quota`
+- ModelScope `insufficient_quota` 与 `429 {"message":"insufficient balance"}`
+- ModelScope Qwen 的 `insufficient balance` 真实 lite subagent 接续
 - 两层 failback、链内已 ban 节点跳过、环检测、连跳上限和 cross-provider 守卫
 - worker/reviewer 子进程启动前跳过已 ban 模型
 - `reload` 保留当前 session ban
