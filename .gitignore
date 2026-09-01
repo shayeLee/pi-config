@@ -4,6 +4,9 @@ agent/auth.json
 agent/models-store.json
 agent/settings.json
 agent/trust.json
+agent/model-failback.json
+agent/model-failback-bans-*.json
+agent/model-failback-bans-*.json.*
 
 agent/bin
 agent/sessions

@@ -1,0 +1,188 @@
+# model-failback
+
+订阅/账户**终态错误**(如 ChatGPT 订阅额度用尽)时的**会话内模型 failback**:
+自动切换到备用模型并让 agent 从失败点继续,**会话上下文不中断、不重启、不重跑任务**。
+
+与重跑式 failback 的区别:
+
+| | 重跑式(agent-team 父进程) | model-failback(本扩展) |
+|---|---|---|
+| 层次 | 进程级:失败后重新 spawn | 请求级:会话内 `setModel` + steering |
+| 上下文 | 全部丢失,从头再来 | 原样保留,失败点继续 |
+| 时窗 | 仅"起步即挂" | 任意时刻(包括任务中途) |
+| 适用范围 | agent-team subagent | 主会话 + subagent 子进程都生效 |
+
+## 为什么按 provider 判定
+
+ChatGPT 订阅 backend 与其他 provider 的终态错误形状完全不同(错误码、文案、作用域),因此判定做成了**按 provider 分派**的插拔层。当前已实现并注册 `openai-codex`、`opencode`、`opencode-go` 与 `modelscope`;接入新 provider 只需新增一个文件并注册一行,见下文"扩展新 provider"。
+
+## 工作原理(openai-codex)
+
+`openai-codex` 走 ChatGPT 订阅 backend(`chatgpt.com/backend-api`)。额度类错误是**账户级终态**:重试与同 provider 换模型都无效,只能跨 provider 切换。
+
+扩展监听 `message_end`,当 assistant 消息以 `stopReason === "error"` 结束且命中终态判定时展开 failback:
+
+```text
+message_end(assistant, error)
+  → 按 message.provider 分派判定 handler
+  → 终态?逐层锚定:
+      1. pi 归一文案:"You have hit your ChatGPT usage limit …"
+      2. 错误码:     usage_limit_reached / usage_not_included
+      3. 订阅历史词: GoUsageLimitError / FreeUsageLimitError / Monthly usage limit reached
+      4. 流式原文:   "Codex error: The usage limit has been reached"
+  → 跳过已 ban 的链节点 → 环检测 + 连跳上限(前进放行、成环拦截)
+  → 解析 fallback 目标(精确键 → provider 通配 → 全局通配)
+  → cross-provider 守卫:跳过同 provider 目标
+  → setModel(备用模型)→ 写入台账 → 通知 → steering 让 agent 继续当前任务
+```
+
+`resetsAt` 从 pi 文案 "Try again in ~N min." 推算,记入台账;`autoRestore` 打开后,额度到点的下一次任务开始前自动切回原模型。
+
+## 工作原理(opencode)
+
+`opencode` 与 `opencode-go` 当前都仅覆盖账户余额耗尽终态:assistant 消息必须是 `stopReason === "error"`，且 `errorMessage` 命中 JSON body 的 `type=CreditsError`，或包含 `Insufficient balance` / `insufficient credits`。两者共享同一份 `CreditsError` 判定实现，但作为不同 provider 拥有独立的额度与映射；判定结果为 `reason: "credits_exhausted"`、`scope: "cross-provider"`，因此只会跨 provider 切换。
+
+`ModelError` 属于模型/端点错误，不会触发；无 API key 属于初始化阶段错误，发生在扩展能收到 `message_end` 之前，扩展没有机会覆盖，同样不会触发。
+
+## 工作原理(modelscope)
+
+`modelscope` 推理 API 底层为阿里云百炼(Model Studio)的 OpenAI-compatible completions 端点。仅覆盖账户/计划额度耗尽终态:命中 `insufficient_quota`、`You exceeded your current quota`、`Free allocated quota exceeded`,或 `out of budget` 时,判定为 `reason: "quota_exhausted"`、`scope: "cross-provider"`。
+
+瞬时频率/并发限流(`Throttling.RateQuota`、`BurstRate`、`Concurrency`)与鉴权错误(`InvalidApiKey`)**不会**触发——前者交给 pi 的退避重试,后者属配置问题换 provider 也无效。
+
+## 配置
+
+`~/.pi/agent/model-failback.json`:链式表达 `A → B → C`,首节点可为 `provider/*` 通配:
+
+```json
+{
+  "chains": [
+    ["opencode/*", "opencode-go/deepseek-v4-flash", "rightcode-codex/gpt-5.6-luna"],
+    ["openai-codex/gpt-5.6-luna", "opencode-go/deepseek-v4-flash", "rightcode-codex/gpt-5.6-luna"],
+    ["openai-codex/gpt-5.6-sol", "rightcode-codex/gpt-5.6-sol"]
+  ],
+  "maxConsecutive": 3,
+  "banFileTtlMs": 604800000,
+  "cooldownMs": 60000,
+  "autoRestore": false
+}
+```
+
+| 字段 | 默认 | 说明 |
+|---|---|---|
+| `chains` | 无 | 链式映射:每项是字符串数组 `["A","B","C"]`,A 终态切 B,B 终态切 C;首节点支持 `provider/*` 通配 |
+| `fallbacks` | `{}` | 旧平面映射 `"provider/model" → "provider/model"`,向后兼容;配置了 `chains` 时优先按链解析 |
+| `cooldownMs` | `60000` | 向后兼容保留;不再参与切换拦截(由环检测 + `maxConsecutive` 接管) |
+| `maxConsecutive` | `3` | 单次 failback 链允许的最大连续切换次数 |
+| `banFileTtlMs` | `604800000` | 孤儿 session ban 文件的惰性清理 TTL(7 天);设为 `0` 或负数关闭 |
+| `autoRestore` | `false` | 配额恢复后自动切回原模型(每次 agent 启动时检查,不打断进行中的任务) |
+
+### 链式语义
+
+- 链中节点按位置解析:命中某个非尾节点 → 切到下一节点;尾节点无再下一跳。
+- `opencode/*` 这种首节点通配支持整 provider 兜底;中间节点通常写精确模型 key。
+- 前进方向连跳放行,由两层机制防失控:
+
+  - **环检测**:目标模型若已出现在当前链中(成环),拒绝切换;
+  - **连跳上限**:超过 `maxConsecutive` 次连续切换即停在最后一跳并报错。
+
+### 跨 subagent 的精确模型 ban
+
+终态发生后，扩展会把**实际失败的精确模型**写入 `~/.pi/agent/model-failback-bans-<session-id>.json`。agent-team 的每个 worker 都是新 Pi 进程，但会继承主 session ID，共享该 session 的 ban；主 session 结束时自动删除文件。若 A、B 已先后耗尽，下一 worker 会直接从 C 开始，不会再为 A/B 各白撞一次。
+
+- ban 只在当前主 session 内共享，不跨 session；主 session 结束后自动清空。
+- 连跳上限和环检测只覆盖同一条连续 failback 链；steering continuation 保留链，下一条新任务自动重置。
+- **只 ban `provider/model`，绝不 ban 整个 provider**；例如 ModelScope Flash 用尽不影响同 provider 的 Pro/Qwen。
+- ban 记录保留到其 `resetsAt` 到期，或手动 `/failback unban <provider/model>` / `/failback reset`；没有明确恢复时间的余额错误，充值后需手动解除。
+- Pi 的 `/model` 没有可取消的事前 extension hook；用户手动选回已 ban 模型时，扩展会在 `model_select` 后立即纠正到链上下一可用节点。
+
+- ban 文件 GC 只由主 Pi 在 `session_start` 执行，worker 子进程不扫描；当前 session 文件和有活跃 lock 的文件不会被删除。
+- 超过 TTL 的异常退出遗留文件会被清理；正常 session 结束仍通过生命周期事件即时删除。
+
+会话级切换:`pi.setModel` 不持久化到 settings 默认模型,新会话仍用原默认模型。
+
+## 命令
+
+| 命令 | 说明 |
+|---|---|
+| `/failback` | 状态:支持 providers、当前映射、跨子进程 ban、连续切换次数、切换链、原模型、配额恢复估计 |
+| `/failback restore` | 强制切回 failback 前的原模型，并清空当前链状态；不会被 ban 重定向立即撤销 |
+| `/failback unban <provider/model>` | 解除一个精确模型 ban；`all` 清除全部 ban |
+| `/failback reset` | 清空会话状态与全部 ban |
+
+## 测试
+
+默认离线回归测试（不发起 LLM 请求）：
+
+```bash
+volta run node tests/run-regression.mjs
+```
+
+显式运行真实 OpenCode → RightCode failback E2E：
+
+```bash
+volta run node tests/e2e-opencode-credits.mjs
+```
+
+E2E 会真实调用 provider，前提是 `opencode` 账户当前无余额，并且本机同时具备 `opencode` 与 `rightcode-codex` 的有效鉴权；它不会被默认回归命令调用。
+
+## 当前状态
+
+当前实现已经完成并启用:
+
+- 支持 `openai-codex`、`opencode`、`opencode-go`、`modelscope` 四个 provider;
+- 使用 `chains` 表达多层 failback，精确节点优先于通配节点;
+- 终态发生后只 ban 精确的 `provider/model`，不 ban 整个 provider;
+- ban 在同一主 session 的 worker/reviewer 子进程之间共享，不跨 session;
+- session 结束时清理 ban，`/reload` 保留 ban;
+- 主 session 启动时按 `banFileTtlMs` 惰性清理异常退出遗留文件，默认 TTL 为 7 天;
+- 多个并行 subagent 写入同一 session ban 文件时使用跨进程锁;
+- `/failback restore`、`/failback unban`、`/failback reset` 可进行人工干预。
+
+## 扩展新 provider
+
+1. 在 `providers/` 新建 `my-provider.ts`,实现接口:
+
+```ts
+import type { ProviderFailbackHandler, TerminalVerdict } from "./types";
+
+export const myProviderHandler: ProviderFailbackHandler = {
+  providerId: "my-provider", // 换成你的 provider id
+  inspect(message): TerminalVerdict | null {
+    // role/stopReason/provider 过滤后,对 errorMessage 做判定
+    // 返回 null = 与该 provider 无关或非终态;
+    // 返回 { reason, scope, resetsAt?, note? } = 需要 failback
+    //   scope: "cross-provider" 表示账户级终态,拒绝同 provider 目标;
+    //          "any" 则允许同 provider 换模型
+    return null;
+  },
+};
+```
+
+2. 在 `providers/registry.ts` 的 `HANDLERS` 数组注册。
+
+引擎、配置、命令、台账零改动。
+
+## 已验证
+
+- 扩展被 pi 正常加载,不干扰正常任务
+- 四个 provider 的终态判定、provider 隔离和无关错误过滤
+- Codex 流式原文 `Codex error: The usage limit has been reached`
+- OpenCode `CreditsError / Insufficient balance`
+- ModelScope `insufficient_quota`
+- 两层 failback、链内已 ban 节点跳过、环检测、连跳上限和 cross-provider 守卫
+- worker/reviewer 子进程启动前跳过已 ban 模型
+- `reload` 保留当前 session ban
+- 并行 ban 写入不丢记录、TTL 孤儿文件清理
+- 真实端到端:
+  - `opencode/gpt-5.6-sol` → `rightcode-codex/gpt-5.6-sol`
+  - `modelscope/deepseek-ai/DeepSeek-V4-Flash-0731` → `openai-codex/gpt-5.6-luna`
+  - `openai-codex/gpt-5.6-terra` → `rightcode-codex/gpt-5.6-terra`
+- 离线回归测试 `24/24` 通过
+
+## 待观察
+
+- `opencode-go` 真实 CreditsError 触发后的二跳，目前仅完成离线链路验证;
+- `resetsAt` 与 provider 实际恢复时间的偏差;
+- `autoRestore` 的真实额度恢复端到端行为;
+- 异常强杀后只能依赖 TTL 清理遗留文件,无法保证立即清理。

@@ -844,11 +844,19 @@ async function runSingleAgent(
 
 		const exitCode = await new Promise<number>((resolve) => {
 			const invocation = getPiInvocation(args);
+			const failbackSessionId = process.env.MODEL_FAILBACK_SESSION_ID ?? process.env.PI_SESSION_ID;
 			const proc = spawn(invocation.command, invocation.args, {
 				cwd: cwd ?? defaultCwd,
 				detached: process.platform !== "win32",
 				shell: false,
 				stdio: ["ignore", "pipe", "pipe"],
+				env: {
+					...process.env,
+					...(failbackSessionId
+						? { MODEL_FAILBACK_SESSION_ID: failbackSessionId }
+						: {}),
+					MODEL_FAILBACK_CHILD: "1",
+				},
 			});
 			childProcess = proc;
 			childPid = proc.pid;
