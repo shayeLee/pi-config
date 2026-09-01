@@ -165,6 +165,32 @@ if (task.includes("SCENARIO:tool_result_end_only")) {
 		isError: false,
 	});
 	emit(assistant("FINAL-ANSWER-C"));
+} else if (task.includes("SCENARIO:model_failback")) {
+	// A terminal source model followed by a failback target. agent-team must
+	// expose the final target in Fleet/result metadata, not the startup model.
+	emit({
+		type: "message_end",
+		message: {
+			role: "assistant",
+			content: [],
+			usage: { input: 10, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 10, cost: { total: 0 } },
+			provider: "modelscope",
+			model: "Qwen/Qwen3.8-Flash-Next",
+			stopReason: "error",
+			errorMessage: '429: {"message":"insufficient balance"}',
+		},
+	});
+	emit({
+		type: "message_end",
+		message: {
+			role: "assistant",
+			content: [{ type: "text", text: "FAILBACK-FINAL-ANSWER" }],
+			usage: { input: 20, output: 5, cacheRead: 0, cacheWrite: 0, totalTokens: 25, cost: { total: 0.0001 } },
+			provider: "rightcode-codex",
+			model: "gpt-5.6-terra",
+			stopReason: "end",
+		},
+	});
 } else if (task.includes("SCENARIO:chain")) {
 	// (4) Chain steps. Step 1 carries a durable tool result that must NOT leak
 	// into {previous}; only the final assistant text may be substituted.

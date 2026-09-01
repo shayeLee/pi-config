@@ -238,7 +238,18 @@ async function main() {
 		);
 		check("details messages carry no transient output", !JSON.stringify(result3.details).includes("TRANSIENT"));
 
-		// --- (4) chain {previous} only from the previous final assistant text ---
+		// --- (4) model-failback updates result/Fleet model to final target --------
+		console.log("\n[4] model-failback updates subagent model metadata");
+		const resultFailback = await run({ agent: "worker", task: "SCENARIO:model_failback" });
+		const failbackResult = resultFailback.details.results[0];
+		check("failback final answer preserved", resultFailback.content[0]?.text === "FAILBACK-FINAL-ANSWER");
+		check(
+			"failback result model is final target",
+			failbackResult.model === "rightcode-codex/gpt-5.6-terra",
+			String(failbackResult.model),
+		);
+
+		// --- (5) chain {previous} only from the previous final assistant text ---
 		console.log("\n[4] chain {previous} is replaced only by the previous step's final assistant text");
 		const result4 = await run({
 			chain: [

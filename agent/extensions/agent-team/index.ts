@@ -940,7 +940,13 @@ async function runSingleAgent(
 							currentResult.usage.cost += usage.cost?.total || 0;
 							currentResult.usage.contextTokens = usage.totalTokens || 0;
 						}
-						if (!currentResult.model && msg.model) currentResult.model = msg.model;
+						// 子进程内 model-failback 会在同一任务中 setModel；以每条 assistant
+						// message_end 的真实 provider/model 覆盖启动配置，Fleet UI 显示最终落点。
+						if (typeof msg.provider === "string" && typeof msg.model === "string") {
+							currentResult.model = `${msg.provider}/${msg.model}`;
+						} else if (msg.model) {
+							currentResult.model = msg.model;
+						}
 						if (msg.stopReason) currentResult.stopReason = msg.stopReason;
 						if (msg.errorMessage) currentResult.errorMessage = msg.errorMessage;
 					}
