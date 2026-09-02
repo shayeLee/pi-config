@@ -184,20 +184,24 @@ export function createEngine(
     }
   });
 
-  pi.on("message_end", async (event, ctx: ExtensionContext) => {
-    const fail = extractFailure(event.message);
-    if (!fail) return;
+  const handleTerminalFailure = async (
+    message: unknown,
+    ctx: ExtensionContext,
+    options: { steer: boolean },
+  ): Promise<boolean> => {
+    const fail = extractFailure(message);
+    if (!fail) return false;
 
     const provider = fail.provider ?? ctx.model?.provider;
     const handler = getProviderHandler(provider);
-    if (!handler) return; // 未注册的 provider:保持现状,不外扩行为
+    if (!handler) return false; // 未注册的 provider:保持现状,不外扩行为
 
-    const verdict = handler.inspect(event.message);
-    if (!verdict) return;
+    const verdict = handler.inspect(message);
+    if (!verdict) return false;
 
     const sourceProvider = typeof provider === "string" ? provider : "unknown";
     const currentModel = (fail.model as string) ?? ctx.model?.id;
-    if (typeof currentModel !== "string") return;
+    if (typeof currentModel !== "string") return false;
     const prevKey = modelKey(sourceProvider, currentModel);
 
     // 先持久化精确模型 ban；即使后续没有可用 fallback，下一个 subagent 也不会再撞它。
@@ -229,7 +233,7 @@ export function createEngine(
         `[model-failback] ${prevKey} 终态,但链上没有未 ban 的 fallback,任务将中断`,
         "error",
       );
-      return;
+      return false;
     }
 
     // ---- 环检测:目标已在当前 failback 链中出现过,拒绝成环切换 ----
@@ -238,7 +242,7 @@ export function createEngine(
         `[model-failback] 检测到切换环: ${target.target} 已在此链失败过,停止 failback,任务将中断`,
         "error",
       );
-      return;
+      return false;
     }
 
     // ---- 连跳上限 ----
@@ -248,11 +252,11 @@ export function createEngine(
         `[model-failback] 已达连跳上限(${maxConsecutive}),停止 failback,任务将中断`,
         "error",
       );
-      return;
+      return false;
     }
 
     // ---- 切换 ----
-    if (!(await setTargetModel(pi, ctx, target))) return;
+    if (!(await setTargetModel(pi, ctx, target))) return false;
 
     // ---- 台账 ----------------
     if (state.chain.length === 0) state.chain.push(prevKey);
@@ -280,12 +284,51 @@ export function createEngine(
       "warning",
     );
 
-    continuationPending = true;
-    pi.sendUserMessage(
-      `[model-failback] 之前的模型(${prevKey})发生终态错误(${failureReason})。` +
-        `已切换到备用模型(${target.target}),请继续完成之前的任务,不要重复已完成的步骤。`,
-      { deliverAs: "steer" },
+    if (options.steer) {
+      continuationPending = true;
+      pi.sendUserMessage(
+        `[model-failback] 之前的模型(${prevKey})发生终态错误(${failureReason})。` +
+          `已切换到备用模型(${target.target}),请继续完成之前的任务,不要重复已完成的步骤。`,
+        { deliverAs: "steer" },
+      );
+    }
+    return true;
+  };
+
+  pi.on("message_end", async (event, ctx: ExtensionContext) => {
+    await handleTerminalFailure(event.message, ctx, { steer: true });
+  });
+
+  let compactionRetryInFlight = false;
+  pi.on("session_compact_failed", async (event, ctx: ExtensionContext) => {
+    if (event.aborted || !event.errorMessage || compactionRetryInFlight) return;
+    const current = ctx.model;
+    if (!current) return;
+
+    const switched = await handleTerminalFailure(
+      {
+        role: "assistant",
+        stopReason: "error",
+        provider: current.provider,
+        model: current.id,
+        errorMessage: event.errorMessage,
+      },
+      ctx,
+      { steer: false },
     );
+    if (!switched) return;
+
+    compactionRetryInFlight = true;
+    ctx.compact({
+      onComplete: () => {
+        compactionRetryInFlight = false;
+        ctx.ui.notify("[model-failback] 已使用备用模型重新压缩上下文", "info");
+      },
+      onError: (error) => {
+        compactionRetryInFlight = false;
+        ctx.ui.notify(`[model-failback] 备用模型压缩仍失败: ${error.message}`, "error");
+      },
+    });
   });
 
   // ---- 自动恢复:autoRestore 打开时,在每次 agent 启动检查配额是否已恢复 ----

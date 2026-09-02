@@ -65,6 +65,7 @@ class FakePi {
 
 function makeContext(models: Array<{ provider: string; id: string }>, currentModel: { provider: string; id: string }) {
   const notifications: Array<{ message: string; level: string }> = [];
+  const compactCalls: unknown[] = [];
   const ctx = {
     model: currentModel,
     modelRegistry: {
@@ -77,8 +78,12 @@ function makeContext(models: Array<{ provider: string; id: string }>, currentMod
         notifications.push({ message, level });
       },
     },
+    compact(options: unknown) {
+      compactCalls.push(options);
+      (options as { onComplete?: () => void }).onComplete?.();
+    },
   };
-  return { ctx, notifications };
+  return { ctx, notifications, compactCalls };
 }
 
 const CHAIN_MODELS = [
@@ -99,14 +104,16 @@ function engineHarness(
   const pi = new FakePi();
   const registryModels =
     models.length > 0 ? models : [currentModel, { provider: "rightcode-codex", id: "gpt-5.6-sol" }];
-  const { ctx, notifications } = makeContext(registryModels, currentModel);
+  const { ctx, notifications, compactCalls } = makeContext(registryModels, currentModel);
   const bans = new MemoryBanStore();
   const state = createEngine(pi as unknown as ExtensionAPI, () => config, bans);
   const messageEnd = pi.handlers.get("message_end")?.[0];
   const sessionStart = pi.handlers.get("session_start")?.[0];
+  const compactFailed = pi.handlers.get("session_compact_failed")?.[0];
   const agentStarts = pi.handlers.get("agent_start") ?? [];
   expect(messageEnd, "createEngine did not register message_end");
   expect(sessionStart, "createEngine did not register session_start");
+  expect(compactFailed, "createEngine did not register session_compact_failed");
   expect(agentStarts.length > 0, "createEngine did not register agent_start");
 
   return {
@@ -115,11 +122,15 @@ function engineHarness(
     state,
     bans,
     notifications,
+    compactCalls,
     async emit(message: Record<string, unknown>) {
       await messageEnd({ message }, ctx);
     },
     async emitSessionStart() {
       await sessionStart({}, ctx);
+    },
+    async emitCompactionFailed(errorMessage: string, aborted = false) {
+      await compactFailed({ errorMessage, aborted, reason: "manual", willRetry: false }, ctx);
     },
     async emitAgentStart() {
       for (const handler of agentStarts) await handler({}, ctx);
@@ -401,6 +412,25 @@ async function runRegressionTests(): Promise<TestResult[]> {
     await harness.emitAgentStart();
     expect(harness.state.chain.length === 0, "new agent run did not reset chain");
     expect(harness.state.consecutive === 0, "new agent run did not reset consecutive count");
+  }));
+
+  results.push(await runTest("engine retries compaction after terminal model failback", async () => {
+    const harness = engineHarness({
+      fallbacks: { "openai-codex/gpt-5.6-sol": "rightcode-codex/gpt-5.6-sol" },
+    });
+    await harness.emitCompactionFailed("Summarization failed: Codex error: The usage limit has been reached");
+    expect(harness.pi.setModelCalls.length === 1, "compaction failure did not switch model");
+    expect((harness.pi.setModelCalls[0] as { provider: string }).provider === "rightcode-codex", "wrong compaction fallback target");
+    expect(harness.compactCalls.length === 1, "compaction was not retried");
+  }));
+
+  results.push(await runTest("engine ignores aborted compaction failures", async () => {
+    const harness = engineHarness({
+      fallbacks: { "openai-codex/gpt-5.6-sol": "rightcode-codex/gpt-5.6-sol" },
+    });
+    await harness.emitCompactionFailed("Codex error: The usage limit has been reached", true);
+    expect(harness.pi.setModelCalls.length === 0, "aborted compaction triggered failback");
+    expect(harness.compactCalls.length === 0, "aborted compaction was retried");
   }));
 
   results.push(await runTest("registry contains all four providers", () => {
