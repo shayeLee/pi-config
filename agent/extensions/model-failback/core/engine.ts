@@ -102,6 +102,23 @@ export function createEngine(
     restoreInProgress: false,
   };
   let redirectingBlockedSelection = false;
+  let extensionActive = true;
+  let compactionRetryActive = false;
+  let compactionRetryEpoch = 0;
+  let compactionRetryTimer: ReturnType<typeof setTimeout> | undefined;
+  let pendingCompactionFailure:
+    | { errorMessage: string; ctx: ExtensionContext; provider: string; model: string; retryCompact: boolean }
+    | undefined;
+
+  // 使 timer、进行中的 ctx.compact 回调和缓存失败全部失效。ctx.compact 本身
+  // 不可取消；epoch 让旧 session/reload 的回调不再触碰已经失效的 context。
+  const cancelCompactionRetry = () => {
+    compactionRetryEpoch += 1;
+    if (compactionRetryTimer) clearTimeout(compactionRetryTimer);
+    compactionRetryTimer = undefined;
+    pendingCompactionFailure = undefined;
+    compactionRetryActive = false;
+  };
 
   /** 在 session 启动或用户手动选回已 ban 模型后，事后切到链上可用节点。 */
   const redirectBlockedModel = async (
@@ -171,11 +188,8 @@ export function createEngine(
   // 只在退出 Pi 时兜底清理。new/resume/fork 已在 before 事件中完成，
   // reload 绝不能依赖 session_shutdown reason 来决定是否保留。
   pi.on("session_shutdown", async (event) => {
-    if (compactionRetryTimer) {
-      clearTimeout(compactionRetryTimer);
-      compactionRetryTimer = undefined;
-    }
-    compactionRetryInFlight = false;
+    extensionActive = false;
+    cancelCompactionRetry();
     if (event.reason === "quit") await bans.endSession();
   });
 
@@ -304,42 +318,101 @@ export function createEngine(
     await handleTerminalFailure(event.message, ctx, { steer: true });
   });
 
-  let compactionRetryInFlight = false;
-  let compactionRetryTimer: ReturnType<typeof setTimeout> | undefined;
-  pi.on("session_compact_failed", async (event, ctx: ExtensionContext) => {
-    if (event.aborted || !event.errorMessage || compactionRetryInFlight) return;
-    const current = ctx.model;
-    if (!current) return;
+  const finishCompactionRetry = (epoch: number, continueFailedChain: boolean) => {
+    if (!extensionActive || epoch !== compactionRetryEpoch) return;
+    const next = continueFailedChain ? pendingCompactionFailure : undefined;
+    pendingCompactionFailure = undefined;
+    if (!next) {
+      compactionRetryActive = false;
+      return;
+    }
+    // 上一次 compact 已经 onError；下一个宏任务才处理它的终态，
+    // 不与 Pi 的失败 catch/finally 或上一次 compact 的回调重入。成功完成时
+    // 必须丢弃并发期间重复的源失败，不能错误地产生一次环检测。
+    compactionRetryTimer = setTimeout(() => {
+      compactionRetryTimer = undefined;
+      void retryCompaction(next, epoch);
+    }, 0);
+  };
 
-    const switched = await handleTerminalFailure(
-      {
-        role: "assistant",
-        stopReason: "error",
-        provider: current.provider,
-        model: current.id,
-        errorMessage: event.errorMessage,
-      },
-      ctx,
-      { steer: false },
-    );
-    if (!switched) return;
+  const retryCompaction = async (
+    failure: { errorMessage: string; ctx: ExtensionContext; provider: string; model: string; retryCompact: boolean },
+    epoch: number,
+  ) => {
+    if (!extensionActive || epoch !== compactionRetryEpoch) return;
+    let switched = false;
+    try {
+      switched = await handleTerminalFailure(
+        {
+          role: "assistant",
+          stopReason: "error",
+          provider: failure.provider,
+          model: failure.model,
+          errorMessage: failure.errorMessage,
+        },
+        failure.ctx,
+        { steer: false },
+      );
+    } catch {
+      if (extensionActive && epoch === compactionRetryEpoch) {
+        failure.ctx.ui.notify("[model-failback] 处理压缩终态失败，未重试压缩", "error");
+      }
+    }
+    if (!extensionActive || epoch !== compactionRetryEpoch) return;
+    if (!switched || !failure.retryCompact) {
+      finishCompactionRetry(epoch, false);
+      return;
+    }
 
     // session_compact_failed 仍在原 compact 的 catch/finally 收尾过程中。
     // 延迟到宏任务边界，避免与共享的 compaction abort controller 重入。
-    compactionRetryInFlight = true;
     compactionRetryTimer = setTimeout(() => {
       compactionRetryTimer = undefined;
-      ctx.compact({
+      if (!extensionActive || epoch !== compactionRetryEpoch) return;
+      // threshold/overflow 压缩失败后 Pi 可能已开始下一次 agent 请求；manual
+      // /compact 也可能在用户立即发消息后走到这里。绝不 abort 正在进行的请求。
+      if (!failure.ctx.isIdle()) {
+        failure.ctx.ui.notify("[model-failback] 已有新请求开始，跳过自动重试压缩", "warning");
+        finishCompactionRetry(epoch, false);
+        return;
+      }
+      failure.ctx.compact({
         onComplete: () => {
-          compactionRetryInFlight = false;
-          ctx.ui.notify("[model-failback] 已使用备用模型重新压缩上下文", "info");
+          if (!extensionActive || epoch !== compactionRetryEpoch) return;
+          failure.ctx.ui.notify("[model-failback] 已使用备用模型重新压缩上下文", "info");
+          finishCompactionRetry(epoch, false);
         },
         onError: (error) => {
-          compactionRetryInFlight = false;
-          ctx.ui.notify(`[model-failback] 备用模型压缩仍失败: ${error.message}`, "error");
+          if (!extensionActive || epoch !== compactionRetryEpoch) return;
+          failure.ctx.ui.notify(`[model-failback] 备用模型压缩仍失败: ${error.message}`, "error");
+          finishCompactionRetry(epoch, true);
         },
       });
     }, 0);
+  };
+
+  pi.on("session_compact_failed", async (event, ctx: ExtensionContext) => {
+    if (event.aborted || !event.errorMessage || !extensionActive) return;
+    const current = ctx.model;
+    if (!current) return;
+    const failure = {
+      errorMessage: event.errorMessage,
+      ctx,
+      provider: current.provider,
+      model: current.id,
+      // 只有用户显式 /compact 可以安全地在失败收尾后重试；threshold/overflow
+      // 会由 Pi 后续的上下文检查处理，不能手动 compact 以免 abort 新请求。
+      retryCompact: event.reason === "manual",
+    };
+    if (compactionRetryActive) {
+      // 当前 retry 的 onError 会在 Pi 发出该事件之后执行；先缓存，届时再沿链继续。
+      pendingCompactionFailure = failure;
+      return;
+    }
+
+    compactionRetryActive = true;
+    const epoch = ++compactionRetryEpoch;
+    await retryCompaction(failure, epoch);
   });
 
   // ---- 自动恢复:autoRestore 打开时,在每次 agent 启动检查配额是否已恢复 ----

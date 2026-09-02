@@ -63,11 +63,18 @@ class FakePi {
   }
 }
 
-function makeContext(models: Array<{ provider: string; id: string }>, currentModel: { provider: string; id: string }) {
+function makeContext(
+  models: Array<{ provider: string; id: string }>,
+  currentModel: { provider: string; id: string },
+  autoCompleteCompact = true,
+) {
   const notifications: Array<{ message: string; level: string }> = [];
   const compactCalls: unknown[] = [];
   const ctx = {
     model: currentModel,
+    isIdle() {
+      return true;
+    },
     modelRegistry: {
       find(provider: string, id: string) {
         return models.find((model) => model.provider === provider && model.id === id);
@@ -80,7 +87,7 @@ function makeContext(models: Array<{ provider: string; id: string }>, currentMod
     },
     compact(options: unknown) {
       compactCalls.push(options);
-      (options as { onComplete?: () => void }).onComplete?.();
+      if (autoCompleteCompact) (options as { onComplete?: () => void }).onComplete?.();
     },
   };
   return { ctx, notifications, compactCalls };
@@ -96,24 +103,33 @@ function creditsFailure(provider: string, model: string): Record<string, unknown
   return assistantFailure(provider, model, '{"type":"CreditsError","message":"Insufficient balance"}');
 }
 
+function waitForTimers(): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, 10));
+}
+
 function engineHarness(
   config: { chains?: string[][]; fallbacks: Record<string, string>; cooldownMs?: number; maxConsecutive?: number },
   models: Array<{ provider: string; id: string }> = [],
   currentModel: { provider: string; id: string } = { provider: "openai-codex", id: "gpt-5.6-sol" },
+  autoCompleteCompact = true,
 ) {
   const pi = new FakePi();
   const registryModels =
     models.length > 0 ? models : [currentModel, { provider: "rightcode-codex", id: "gpt-5.6-sol" }];
-  const { ctx, notifications, compactCalls } = makeContext(registryModels, currentModel);
+  const { ctx, notifications, compactCalls } = makeContext(registryModels, currentModel, autoCompleteCompact);
   const bans = new MemoryBanStore();
   const state = createEngine(pi as unknown as ExtensionAPI, () => config, bans);
   const messageEnd = pi.handlers.get("message_end")?.[0];
   const sessionStart = pi.handlers.get("session_start")?.[0];
   const compactFailed = pi.handlers.get("session_compact_failed")?.[0];
+  const beforeSwitch = pi.handlers.get("session_before_switch")?.[0];
+  const shutdown = pi.handlers.get("session_shutdown")?.[0];
   const agentStarts = pi.handlers.get("agent_start") ?? [];
   expect(messageEnd, "createEngine did not register message_end");
   expect(sessionStart, "createEngine did not register session_start");
   expect(compactFailed, "createEngine did not register session_compact_failed");
+  expect(beforeSwitch, "createEngine did not register session_before_switch");
+  expect(shutdown, "createEngine did not register session_shutdown");
   expect(agentStarts.length > 0, "createEngine did not register agent_start");
 
   return {
@@ -129,8 +145,18 @@ function engineHarness(
     async emitSessionStart() {
       await sessionStart({}, ctx);
     },
-    async emitCompactionFailed(errorMessage: string, aborted = false) {
-      await compactFailed({ errorMessage, aborted, reason: "manual", willRetry: false }, ctx);
+    async emitCompactionFailed(
+      errorMessage: string,
+      aborted = false,
+      reason: "manual" | "threshold" | "overflow" = "manual",
+    ) {
+      await compactFailed({ errorMessage, aborted, reason, willRetry: false }, ctx);
+    },
+    async emitBeforeSwitch() {
+      await beforeSwitch({}, ctx);
+    },
+    async emitShutdown() {
+      await shutdown({ reason: "reload" }, ctx);
     },
     async emitAgentStart() {
       for (const handler of agentStarts) await handler({}, ctx);
@@ -419,7 +445,7 @@ async function runRegressionTests(): Promise<TestResult[]> {
       fallbacks: { "openai-codex/gpt-5.6-sol": "rightcode-codex/gpt-5.6-sol" },
     });
     await harness.emitCompactionFailed("Summarization failed: Codex error: The usage limit has been reached");
-    await new Promise((resolve) => setTimeout(resolve, 10));
+    await waitForTimers();
     expect(harness.pi.setModelCalls.length === 1, "compaction failure did not switch model");
     expect((harness.pi.setModelCalls[0] as { provider: string }).provider === "rightcode-codex", "wrong compaction fallback target");
     expect(harness.compactCalls.length === 1, "compaction was not retried");
@@ -432,6 +458,115 @@ async function runRegressionTests(): Promise<TestResult[]> {
     await harness.emitCompactionFailed("Codex error: The usage limit has been reached", true);
     expect(harness.pi.setModelCalls.length === 0, "aborted compaction triggered failback");
     expect(harness.compactCalls.length === 0, "aborted compaction was retried");
+  }));
+
+  results.push(await runTest("engine serializes concurrent compaction failures", async () => {
+    const harness = engineHarness({
+      fallbacks: { "openai-codex/gpt-5.6-sol": "rightcode-codex/gpt-5.6-sol" },
+    });
+    await Promise.all([
+      harness.emitCompactionFailed("Codex error: The usage limit has been reached"),
+      harness.emitCompactionFailed("Codex error: The usage limit has been reached"),
+    ]);
+    await waitForTimers();
+    expect(harness.pi.setModelCalls.length === 1, "concurrent failures switched model more than once");
+    expect(harness.compactCalls.length === 1, "concurrent failures started multiple compactions");
+    expect(
+      !harness.notifications.some((notification) => notification.message.includes("检测到切换环")),
+      "duplicate source failure produced a false cycle notification",
+    );
+    expect(
+      harness.pi.entries.filter((entry) => entry.type === "model-failback").length === 1,
+      "duplicate source failure wrote another failback ledger entry",
+    );
+  }));
+
+  results.push(await runTest("engine continues a failed compaction chain after retry completion", async () => {
+    const source = { provider: "openai-codex", id: "gpt-5.6-sol" };
+    const middle = { provider: "opencode", id: "gpt-5.6-sol" };
+    const target = { provider: "rightcode-codex", id: "gpt-5.6-sol" };
+    const harness = engineHarness(
+      {
+        chains: [["openai-codex/gpt-5.6-sol", "opencode/gpt-5.6-sol", "rightcode-codex/gpt-5.6-sol"]],
+        fallbacks: {},
+      },
+      [source, middle, target],
+      source,
+      false,
+    );
+    await harness.emitCompactionFailed("Codex error: The usage limit has been reached");
+    await waitForTimers();
+    expect(harness.compactCalls.length === 1, "first fallback compaction did not start");
+    (harness.ctx as { model: { provider: string; id: string } }).model = middle;
+    await harness.emitCompactionFailed('{"type":"CreditsError","message":"Insufficient balance"}');
+    ((harness.compactCalls[0] as { onError: (error: Error) => void }).onError)(new Error("CreditsError"));
+    await waitForTimers();
+    await waitForTimers();
+    expect(harness.pi.setModelCalls.length === 2, "failed fallback compact did not advance chain");
+    expect(
+      (harness.pi.setModelCalls[1] as { provider: string }).provider === "rightcode-codex",
+      "wrong second compaction fallback target",
+    );
+    expect(harness.compactCalls.length === 2, "second fallback compaction did not start");
+  }));
+
+  results.push(await runTest("engine keeps retry when a session switch is cancelled", async () => {
+    const harness = engineHarness({
+      fallbacks: { "openai-codex/gpt-5.6-sol": "rightcode-codex/gpt-5.6-sol" },
+    });
+    await harness.emitCompactionFailed("Codex error: The usage limit has been reached");
+    // session_before_switch 可以被后续扩展取消，before 本身不能使当前 retry 失效。
+    await harness.emitBeforeSwitch();
+    await waitForTimers();
+    expect(harness.compactCalls.length === 1, "cancelled switch discarded current session retry");
+  }));
+
+  results.push(await runTest("engine does not manually retry threshold compaction", async () => {
+    const harness = engineHarness({
+      fallbacks: { "openai-codex/gpt-5.6-sol": "rightcode-codex/gpt-5.6-sol" },
+    });
+    await harness.emitCompactionFailed("Codex error: The usage limit has been reached", false, "threshold");
+    await waitForTimers();
+    expect(harness.pi.setModelCalls.length === 1, "threshold failure did not fail back");
+    expect(harness.compactCalls.length === 0, "threshold failure manually aborted a possible new request");
+  }));
+
+  results.push(await runTest("engine does not abort a new request for manual retry", async () => {
+    const harness = engineHarness({
+      fallbacks: { "openai-codex/gpt-5.6-sol": "rightcode-codex/gpt-5.6-sol" },
+    });
+    (harness.ctx as { isIdle: () => boolean }).isIdle = () => false;
+    await harness.emitCompactionFailed("Codex error: The usage limit has been reached");
+    await waitForTimers();
+    expect(harness.compactCalls.length === 0, "manual retry aborted a newly started request");
+  }));
+
+  results.push(await runTest("engine cancels a pending compaction timer on shutdown", async () => {
+    const harness = engineHarness({
+      fallbacks: { "openai-codex/gpt-5.6-sol": "rightcode-codex/gpt-5.6-sol" },
+    });
+    await harness.emitCompactionFailed("Codex error: The usage limit has been reached");
+    await harness.emitShutdown();
+    await waitForTimers();
+    expect(harness.compactCalls.length === 0, "shutdown did not cancel pending compaction timer");
+  }));
+
+  results.push(await runTest("engine ignores old compaction callback after shutdown", async () => {
+    const harness = engineHarness(
+      { fallbacks: { "openai-codex/gpt-5.6-sol": "rightcode-codex/gpt-5.6-sol" } },
+      [],
+      { provider: "openai-codex", id: "gpt-5.6-sol" },
+      false,
+    );
+    await harness.emitCompactionFailed("Codex error: The usage limit has been reached");
+    await waitForTimers();
+    const options = harness.compactCalls[0] as { onComplete: () => void };
+    await harness.emitShutdown();
+    options.onComplete();
+    expect(
+      !harness.notifications.some((notification) => notification.message.includes("已使用备用模型重新压缩")),
+      "old session compaction callback used stale context",
+    );
   }));
 
   results.push(await runTest("registry contains all four providers", () => {

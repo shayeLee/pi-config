@@ -138,7 +138,7 @@ E2E 会真实调用 provider，前提是 `opencode` 账户当前无余额，并�
 - 主 session 启动时按 `banFileTtlMs` 惰性清理异常退出遗留文件，默认 TTL 为 7 天;
 - 多个并行 subagent 写入同一 session ban 文件时使用跨进程锁;
 - agent-team 的 Fleet/subagent UI 以最后一条 assistant `provider/model` 显示 failback 最终落点;
-- compaction summarization 遇到终态错误时，先切换模型再自动重试一次 compaction;
+- 用户显式 compaction 的 summarization 遇到终态错误时，先切换模型，再在 Pi 收尾且 session 空闲后重试一次 compaction；自动 threshold/overflow 压缩只切换模型，不中断新请求;
 - `/failback restore`、`/failback unban`、`/failback reset` 可进行人工干预。
 
 ## 扩展新 provider
