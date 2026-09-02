@@ -419,6 +419,7 @@ async function runRegressionTests(): Promise<TestResult[]> {
       fallbacks: { "openai-codex/gpt-5.6-sol": "rightcode-codex/gpt-5.6-sol" },
     });
     await harness.emitCompactionFailed("Summarization failed: Codex error: The usage limit has been reached");
+    await new Promise((resolve) => setTimeout(resolve, 10));
     expect(harness.pi.setModelCalls.length === 1, "compaction failure did not switch model");
     expect((harness.pi.setModelCalls[0] as { provider: string }).provider === "rightcode-codex", "wrong compaction fallback target");
     expect(harness.compactCalls.length === 1, "compaction was not retried");

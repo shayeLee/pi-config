@@ -171,6 +171,11 @@ export function createEngine(
   // 只在退出 Pi 时兜底清理。new/resume/fork 已在 before 事件中完成，
   // reload 绝不能依赖 session_shutdown reason 来决定是否保留。
   pi.on("session_shutdown", async (event) => {
+    if (compactionRetryTimer) {
+      clearTimeout(compactionRetryTimer);
+      compactionRetryTimer = undefined;
+    }
+    compactionRetryInFlight = false;
     if (event.reason === "quit") await bans.endSession();
   });
 
@@ -300,6 +305,7 @@ export function createEngine(
   });
 
   let compactionRetryInFlight = false;
+  let compactionRetryTimer: ReturnType<typeof setTimeout> | undefined;
   pi.on("session_compact_failed", async (event, ctx: ExtensionContext) => {
     if (event.aborted || !event.errorMessage || compactionRetryInFlight) return;
     const current = ctx.model;
@@ -318,17 +324,22 @@ export function createEngine(
     );
     if (!switched) return;
 
+    // session_compact_failed 仍在原 compact 的 catch/finally 收尾过程中。
+    // 延迟到宏任务边界，避免与共享的 compaction abort controller 重入。
     compactionRetryInFlight = true;
-    ctx.compact({
-      onComplete: () => {
-        compactionRetryInFlight = false;
-        ctx.ui.notify("[model-failback] 已使用备用模型重新压缩上下文", "info");
-      },
-      onError: (error) => {
-        compactionRetryInFlight = false;
-        ctx.ui.notify(`[model-failback] 备用模型压缩仍失败: ${error.message}`, "error");
-      },
-    });
+    compactionRetryTimer = setTimeout(() => {
+      compactionRetryTimer = undefined;
+      ctx.compact({
+        onComplete: () => {
+          compactionRetryInFlight = false;
+          ctx.ui.notify("[model-failback] 已使用备用模型重新压缩上下文", "info");
+        },
+        onError: (error) => {
+          compactionRetryInFlight = false;
+          ctx.ui.notify(`[model-failback] 备用模型压缩仍失败: ${error.message}`, "error");
+        },
+      });
+    }, 0);
   });
 
   // ---- 自动恢复:autoRestore 打开时,在每次 agent 启动检查配额是否已恢复 ----
