@@ -60,6 +60,7 @@ export interface FleetRun {
 	streamingDeltas: FleetStreamingDelta[];
 	usage: FleetUsage;
 	model?: string;
+	thinkingLevel?: string;
 	status: FleetRunStatus;
 	stopping?: boolean;
 	startedAt: number;

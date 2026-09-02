@@ -184,7 +184,27 @@ async function main() {
 		check("ctrl+alt+f shortcut registered", Boolean(shortcuts.get("ctrl+alt+f")));
 		if (!subagent) process.exit(1);
 
-		const ctx = { cwd: projectDir };
+		const ctx = {
+			cwd: projectDir,
+			modelRegistry: {
+				getAll: () => [
+					{
+						provider: "fake",
+						id: "provider",
+						reasoning: true,
+						thinkingLevelMap: {
+							off: null,
+							minimal: null,
+							low: null,
+							medium: null,
+							high: "high",
+							xhigh: null,
+							max: null,
+						},
+					},
+				],
+			},
+		};
 		const run = (params, signal) => subagent.execute("harness-call", params, signal, undefined, ctx);
 
 		// --- (1) tool_result_end-only keeps a durable toolResult ---------------
@@ -296,8 +316,11 @@ async function main() {
 		// Temp agent config reached the child process.
 		const modelIndex = step1Call.argv.indexOf("--model");
 		const toolsIndex = step1Call.argv.indexOf("--tools");
+		const thinkingIndex = step1Call.argv.indexOf("--thinking");
 		check("json mode flags passed", step1Call.argv.includes("--mode") && step1Call.argv.includes("--no-session") && step1Call.argv.includes("-p"));
 		check("agent model flag passed", modelIndex >= 0 && step1Call.argv[modelIndex + 1] === "fake/provider");
+		check("agent thinking flag passed", thinkingIndex >= 0 && step1Call.argv[thinkingIndex + 1] === "high");
+		check("resolved thinkingLevel is stored in result", step1.thinkingLevel === "high");
 		check("agent tools flag passed", toolsIndex >= 0 && step1Call.argv[toolsIndex + 1]?.split(",").includes("bash"));
 		check("system prompt appended via file", step1Call.argv.includes("--append-system-prompt"));
 		check("agent system prompt content reached subagent", step1Call.systemPrompt.includes(SYSTEM_PROMPT_BODY));

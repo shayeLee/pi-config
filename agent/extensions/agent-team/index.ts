@@ -17,12 +17,14 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
-import type { Message } from "@earendil-works/pi-ai";
-import { StringEnum } from "@earendil-works/pi-ai";
+import { clampThinkingLevel, StringEnum, type Message, type Model, type ModelThinkingLevel } from "@earendil-works/pi-ai";
 import {
 	CONFIG_DIR_NAME,
 	type ExtensionAPI,
+	type ModelRegistry,
 	type SessionEntry,
+	SettingsManager,
+	getAgentDir,
 	getMarkdownTheme,
 	withFileMutationQueue,
 } from "@earendil-works/pi-coding-agent";
@@ -46,6 +48,7 @@ const MAX_FLEET_STREAMING_DELTA_COUNT = 256;
 const MAX_FLEET_TOOL_UPDATES = 64;
 const STREAMING_DELTA_METADATA_BYTES = 64;
 const FLEET_TRUNCATION_MARKER = "\n\n[Fleet live output truncated]";
+const DEFAULT_THINKING_LEVEL: ModelThinkingLevel = "medium";
 
 /** Renders a subagent tool row in the opencode style: subtle background + left rail. */
 class OpencodeToolShell implements Component {
@@ -154,6 +157,7 @@ function formatUsageStats(
 		turns?: number;
 	},
 	model?: string,
+	thinkingLevel?: string,
 ): string {
 	const parts: string[] = [];
 	if (usage.turns) parts.push(`${usage.turns} turn${usage.turns > 1 ? "s" : ""}`);
@@ -166,6 +170,7 @@ function formatUsageStats(
 		parts.push(`ctx:${formatTokens(usage.contextTokens)}`);
 	}
 	if (model) parts.push(model);
+	if (thinkingLevel) parts.push(`thinking:${thinkingLevel}`);
 	return parts.join(" ");
 }
 
@@ -334,6 +339,7 @@ interface SingleResult {
 	stderr: string;
 	usage: UsageStats;
 	model?: string;
+	thinkingLevel?: string;
 	stopReason?: string;
 	errorMessage?: string;
 	step?: number;
@@ -408,6 +414,7 @@ function restoredRun(
 		messages,
 		usage: restoredUsage(result.usage),
 		model: typeof result.model === "string" ? result.model : undefined,
+		thinkingLevel: typeof result.thinkingLevel === "string" ? result.thinkingLevel : undefined,
 		status: restoredStatus(result),
 		startedAt,
 		endedAt,
@@ -586,6 +593,47 @@ function getPiInvocation(args: string[]): { command: string; args: string[] } {
 	return { command: "pi", args };
 }
 
+const VALID_THINKING_LEVELS = new Set<ModelThinkingLevel>(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
+
+/** Resolve an exact agent model reference, preserving Pi's full-ID-first semantics. */
+function resolveAgentModel(modelRef: string, modelRegistry: ModelRegistry): { model: Model<any>; thinkingLevel?: ModelThinkingLevel } | undefined {
+	const models = modelRegistry.getAll();
+	const findExact = (reference: string): Model<any> | undefined => {
+		const normalized = reference.toLowerCase();
+		const canonical = models.filter((model) => `${model.provider}/${model.id}`.toLowerCase() === normalized);
+		if (canonical.length === 1) return canonical[0];
+		if (canonical.length > 1) return undefined;
+		const bare = models.filter((model) => model.id.toLowerCase() === normalized);
+		return bare.length === 1 ? bare[0] : undefined;
+	};
+
+	const exact = findExact(modelRef);
+	if (exact) return { model: exact };
+
+	const lastColon = modelRef.lastIndexOf(":");
+	if (lastColon === -1) return undefined;
+	const suffix = modelRef.slice(lastColon + 1);
+	if (!VALID_THINKING_LEVELS.has(suffix)) return undefined;
+	const base = findExact(modelRef.slice(0, lastColon));
+	return base ? { model: base, thinkingLevel: suffix as ModelThinkingLevel } : undefined;
+}
+
+/** Mirror Pi's child-session startup resolution for unpinned agents. */
+function resolveAgentThinkingLevel(
+	agent: AgentConfig,
+	modelRegistry: ModelRegistry,
+	settings: SettingsManager,
+): string | undefined {
+	const explicit = VALID_THINKING_LEVELS.has(agent.thinkingLevel as ModelThinkingLevel)
+		? (agent.thinkingLevel as ModelThinkingLevel)
+		: undefined;
+	if (!agent.model) return explicit;
+	const resolved = resolveAgentModel(agent.model, modelRegistry);
+	if (!resolved) return explicit;
+	const requested = explicit ?? resolved.thinkingLevel ?? settings.getModelThinkingLevel(resolved.model.provider, resolved.model.id) ?? settings.getDefaultThinkingLevel() ?? DEFAULT_THINKING_LEVEL;
+	return clampThinkingLevel(resolved.model, requested);
+}
+
 type OnUpdateCallback = (partial: AgentToolResult<SubagentDetails>) => void;
 
 async function runSingleAgent(
@@ -600,10 +648,12 @@ async function runSingleAgent(
 	onUpdate: OnUpdateCallback | undefined,
 	makeDetails: (results: SingleResult[]) => SubagentDetails,
 	fleetStore: FleetStore,
+	modelRegistry: ModelRegistry | undefined,
+	projectTrusted: boolean | undefined,
 ): Promise<SingleResult> {
-	const agent = agents.find((a) => a.name === agentName);
+	const configuredAgent = agents.find((a) => a.name === agentName);
 
-	if (!agent) {
+	if (!configuredAgent) {
 		const available = agents.map((a) => `"${a.name}"`).join(", ") || "none";
 		return {
 			agent: agentName,
@@ -617,8 +667,20 @@ async function runSingleAgent(
 		};
 	}
 
+	const agent = modelRegistry
+		? {
+				...configuredAgent,
+				thinkingLevel: resolveAgentThinkingLevel(
+					configuredAgent,
+					modelRegistry,
+					SettingsManager.create(cwd ?? defaultCwd, getAgentDir(), { projectTrusted }),
+				),
+			}
+		: configuredAgent;
+
 	const args: string[] = ["--mode", "json", "-p", "--no-session"];
 	if (agent.model) args.push("--model", agent.model);
+	if (agent.thinkingLevel) args.push("--thinking", agent.thinkingLevel);
 	if (agent.tools && agent.tools.length > 0) args.push("--tools", agent.tools.join(","));
 
 	let tmpPromptDir: string | null = null;
@@ -633,6 +695,7 @@ async function runSingleAgent(
 		stderr: "",
 		usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
 		model: agent.model,
+		thinkingLevel: agent.thinkingLevel,
 		step,
 	};
 	let childProcess: ReturnType<typeof spawn> | null = null;
@@ -702,6 +765,7 @@ async function runSingleAgent(
 		toolUpdates: {},
 		usage: currentResult.usage,
 		model: currentResult.model,
+		thinkingLevel: currentResult.thinkingLevel,
 		stop: () => {
 			if (settled || stopRequested) return false;
 			stopRequested = true;
@@ -823,6 +887,7 @@ async function runSingleAgent(
 
 	const emitUpdate = () => {
 		fleetRun.model = currentResult.model;
+		fleetRun.thinkingLevel = currentResult.thinkingLevel;
 		fleetStore.touch();
 		if (onUpdate) {
 			onUpdate({
@@ -950,6 +1015,14 @@ async function runSingleAgent(
 						if (msg.stopReason) currentResult.stopReason = msg.stopReason;
 						if (msg.errorMessage) currentResult.errorMessage = msg.errorMessage;
 					}
+					emitUpdate();
+				}
+
+				// The child may emit its resolved thinking level (set/clamped at startup
+				// or during model failback). Prefer it as the authoritative final value;
+				// otherwise the launch configuration stays in place.
+				if (event.type === "thinking_level_changed" && typeof event.level === "string") {
+					currentResult.thinkingLevel = event.level;
 					emitUpdate();
 				}
 
@@ -1181,6 +1254,8 @@ export default function (pi: ExtensionAPI) {
 						chainUpdate,
 						makeDetails("chain"),
 						fleetStore,
+						ctx.modelRegistry,
+						ctx.isProjectTrusted?.(),
 					);
 					results.push(result);
 
@@ -1261,6 +1336,8 @@ export default function (pi: ExtensionAPI) {
 						},
 						makeDetails("parallel"),
 						fleetStore,
+						ctx.modelRegistry,
+						ctx.isProjectTrusted?.(),
 					);
 					allResults[index] = result;
 					emitParallelUpdate();
@@ -1301,6 +1378,8 @@ export default function (pi: ExtensionAPI) {
 					onUpdate,
 					makeDetails("single"),
 					fleetStore,
+					ctx.modelRegistry,
+					ctx.isProjectTrusted?.(),
 				);
 				const isError = isFailedResult(result);
 				if (isError) {
@@ -1480,7 +1559,7 @@ export default function (pi: ExtensionAPI) {
 					if (isRunning) header += theme.fg("warning", "  running");
 					if (isStopped) header += theme.fg("warning", "  stopped");
 					else if (isError && r.stopReason) header += ` ${theme.fg("error", `[${r.stopReason}]`)}`;
-					const usageStr = formatUsageStats(r.usage, r.model);
+					const usageStr = formatUsageStats(r.usage, r.model, r.thinkingLevel);
 					if (usageStr) header += theme.fg("dim", `  ${usageStr}`);
 					container.addChild(new Text(header, 0, 0));
 					if (isError && !isStopped && r.errorMessage)
@@ -1507,7 +1586,7 @@ export default function (pi: ExtensionAPI) {
 				if (isRunning) header += theme.fg("warning", "  running");
 				if (isStopped) header += theme.fg("warning", "  stopped");
 				else if (isError && r.stopReason) header += ` ${theme.fg("error", `[${r.stopReason}]`)}`;
-				const usageStr = formatUsageStats(r.usage, r.model);
+				const usageStr = formatUsageStats(r.usage, r.model, r.thinkingLevel);
 				if (usageStr) header += theme.fg("dim", `  ${usageStr}`);
 				container.addChild(new Text(header, 0, 0));
 				if (isError && !isStopped && r.errorMessage) {
@@ -1601,7 +1680,7 @@ export default function (pi: ExtensionAPI) {
 							container.addChild(new Markdown(finalOutput.trim(), 1, 0, mdTheme));
 						}
 
-						const stepUsage = formatUsageStats(r.usage, r.model);
+						const stepUsage = formatUsageStats(r.usage, r.model, r.thinkingLevel);
 						if (stepUsage) container.addChild(new Text(theme.fg("dim", stepUsage), 0, 0));
 					}
 
@@ -1706,7 +1785,7 @@ export default function (pi: ExtensionAPI) {
 							container.addChild(new Markdown(finalOutput.trim(), 1, 0, mdTheme));
 						}
 
-						const taskUsage = formatUsageStats(r.usage, r.model);
+						const taskUsage = formatUsageStats(r.usage, r.model, r.thinkingLevel);
 						if (taskUsage) container.addChild(new Text(theme.fg("dim", taskUsage), 0, 0));
 					}
 

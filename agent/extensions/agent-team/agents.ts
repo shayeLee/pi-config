@@ -13,6 +13,8 @@ export interface AgentConfig {
 	description: string;
 	tools?: string[];
 	model?: string;
+	/** Effective thinking level (off, minimal, low, medium, high, xhigh, max). */
+	thinkingLevel?: string;
 	systemPrompt: string;
 	source: "user" | "project";
 	filePath: string;
@@ -49,22 +51,29 @@ function loadAgentsFromDir(dir: string, source: "user" | "project"): AgentConfig
 			continue;
 		}
 
-		const { frontmatter, body } = parseFrontmatter<Record<string, string>>(content);
+		const { frontmatter, body } = parseFrontmatter<Record<string, unknown>>(content);
+		const name = typeof frontmatter.name === "string" ? frontmatter.name.trim() : "";
+		const description = typeof frontmatter.description === "string" ? frontmatter.description.trim() : "";
 
-		if (!frontmatter.name || !frontmatter.description) {
+		if (!name || !description) {
 			continue;
 		}
 
-		const tools = frontmatter.tools
-			?.split(",")
-			.map((t: string) => t.trim())
-			.filter(Boolean);
+		const tools = typeof frontmatter.tools === "string"
+			? frontmatter.tools.split(",").map((t) => t.trim()).filter(Boolean)
+			: Array.isArray(frontmatter.tools)
+				? frontmatter.tools.filter((t): t is string => typeof t === "string").map((t) => t.trim()).filter(Boolean)
+				: undefined;
+
+		const model = typeof frontmatter.model === "string" ? frontmatter.model.trim() : undefined;
+		const thinkingLevel = typeof frontmatter.thinking === "string" ? frontmatter.thinking.trim() || undefined : undefined;
 
 		agents.push({
-			name: frontmatter.name,
-			description: frontmatter.description,
+			name,
+			description,
 			tools: tools && tools.length > 0 ? tools : undefined,
-			model: frontmatter.model,
+			model: model || undefined,
+			thinkingLevel,
 			systemPrompt: body,
 			source,
 			filePath,

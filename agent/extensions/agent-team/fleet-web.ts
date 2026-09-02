@@ -66,6 +66,7 @@ type WebRun = {
 	toolUpdates: Record<string, WebToolUpdate>;
 	omitted: WebOmissions;
 	model?: string;
+	thinkingLevel?: string;
 	status: FleetRun["status"];
 	stopping?: boolean;
 	startedAt: number;
@@ -347,6 +348,7 @@ export function webRun(run: FleetRun | undefined, options: WebRunOptions): WebRu
 			assistantContentParts: omittedAssistantContentParts,
 		},
 		...(run.model ? { model: capWebText(run.model, options.textBytes) } : {}),
+		...(run.thinkingLevel ? { thinkingLevel: capWebText(run.thinkingLevel, options.textBytes) } : {}),
 		status: run.status,
 		...(run.stopping ? { stopping: true } : {}),
 		startedAt: run.startedAt,
@@ -363,7 +365,7 @@ export function selectWebRun(run: FleetRun | undefined, revision: number): WebRu
 	if (Buffer.byteLength(JSON.stringify({ revision, run: minimal })) <= MAX_WEB_RUN_BYTES) return minimal;
 	// Last-resort bounded shape: even the id cannot exceed the cap.
 	return minimal
-		? { ...minimal, id: capWebText(minimal.id, 1024), agent: "", task: "", model: undefined }
+		? { ...minimal, id: capWebText(minimal.id, 1024), agent: "", task: "", model: undefined, thinkingLevel: undefined }
 		: undefined;
 }
 
@@ -1130,7 +1132,10 @@ function renderDetail(run, revision) {
 	statusItem.className = "chip " + status.className;
 	text(statusItem, status.label);
 	meta.append(statusItem);
-	for (const value of [MODE_LABELS[run.mode] || run.mode, run.model || "模型待定", duration(run)]) {
+	const modelText = run.model
+		? (run.thinkingLevel ? run.model + " · " + run.thinkingLevel : run.model)
+		: (run.thinkingLevel ? "thinking:" + run.thinkingLevel : "模型待定");
+	for (const value of [MODE_LABELS[run.mode] || run.mode, modelText, duration(run)]) {
 		const item = document.createElement("span");
 		text(item, value);
 		meta.append(item);

@@ -45,6 +45,13 @@ function formatDuration(startedAt: number, endedAt?: number): string {
 	return `${minutes}m${rest.toString().padStart(2, "0")}s`;
 }
 
+function formatModel(run: FleetRun): string {
+	const model = run.model?.trim();
+	const thinking = run.thinkingLevel?.trim();
+	if (model && thinking) return `${model} · ${thinking}`;
+	return model ?? thinking ?? "";
+}
+
 function getStatusIcon(run: FleetRun, theme: Theme): string {
 	if (run.stopping) return theme.fg("warning", "■");
 	switch (run.status) {
@@ -113,7 +120,8 @@ export class FleetWidget {
 		];
 		for (const run of visibleRuns) {
 			const usage = getUsageText(run);
-			const meta = `${run.model ? `${run.model} · ` : ""}${formatDuration(run.startedAt, run.endedAt)}${usage ? ` · ${usage}` : ""}`;
+			const modelLabel = formatModel(run);
+			const meta = `${modelLabel ? `${modelLabel} · ` : ""}${formatDuration(run.startedAt, run.endedAt)}${usage ? ` · ${usage}` : ""}`;
 			const prefix = `${getStatusIcon(run, this.theme)} ${this.theme.fg("accent", `#${run.id}`)} ${this.theme.fg("toolTitle", run.agent)} `;
 			const suffix = this.theme.fg("dim", `  ${meta}`);
 			const available = Math.max(8, width - visibleWidth(prefix) - visibleWidth(suffix));
@@ -353,7 +361,8 @@ class FleetOverlay {
 				const selected = run.id === this.selectedId;
 				const prefix = selected ? this.theme.fg("accent", "› ") : "  ";
 				const usage = getUsageText(run);
-				const meta = `${run.stopping ? "stopping" : run.status}${run.model ? ` · ${run.model}` : ""} · ${formatDuration(run.startedAt, run.endedAt)}${usage ? ` · ${usage}` : ""}`;
+				const modelLabel = formatModel(run);
+				const meta = `${run.stopping ? "stopping" : run.status}${modelLabel ? ` · ${modelLabel}` : ""} · ${formatDuration(run.startedAt, run.endedAt)}${usage ? ` · ${usage}` : ""}`;
 				const label = `${getStatusIcon(run, this.theme)} #${run.id} ${run.agent}  ${singleLine(run.task)}`;
 				const line = `${prefix}${selected ? this.theme.bg("selectedBg", this.theme.fg("text", label)) : label}`;
 				lines.push(truncateToWidth(line, width, "…"));
@@ -381,7 +390,8 @@ class FleetOverlay {
 		const start = Math.max(0, transcript.length - height - offset);
 		const visible = transcript.slice(start, start + height);
 		const usage = getUsageText(run);
-		const meta = `${run.stopping ? "stopping" : run.status}${run.model ? ` · ${run.model}` : ""} · ${formatDuration(run.startedAt, run.endedAt)}${usage ? ` · ${usage}` : ""}`;
+		const modelLabel = formatModel(run);
+		const meta = `${run.stopping ? "stopping" : run.status}${modelLabel ? ` · ${modelLabel}` : ""} · ${formatDuration(run.startedAt, run.endedAt)}${usage ? ` · ${usage}` : ""}`;
 		const header = `${getStatusIcon(run, this.theme)} ${this.theme.fg("accent", `#${run.id}`)} ${this.theme.fg("toolTitle", this.theme.bold(run.agent))} ${this.theme.fg("dim", meta)}`;
 		const lines = [truncateToWidth(header, width), this.theme.fg("borderMuted", "─".repeat(width)), ...visible];
 		lines.push(this.theme.fg("borderMuted", "─".repeat(width)));
