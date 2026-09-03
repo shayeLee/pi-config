@@ -195,6 +195,8 @@ export default function (pi: ExtensionAPI) {
 					if (totals.output) stats.push(`↓${formatTokens(totals.output)}`);
 					if (totals.cacheRead) stats.push(`R${formatTokens(totals.cacheRead)}`);
 					if (totals.cacheWrite) stats.push(`W${formatTokens(totals.cacheWrite)}`);
+					const totalTokens = totals.input + totals.output + totals.cacheRead + totals.cacheWrite;
+					if (totalTokens) stats.push(`Σ${formatTokens(totalTokens)}`);
 					if ((totals.cacheRead > 0 || totals.cacheWrite > 0) && latestCacheHitRate !== undefined)
 						stats.push(`CH${latestCacheHitRate.toFixed(1)}%`);
 					if (totals.cost || model?.provider === "kimi-coding")
