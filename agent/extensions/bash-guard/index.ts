@@ -21,9 +21,11 @@
  * rules that exist *because* a write crosses the boundary (`破坏性删除`,
  * `写入系统目录`) can be exempted; authority rules (`sudo`, git history/remote,
  * remote script execution, disk/partition ops, global installs) always ask.
- * The exemption is fail-closed: unknown shell syntax, unknown commands, globs,
- * variables, or an operand that cannot be canonicalized (including a symlink
- * pointing outside the roots or at the pi config dir) keeps the normal flow.
+ * The legacy exemption is fail-closed: unknown shell syntax, unknown commands,
+ * globs, variables, or an operand that cannot be canonicalized (including a
+ * symlink pointing outside the roots or at the pi config dir) keeps the normal
+ * flow. A separate explicit `rmExemptRoots` setting supports terminal-glob rm
+ * cleanup only; it is never inferred from broad path-scope extraRoots.
  *
  * Config file (takes precedence over environment variables):
  *   User-level:   ~/.pi/agent/bash-guard.json
@@ -34,7 +36,7 @@
  *   BASH_GUARD_NOUI=allow -> same as noUI: "allow"
  *   BASH_GUARD_SCOPE_EXEMPT=0 -> disable the authorized-roots exemption
  *
- * Invalid JSON/schema is warned about and the file is ignored; environment
+ * rmExemptRoots is config-file-only. Invalid JSON/schema is warned about and the file is ignored; environment
  * fallbacks are then disabled and safe defaults are used.
  * See README.md (same directory) for the full reference.
  */
@@ -47,6 +49,7 @@ import {
 	type ExtensionAPI,
 } from "@earendil-works/pi-coding-agent";
 import {
+	analyseExplicitRmExemption,
 	analyseScopeExemption,
 	compileRules,
 	isAllowlisted,
@@ -174,6 +177,7 @@ export default function (pi: ExtensionAPI) {
 	let loaded: LoadedConfig | undefined;
 	// Authorized roots depend on the session cwd, so they are cached per cwd.
 	let scopeRoots: { cwd: string; roots: string[]; projectRoot?: string } | undefined;
+	let rmExemptRoots: { cwd: string; roots: string[] } | undefined;
 	const warned = new Set<string>();
 
 	const warn = (ctx: UI, message: string) => {
@@ -209,6 +213,7 @@ export default function (pi: ExtensionAPI) {
 	const reload = () => {
 		loaded = undefined;
 		scopeRoots = undefined;
+		rmExemptRoots = undefined;
 	};
 
 	/** Canonical authorized write roots: project cwd + path-scope extraRoots. */
@@ -273,6 +278,22 @@ export default function (pi: ExtensionAPI) {
 		return { roots: scopeRoots.roots, sensitive, projectRoot: scopeRoots.projectRoot };
 	};
 
+	const getRmExemptRoots = (cwd: string, config: BashGuardConfig, ctx: UI): string[] => {
+		if (rmExemptRoots?.cwd === cwd) return rmExemptRoots.roots;
+		const roots: string[] = [];
+		for (const entry of config.rmExemptRoots ?? []) {
+			try {
+				const canonical = canonicalizePath(anchoredConfigPath(entry, cwd));
+				if (canonical) roots.push(canonical);
+				else warn(ctx, `rmExemptRoots 路径无法安全规范化，已忽略：${entry}`);
+			} catch {
+				warn(ctx, `rmExemptRoots 条目格式无效，已忽略：${entry}`);
+			}
+		}
+		rmExemptRoots = { cwd, roots: [...new Set(roots)] };
+		return rmExemptRoots.roots;
+	};
+
 	pi.on("session_start", (_event, ctx) => {
 		reload();
 		getConfig(ctx);
@@ -311,11 +332,24 @@ export default function (pi: ExtensionAPI) {
 			const scopeExemptEnabled = config.scopeExempt
 				?? (suppressEnvironment || process.env.BASH_GUARD_SCOPE_EXEMPT !== "0");
 			if (scopeExemptEnabled) {
+				const scope = getScopeRoots(ctx.cwd, ctx);
+				if (matched.name === "破坏性删除") {
+					const explicitRoots = getRmExemptRoots(ctx.cwd, config, ctx);
+					if (explicitRoots.length > 0) {
+						const explicitVerdict = analyseExplicitRmExemption(rawCommand, {
+							cwd: ctx.cwd,
+							roots: explicitRoots,
+							sensitiveDirs: scope.sensitive,
+							projectRoot: scope.projectRoot,
+							canonicalize: canonicalizePath,
+						});
+						if (explicitVerdict.exempt) return undefined;
+					}
+				}
 				// Analyse the RAW command: normalizeCommand() folds newlines into spaces
 				// for regex matching, which would merge `echo x > /tmp/a` and a following
 				// `rm -rf /etc` into one segment and hide the dangerous line. The lexer
 				// treats a newline as a command separator, so every line must be in scope.
-				const scope = getScopeRoots(ctx.cwd, ctx);
 				const verdict = analyseScopeExemption(rawCommand, {
 					cwd: ctx.cwd,
 					roots: scope.roots,

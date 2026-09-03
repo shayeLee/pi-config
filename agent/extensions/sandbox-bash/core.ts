@@ -197,6 +197,42 @@ export function filterSensitiveRoots(entries: string[], sensitiveDirs: string[],
 }
 
 /**
+ * Map deny entries to canonical forms, skipping failures per entry.
+ *
+ * denyRead is an opt-in blacklist: one malformed/broken entry (illegal
+ * file: URL, broken symlink, unreadable ancestor) must not throw and must
+ * not affect the other entries. The per-entry try/catch lives here so the
+ * Seatbelt side (core canonicalPath, kernel `..` semantics) and the
+ * built-in side (deny-core resolveLikeBuiltin + canonicalizePath,
+ * resolveToCwd semantics) share the same failure handling WITHOUT sharing
+ * path resolution itself — the resolvers intentionally differ (see
+ * buildProfile/deny-core docs) and unifying them would shift allow/deny
+ * coverage, so only this failure-handling wrapper is shared.
+ */
+export function canonicalDenyRoots(
+	entries: string[],
+	canonicalizeEntry: (entry: string) => string | undefined,
+	onSkip?: (entry: string, reason: string) => void,
+): string[] {
+	const out: string[] = [];
+	for (const entry of entries) {
+		let canonical: string | undefined;
+		try {
+			canonical = canonicalizeEntry(entry);
+		} catch (error) {
+			try { onSkip?.(entry, String(error)); } catch { /* total: reporting must not throw */ }
+			continue;
+		}
+		if (!canonical) {
+			try { onSkip?.(entry, "unresolvable"); } catch { /* total: reporting must not throw */ }
+			continue;
+		}
+		out.push(canonical);
+	}
+	return [...new Set(out)];
+}
+
+/**
  * Build a Seatbelt profile that restricts WRITE (and, optionally, sensitive
  * READS via denyRead):
  *   - write: deny everything, then allow only the authorized roots, plus the
@@ -224,12 +260,26 @@ export function filterSensitiveRoots(entries: string[], sensitiveDirs: string[],
  *     without its allow, nothing outside the cwd subtree of that dir is
  *     reachable, so credentials next to (not inside) the cwd stay protected;
  *   - disjoint from the cwd: denied after the allows as usual.
+ *
+ * `sensitiveFiles` are exact pi config/credential FILES (e.g. the agent dir's
+ * auth.json / path-scope.json) that must stay write-denied in EVERY cwd
+ * situation — including when the project cwd lives inside a sensitive dir and
+ * all dir-level denies are lifted to keep the project writable. They are denied
+ * (raw + canonical form, subpath) after every allow clause, just before the
+ * denyRead clauses, so the file-level deny always wins.
+ *
+ * `editableDirs` (e.g. `~/.pi/agent/extensions`) are re-allowed AFTER the
+ * dir-level sensitive denies, so extension source code stays editable from any
+ * project cwd even though its containing dir is write-denied. The sensitive
+ * FILES (never under the editable dir) are still denied after this re-allow.
  */
 export function buildProfile(
 	cwd: string,
 	extraRoots: string[],
 	denyRead: string[],
 	sensitiveDirs: string[] = [],
+	sensitiveFiles: string[] = [],
+	editableDirs: string[] = [],
 ): string {
 	const tempDir = tmpdir();
 	const sensitive = sensitiveForms(sensitiveDirs, cwd);
@@ -281,6 +331,37 @@ export function buildProfile(
 	].filter((p): p is string => Boolean(p));
 	const unique = [...new Set(authorized)];
 
+	// Exact sensitive config files (raw + canonical): never writable, in any cwd
+	// situation. The canonical form covers agent-dir symlinks/spellings.
+	const sensitiveFileForms = [...new Set(
+		sensitiveFiles.flatMap((file) => [absolutePath(file, cwd), canonicalPath(file, cwd) ?? ""]).filter(Boolean),
+	)];
+	// Covering sensitive dirs (strict parents of the cwd): denied BEFORE the cwd
+	// re-allow below, so the cwd allow carves the project subtree back out.
+	const coveringForms = sensitiveFiles.length > 0
+		? [...new Set(coveringSensitive)]
+			.filter((dir) => !cwdForms.includes(dir))
+			.flatMap((dir) => [absolutePath(dir, cwd), canonicalPath(dir, cwd) ?? ""])
+			.filter(Boolean)
+		: [];
+	// Child sensitive dirs (strictly inside the cwd subtree, never the cwd
+	// itself): denied AFTER the cwd re-allow. A trailing cwd allow would
+	// otherwise re-open them (Seatbelt last-match-wins), letting `mv agent
+	// agent.bak` succeed and exposing credentials via the renamed path. The
+	// explicitly editable dirs are re-allowed after this deny, so extension
+	// source stays editable while the rest of the child dir stays denied.
+	const childSensitiveForms = sensitiveFiles.length > 0
+		? [...new Set(projectSensitive)]
+			.filter((dir) => !cwdForms.includes(dir))
+			.flatMap((dir) => [absolutePath(dir, cwd), canonicalPath(dir, cwd) ?? ""])
+			.filter(Boolean)
+		: [];
+	// Dir-level carve-outs that must stay writable even though sensitive dirs are
+	// denied (e.g. agent/extensions source code), in raw + canonical form.
+	const editableForms = [...new Set(
+		editableDirs.flatMap((dir) => [absolutePath(dir, cwd), canonicalPath(dir, cwd) ?? ""]).filter(Boolean),
+	)];
+
 	const parts: string[] = [
 		"(version 1)",
 		"(allow default)",
@@ -298,12 +379,31 @@ export function buildProfile(
 		// disjoint from the project cwd are denied; the others are handled by the
 		// classification above (kept writable / covering roots dropped).
 		...externalSensitive.map((p) => `(deny file-write* (subpath "${escapeProfilePath(p)}"))`),
-		// optional sensitive-read denylist (last, so it wins over everything).
-		// Fail closed: an entry that cannot be canonicalized (broken symlink,
-		// unreadable ancestor) still denies its anchored literal form — silently
-		// dropping the deny would make the path readable instead.
-		...denyRead
-			.map((entry) => canonicalPath(entry, cwd) ?? anchorKeepDotDot(entry, cwd))
+		...coveringForms.map((p) => `(deny file-write* (subpath "${escapeProfilePath(p)}"))`),
+		// Project cwd re-allowed after the parent-level denies (carves the project
+		// back out) but BEFORE the child-level denies below, so a sensitive
+		// subdir can never be re-opened by this allow. A sensitive-file deny
+		// further below still wins over everything.
+		...(sensitiveFiles.length > 0 ? cwdForms : []).map((p) => `(allow file-write* (subpath "${escapeProfilePath(p)}"))`),
+		// Child sensitive dirs (strict descendants of the cwd): denied after the
+		// cwd re-allow so rename/unlink tricks around protected files stay blocked.
+		...childSensitiveForms.map((p) => `(deny file-write* (subpath "${escapeProfilePath(p)}"))`),
+		// editable (extension source) dirs: re-allowed after the dir-level denies so
+		// extension code stays editable from any project cwd.
+		...editableForms.map((p) => `(allow file-write* (subpath "${escapeProfilePath(p)}"))`),
+		// sensitive config files: exact-file denies, emitted after EVERY allow —
+		// including the editable-dir re-allow and, when the project cwd lives inside
+		// the sensitive tree, the cwd allow itself. The file-level deny therefore
+		// wins in every cwd situation.
+		...sensitiveFileForms.map((p) => `(deny file-write* (subpath "${escapeProfilePath(p)}"))`),
+		// Optional sensitive-read denylist (last, so it wins over everything).
+		// Entries that cannot be canonicalized are ignored: denyRead is an opt-in
+		// blacklist, and one malformed/broken entry must not affect other reads.
+		// Per-entry failures are isolated by canonicalDenyRoots (shared with the
+		// built-in side); resolution itself stays Seatbelt-specific (kernel `..`
+		// semantics, no built-in @/unicode/file: normalization) so coverage never
+		// shifts when the helper is reused.
+		...canonicalDenyRoots(denyRead, (entry) => canonicalPath(entry, cwd))
 			.map((p) => `(deny file-read* (subpath "${escapeProfilePath(p)}"))`),
 	];
 	return parts.join("");

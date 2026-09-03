@@ -93,6 +93,7 @@
 | `noUI` | `"block"` \| `"allow"` | `"block"` | 无 UI 时：`block` 拦截；`allow` 放行 |
 | `allowlist` | string[] | `[]` | 命令**精确相等**或**以之为前缀**（如 `"npm install"` 匹配 `"npm install lodash"`）即跳过所有检查 |
 | `patterns` | string[] | `[]` | 追加的自定义危险正则（正则 source，自动加 `i` 标志） |
+| `rmExemptRoots` | string[] | `[]` | 显式允许无确认 `rm -rf` / `rm -f` 的删除根。仅严格子路径可免 guard；支持最后一个路径段的 glob，如 `/tmp/pi-cleanup/run-*`。不继承 `extraRoots`，避免 `/var` 这类宽根自动获得无确认删除权限 |
 | `scopeExempt` | boolean | `true` | `false` 关闭「授权根放行」，越界类规则也一律按原流程处理 |
 
 配置为**会话级**：修改后需 `/reload` 重读。`session_start` 时读取一次并缓存，`/reload` 会清空缓存并重新读取。
@@ -140,6 +141,16 @@ volta run node --test core.test.ts
 ```json
 { "allowlist": ["npm run build", "npm run test", "git pull"] }
 ```
+
+**显式放行临时目录中的 glob 清理（不会放宽整个 `/var`）：**
+
+```json
+{
+  "rmExemptRoots": ["/var/folders/xn/s_0b871d6ps9_5fh1krppzmr0000gn/T"]
+}
+```
+
+该配置只对 `rm -rf` / `rm -f` 生效。glob 必须在最后一个路径段；符号链接前缀、变量、命令替换、brace expansion、删除根目录本身以及后续写入操作都会继续 guard。
 
 **每次都问，连项目目录/extraRoots 内的删除与写入也不豁免：**
 

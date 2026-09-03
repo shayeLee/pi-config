@@ -24,6 +24,14 @@
  * strictly containing the cwd get no deny but every root covering them is
  * dropped, and disjoint dirs are denied as usual — so credentials outside the
  * cwd are never relaxed just to keep the project writable.
+ *
+ * On top of the dir-level denies, the exact pi config/credential FILES
+ * (auth.json, oauth.json, trust.json, settings.json, models.json,
+ * models-store.json, path-scope.json, sandbox-bash.json, bash-guard.json,
+ * absolute from getAgentDir()) stay write-denied in EVERY cwd situation — even
+ * when the project itself lives inside the agent dir and the dir-level denies
+ * are lifted. And ~/.pi/agent/extensions (extension source code) stays
+ * editable from any project cwd, re-allowed after the dir-level denies.
  * extraRoots are read from the USER-level ~/.pi/agent/path-scope.json only: a
  * checked-in project must not be able to widen the kernel write boundary.
  * Relative root entries are anchored to the session cwd. Reads are deliberately
@@ -61,6 +69,7 @@ import {
 	validateSandboxBashConfig,
 	type SandboxBashConfig,
 } from "./core";
+import { sensitiveWriteFiles } from "./deny-core";
 
 type UI = { ui: { notify(message: string, type?: "info" | "warning" | "error"): void } };
 
@@ -136,13 +145,14 @@ function authorizedRoots(
 	return kept;
 }
 
-const SUPPORTED = process.platform === "darwin" && existsSync("/usr/bin/sandbox-exec");
+const SANDBOX_EXEC = "/usr/bin/sandbox-exec";
+const SUPPORTED = process.platform === "darwin" && existsSync(SANDBOX_EXEC);
 
 function createSandboxedBashOps(profile: string): BashOperations {
 	return {
 		exec(command, cwd, { onData, signal, timeout, env }) {
 			return new Promise((resolveResult, reject) => {
-				const child = spawn("sandbox-exec", ["-p", profile, "bash", "-c", command], {
+				const child = spawn(SANDBOX_EXEC, ["-p", profile, "bash", "-c", command], {
 					cwd,
 					detached: true,
 					env: env ?? process.env,
@@ -246,11 +256,19 @@ export default function (pi: ExtensionAPI) {
 	/** One profile per call: the tool path and the `!` path must never diverge. */
 	const profileFor = (ctx: UI): string => {
 		const cfg = getConfig(ctx);
+		const agentDir = getAgentDir();
 		return buildProfile(
 			ctx.cwd,
 			authorizedRoots(cfg, ctx.cwd, (entry) => note(ctx, `已从写授权根中排除 pi 配置/凭据目录（设计如此）：${entry}`)),
 			cfg.config.denyRead ?? [],
 			sensitiveDirs(),
+			// Exact pi config/credential files (auth.json, settings.json, ...):
+			// write-denied in every cwd situation, even when the dir-level denies
+			// are lifted because the project itself lives inside the agent dir.
+			sensitiveWriteFiles(agentDir),
+			// agent/extensions source code stays editable from any project cwd,
+			// re-allowed after the dir-level agent-dir denies.
+			[join(agentDir, "extensions")],
 		);
 	};
 

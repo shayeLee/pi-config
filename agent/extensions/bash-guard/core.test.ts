@@ -12,6 +12,7 @@ import assert from "node:assert";
 import { homedir } from "node:os";
 import {
 	DEFAULT_DANGEROUS_RULES,
+	analyseExplicitRmExemption,
 	analyseScopeExemption,
 	compileRules,
 	isAllowlisted,
@@ -102,6 +103,10 @@ describe("validateBashGuardConfig", () => {
 	it("rejects non-string / empty patterns", () => {
 		assert.ok("error" in validateBashGuardConfig({ patterns: ["ok", 123] }));
 		assert.ok("error" in validateBashGuardConfig({ patterns: [""] }));
+	});
+	it("rejects non-string / empty rmExemptRoots", () => {
+		assert.ok("error" in validateBashGuardConfig({ rmExemptRoots: ["/tmp", 123] }));
+		assert.ok("error" in validateBashGuardConfig({ rmExemptRoots: [""] }));
 	});
 	it("rejects a non-boolean scopeExempt", () => {
 		assert.ok("error" in validateBashGuardConfig({ scopeExempt: "yes" }));
@@ -409,6 +414,44 @@ describe("analyseScopeExemption: everything else stays guarded (fail closed)", (
 			}
 		});
 	}
+});
+
+describe("analyseExplicitRmExemption", () => {
+	const explicit = (command: string, canonicalize = (absolute: string) => resolve(absolute)) =>
+		analyseExplicitRmExemption(command, {
+			cwd: CWD,
+			roots: ["/explicit/T"],
+			canonicalize,
+		});
+
+	it("exempts terminal globs under an explicit root and read-only inspection tails", () => {
+		const command = 'rm -rf /explicit/T/ps-e2e-* /explicit/T/ps-pr-*; ls /explicit/T 2>/dev/null | grep -E "^(ps-)" || echo "clean"; cd /proj && git status --short';
+		const result = explicit(command);
+		assert.equal(result.exempt, true, JSON.stringify(result));
+	});
+
+	for (const command of [
+		"rm -rf /explicit/T",
+		"rm -rf /explicit/*/escape",
+		"rm -rf /explicit/T/$DIR-*",
+		"rm -rf /explicit/T/{a,b}",
+		"rm -rf /explicit/T/ps-*; cd /tmp && rm -rf ./later-*",
+		"rm -rf /explicit/T/ps-*; echo x > /etc/passwd",
+		"rm -rf /explicit/T/ps-*; find /var -delete",
+		"rm -rf /explicit/T/ps-*; find /var -exec rm -rf {} +",
+		"sudo rm -rf /explicit/T/ps-*",
+	]) {
+		it(`keeps unsafe command guarded: ${command}`, () => {
+			assert.equal(explicit(command).exempt, false, command);
+		});
+	}
+
+	it("rejects a terminal glob whose static prefix resolves through a symlink outside the explicit root", () => {
+		const result = explicit("rm -rf /explicit/T/link/ps-*", (absolute) =>
+			absolute === "/explicit/T/link" ? "/outside" : resolve(absolute),
+		);
+		assert.equal(result.exempt, false, JSON.stringify(result));
+	});
 });
 
 describe("broad roots never override the protected pi config dirs", () => {

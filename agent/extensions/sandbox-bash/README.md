@@ -25,9 +25,13 @@
 | 写授权根内 | 放行 |
 | 写授权根外任何路径 | **内核拒绝** |
 | 写 `~/.pi`、`~/.pi/agent`（含通过符号链接、`..` 绕行、或被 `~` 这样的宽根包含） | **内核拒绝** |
+| 写 pi 配置/凭据**文件**（`auth.json`、`oauth.json`、`trust.json`、`settings.json`、`models.json`、`models-store.json`、`path-scope.json`、`sandbox-bash.json`、`bash-guard.json`，由 `getAgentDir()` 派生的绝对路径，含其父目录同名文件） | **任何 cwd 下都内核拒绝**（即使 cwd 就在 `~/.pi` 内、目录级 deny 被豁免） |
+| 写 `~/.pi/agent/extensions`（扩展源码） | **放行**（目录级 deny 之后重新放开，任何 cwd 下都可编辑扩展代码） |
 | 写 `/dev/null`、`/dev/zero` | 放行（`file-write*`，覆盖 `>`、`>>`、`touch` 等变体，git 等工具依赖） |
 | 读 / 执行 / 网络 | **完全放行** |
 | 读 `denyRead` 配置的路径 | **内核拒绝**（data + metadata） |
+
+内置 `read` / `grep` / `find` / `ls` 工具同样受本配置的 `denyRead` 限制（实现在 `path-scope` 扩展里，路径解析与内置工具的 `resolveToCwd` 一致后再 canonicalize；deny 优先于 cwd/extraRoots/会话批准；`grep`/`find` 的搜索根若包含 deny 根也会被拒，因为递归搜索会进入敏感根）。`write`/`edit` 不受 `denyRead` 限制，只受上面的敏感配置文件写保护限制。
 
 ## 设计取舍（重要）
 
@@ -55,13 +59,15 @@
 |------|------|------|------|
 | `enabled` | boolean | `true` | `false` 完全禁用（回到普通 bash） |
 | `allowWrite` | string[] | `[]` | 额外写授权根，绝对/`~`/相对（按会话 cwd 解析）路径。cwd、`/tmp`、`/private/tmp`、`os.tmpdir()` 恒定包含 |
-| `denyRead` | string[] | `[]` | 禁止读的敏感路径（data + metadata），绝对/`~`/相对（按会话 cwd 解析）路径。读默认全放行，仅这些路径被内核拒绝。路径无法规范化（断链/不可读）时不静默取消：退而拒绝其字面锚定形式（fail-closed） |
+| `denyRead` | string[] | `[]` | 禁止读的敏感路径（data + metadata），绝对/`~`/相对（按会话 cwd 解析）路径。读默认全放行，仅这些路径被内核拒绝。无法规范化的单条路径会被忽略。配置文件本身无效/不可读时，按未配置 denyRead 处理，并继续使用 path-scope 的 extraRoots 规则 |
 
 写授权根的来源：**cwd + `/tmp` + `/private/tmp` + `os.tmpdir()` 恒定**，再叠加 `~/.pi/agent/path-scope.json` 的 `extraRoots` 和本配置的 `allowWrite`，但**自动过滤掉 `~/.pi`（含 `~/.pi/agent`）及其子路径**——这些目录存有 `auth.json`、`settings.json`、扩展自身代码，绝不能成为 bash 写授权根。被排除时会推一条 `info` 提醒（不是错误：例如 `extraRoots` 里写了 `~/.pi` 就是这个结果）。改任一配置后 `/reload` 重读。
 
 > `extraRoots` **只读用户级** `~/.pi/agent/path-scope.json`，不读项目级 `.pi/path-scope.json`：一个仓库不应能自行拓宽内核写授权面。`path-scope`（文件工具弹窗）则会在项目受信任时叠加项目级配置——这是有意的不对称：前者只决定“问不问”，后者决定“能不能写”。
 
 除过滤根列表外，profile 会在**所有 allow 子句之后**再为与项目无关的敏感目录补上 `(deny file-write* (subpath …))`，因此一个包含敏感目录的宽根（如 `~` 或 `/`）也不能写入 `~/.pi`。当 cwd 本身就在敏感目录下（例如就在 `~/.pi` 里跑 pi）时，敏感目录按位置分类而不是整体免 deny：cwd 子树内（含 cwd 本身）属于项目、保持可写；**严格包含 cwd** 的敏感目录不能 deny（会连项目一起拒），改为**丢弃所有覆盖它的宽根**（如 `~`、`/`），于是 cwd 子树之外的凭据（如 `agent/auth.json` 相对 cwd 在 `agent/sessions` 下时）依然够不到；与项目不相交的照常 deny。这与 bash-guard 的 cwd 优先豁免保持一致。
+
+不论 cwd 如何分类，profile **始终**在末尾（所有 allow 与目录级 deny 之后）为敏感配置**文件**补 `(deny file-write* (subpath …))`（原始 + realpath 双变体）——所以「cwd 在 `~/.pi` 内时项目对 `~/.pi` 可写」不会连带解锁 `agent/auth.json` 之类的文件。同时 `~/.pi/agent/extensions` 在目录级 deny 之后重新放开，保证任何 cwd 下都能编辑扩展源码（注意：这使其他项目也能向扩展目录写入新代码，请按需取舍）。
 
 ## 环境要求
 

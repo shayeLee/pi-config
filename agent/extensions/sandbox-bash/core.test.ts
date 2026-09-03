@@ -11,12 +11,13 @@
 import { describe, it } from "node:test";
 import assert from "node:assert";
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import {
 	absolutePath,
 	buildProfile,
+	canonicalDenyRoots,
 	canonicalPath,
 	escapeProfilePath,
 	filterSensitiveRoots,
@@ -159,8 +160,8 @@ describe("filterSensitiveRoots", () => {
 			mkdirSync(good);
 			const bad = `${base}/broken/newsub`;
 
-			// Fail closed: the unresolvable root is dropped even though it never
-			// touches the sensitive dir; legitimate roots (incl. relative) survive.
+			// The unresolvable root is dropped; legitimate roots (incl. relative)
+			// survive.
 			assert.deepEqual(filterSensitiveRoots([bad, good, "./keep"], [secret], base), [good, "./keep"]);
 
 			const profile = buildProfile(base, [bad, good], [], [secret]);
@@ -295,12 +296,12 @@ describe("buildProfile", () => {
 		const occurrences = profile.split('/cwd"').length - 1;
 		assert.equal(occurrences, 1, "cwd should appear once");
 	});
-	it("denies an unresolvable denyRead path via its anchored literal form instead of dropping it", () => {
+	it("ignores an unresolvable denyRead path", () => {
 		const base = mkdtempSync(join(tmpdir(), "sb-denybad-"));
 		try {
 			symlinkSync(join(base, "missing"), join(base, "broken"));
 			const profile = buildProfile(base, [], [`${base}/broken/secret`]);
-			assert.ok(profile.includes(`(deny file-read* (subpath "${base}/broken/secret")`), profile);
+			assert.ok(!profile.includes(`(deny file-read* (subpath "${base}/broken/secret")`), profile);
 
 			// ...while a resolvable denyRead entry still uses its canonical form.
 			const goodProfile = buildProfile(base, [], [`${base}/plain`]);
@@ -367,6 +368,166 @@ describe("buildProfile", () => {
 		const profile = buildProfile(cwd, ["/Users/mz/.volta"], [], [agent, pi]);
 		assert.ok(profile.includes('(allow file-write* (subpath "/Users/mz/.volta")'), profile);
 		assert.ok(profile.includes(`(allow file-write* (subpath "${cwd}"`), profile);
+	});
+});
+
+describe("buildProfile: sensitive config files + editable dirs", () => {
+	it("denies exact sensitive config files (subpath, raw + canonical) after every allow", () => {
+		const base = mkdtempSync(join(tmpdir(), "sb-files-"));
+		try {
+			const agent = join(base, "agent");
+			const auth = join(agent, "auth.json");
+			mkdirSync(agent, { recursive: true });
+			writeFileSync(auth, "{}");
+			const cwd = join(base, "proj");
+			const profile = buildProfile(cwd, [], [], [agent, base], [auth], [join(agent, "extensions")]);
+
+			const canonicalAuth = canonicalPath(auth, cwd);
+			assert.ok(canonicalAuth !== undefined);
+			assert.ok(profile.includes(`(deny file-write* (subpath "${canonicalAuth}")`), profile);
+			assert.ok(profile.includes(`(deny file-write* (subpath "${auth}")`), profile);
+
+			const lastAllow = profile.lastIndexOf("(allow file-write*");
+			assert.ok(lastAllow >= 0, "profile should contain allows");
+			const denyIndex = profile.indexOf(`(deny file-write* (subpath "${canonicalAuth}")`);
+			assert.ok(denyIndex > lastAllow, "sensitive-file deny must come after every allow");
+		} finally {
+			rmSync(base, { recursive: true, force: true });
+		}
+	});
+
+	it("keeps the file-level denies when the cwd lives inside the sensitive tree", () => {
+		const base = mkdtempSync(join(tmpdir(), "sb-files-"));
+		try {
+			const piDir = join(base, ".pi");
+			const agent = join(piDir, "agent");
+			mkdirSync(agent, { recursive: true });
+			const auth = join(agent, "auth.json");
+			writeFileSync(auth, "{}");
+			const cwd = piDir;
+			const profile = buildProfile(cwd, [], [], [agent, piDir], [auth], [join(agent, "extensions")]);
+
+			// project stays writable; the sensitive agent directory is denied after
+			// the cwd allow to prevent rename/unlink tricks around protected files.
+			assert.ok(profile.includes(`(allow file-write* (subpath "${cwd}")`), profile);
+			assert.ok(profile.includes(`(deny file-write* (subpath "${agent}")`), profile);
+			assert.ok(!profile.includes(`(deny file-write* (subpath "${piDir}")`), profile);
+			// ...but the config file itself must STILL be denied.
+			const canonicalAuth = canonicalPath(auth, cwd);
+			assert.ok(canonicalAuth !== undefined);
+			assert.ok(profile.includes(`(deny file-write* (subpath "${canonicalAuth}")`), profile);
+		} finally {
+			rmSync(base, { recursive: true, force: true });
+		}
+	});
+
+	it("re-allows an editable dir (extensions) AFTER the dir-level sensitive denies", () => {
+		const base = mkdtempSync(join(tmpdir(), "sb-files-"));
+		try {
+			const agent = join(base, ".pi", "agent");
+			const ext = join(agent, "extensions");
+			mkdirSync(ext, { recursive: true });
+			const piDir = join(base, ".pi");
+			const cwd = join(base, "proj");
+			const profile = buildProfile(cwd, [], [], [agent, piDir], [], [ext]);
+
+			const agentDeny = profile.indexOf(`(deny file-write* (subpath "${agent}")`);
+			const extAllow = profile.indexOf(`(allow file-write* (subpath "${ext}")`);
+			assert.ok(agentDeny >= 0, profile);
+			assert.ok(extAllow > agentDeny, `extensions allow must come after the dir deny: ${profile}`);
+		} finally {
+			rmSync(base, { recursive: true, force: true });
+		}
+	});
+
+	it("escapes quote characters in sensitive-file deny paths", () => {
+		const profile = buildProfile("/cwd", [], [], [], ["/weird\"path/auth.json"], []);
+		assert.ok(profile.includes('(deny file-write* (subpath "/weird\\"path/auth.json")'), profile);
+	});
+
+	it("emits no file-level clauses when none are configured", () => {
+		const profile = buildProfile("/cwd", [], []);
+		assert.ok(!profile.includes("(deny file-write* (subpath \"/cwd/auth.json\")"), profile);
+	});
+});
+
+describe("canonicalDenyRoots (shared per-entry isolation)", () => {
+	it("skips a throwing entry and keeps the rest, deduplicated", () => {
+		const skipped: string[] = [];
+		const out = canonicalDenyRoots(
+			["/good", "/bad", "/good"],
+			(entry) => {
+				if (entry === "/bad") throw new Error("illegal file: URL");
+				return entry;
+			},
+			(entry) => skipped.push(entry),
+		);
+		assert.deepEqual(out, ["/good"]);
+		assert.deepEqual(skipped, ["/bad"]);
+	});
+	it("skips unresolvable (undefined) entries without throwing", () => {
+		const skipped: string[] = [];
+		const out = canonicalDenyRoots(["/good", "/missing"], (entry) => entry === "/good" ? entry : undefined, (entry) => skipped.push(entry));
+		assert.deepEqual(out, ["/good"]);
+		assert.deepEqual(skipped, ["/missing"]);
+	});
+});
+
+describe("buildProfile: cwd inside the sensitive tree (rename-trick hardening)", () => {
+	function makePiTree() {
+		const base = mkdtempSync(join(tmpdir(), "sb-rename-"));
+		const piDir = join(base, ".pi");
+		const agent = join(piDir, "agent");
+		const ext = join(agent, "extensions");
+		mkdirSync(ext, { recursive: true });
+		const auth = join(agent, "auth.json");
+		writeFileSync(auth, "{}");
+		return { base, piDir, agent, ext, auth };
+	}
+
+	it("cwd == sensitive dir: child deny comes AFTER the cwd re-allow, extensions stay editable, files stay denied", () => {
+		const { base, piDir, agent, ext, auth } = makePiTree();
+		try {
+			const profile = buildProfile(piDir, [], [], [agent, piDir], [auth], [ext]);
+			const cwdAllow = profile.lastIndexOf(`(allow file-write* (subpath "${piDir}")`); // LAST: top allows already contain cwd; the re-allow is the trailing one
+			const agentDeny = profile.indexOf(`(deny file-write* (subpath "${agent}")`);
+			const extAllow = profile.indexOf(`(allow file-write* (subpath "${ext}")`);
+			const canonicalAuth = canonicalPath(auth, piDir);
+			assert.ok(canonicalAuth !== undefined);
+			const fileDeny = profile.indexOf(`(deny file-write* (subpath "${canonicalAuth}")`);
+			assert.ok(cwdAllow >= 0, profile);
+			assert.ok(agentDeny >= 0, profile);
+			assert.ok(extAllow >= 0, profile);
+			assert.ok(fileDeny >= 0, profile);
+			// The child dir deny must win over the trailing cwd allow (Seatbelt
+			// last-match-wins); otherwise `mv agent agent.bak` re-opens the
+			// credentials via the renamed path.
+			assert.ok(agentDeny > cwdAllow, `agent deny must come after the cwd re-allow: ${profile}`);
+			assert.ok(extAllow > agentDeny, `extensions allow must come after the child deny: ${profile}`);
+			assert.ok(fileDeny > extAllow, `file deny must come after every allow: ${profile}`);
+			// The cwd itself is never denied (the project stays writable).
+			assert.ok(!profile.includes(`(deny file-write* (subpath "${piDir}")`), profile);
+		} finally {
+			rmSync(base, { recursive: true, force: true });
+		}
+	});
+
+	it("cwd strictly inside: covering denies come BEFORE the cwd re-allow (project carved back out)", () => {
+		const { base, piDir, agent } = makePiTree();
+		const cwd = join(agent, "sessions");
+		mkdirSync(cwd, { recursive: true });
+		try {
+			const auth = join(agent, "auth.json");
+			const profile = buildProfile(cwd, [], [], [agent, piDir], [auth], [join(agent, "extensions")]);
+			const cwdAllow = profile.lastIndexOf(`(allow file-write* (subpath "${cwd}")`); // LAST: re-allow after the covering denies
+			const agentDeny = profile.indexOf(`(deny file-write* (subpath "${agent}")`);
+			const piDeny = profile.indexOf(`(deny file-write* (subpath "${piDir}")`);
+			assert.ok(cwdAllow >= 0, profile);
+			assert.ok(agentDeny >= 0 && piDeny >= 0, profile);
+			assert.ok(agentDeny < cwdAllow && piDeny < cwdAllow, `covering denies must precede the cwd re-allow: ${profile}`);
+		} finally {
+			rmSync(base, { recursive: true, force: true });
+		}
 	});
 });
 
@@ -552,6 +713,175 @@ describe("sandbox-exec integration (write isolation)", { skip: SANDBOX_SKIP }, (
 		} finally {
 			rmSync(root, { recursive: true, force: true });
 			rmSync(secret, { recursive: true, force: true });
+		}
+	});
+});
+
+describe("sandbox-exec: sensitive config file write protection", { skip: SANDBOX_SKIP }, () => {
+	function makeAgentTree(): { base: string; piDir: string; agent: string; auth: string; ext: string } {
+		const base = mkdtempSync(join(tmpdir(), "sb-cfg-"));
+		const piDir = join(base, ".pi");
+		const agent = join(piDir, "agent");
+		const ext = join(agent, "extensions");
+		mkdirSync(ext, { recursive: true });
+		const auth = join(agent, "auth.json");
+		writeFileSync(auth, "{}");
+		return { base, piDir, agent, auth, ext };
+	}
+
+	it("denies writes to a sensitive config file when the cwd is inside the sensitive tree", () => {
+		const { base, piDir, agent, auth, ext } = makeAgentTree();
+		try {
+			const profile = buildProfile(piDir, [], [], [agent, piDir], [auth], [ext]);
+			const result = spawnSync(
+				SANDBOX_EXEC,
+				["-p", profile, "bash", "-c", `echo leaked > "${auth}"`],
+				{ cwd: piDir, encoding: "utf8" },
+			);
+			assert.notEqual(result.status, 0, "write into the sensitive file should have failed");
+			assert.ok(/Operation not permitted/i.test(result.stderr), result.stderr);
+			assert.equal(readFileSync(auth, "utf8"), "{}");
+		} finally {
+			rmSync(base, { recursive: true, force: true });
+		}
+	});
+
+	it("blocks deleting (unlink) a sensitive config file even inside the sensitive tree", () => {
+		const { base, piDir, agent, auth, ext } = makeAgentTree();
+		try {
+			const profile = buildProfile(piDir, [], [], [agent, piDir], [auth], [ext]);
+			const result = spawnSync(
+				SANDBOX_EXEC,
+				["-p", profile, "bash", "-c", `rm "${auth}"`],
+				{ cwd: piDir, encoding: "utf8" },
+			);
+			assert.notEqual(result.status, 0, "unlink of the sensitive file should have failed");
+			assert.ok(/Operation not permitted/i.test(result.stderr), result.stderr);
+			assert.ok(existsSync(auth), "the file must still exist");
+		} finally {
+			rmSync(base, { recursive: true, force: true });
+		}
+	});
+
+	it("blocks CREATING a not-yet-existing sensitive config file inside the sensitive tree", () => {
+		const { base, piDir, agent, auth, ext } = makeAgentTree();
+		rmSync(auth, { force: true });
+		try {
+			const profile = buildProfile(piDir, [], [], [agent, piDir], [auth], [ext]);
+			const result = spawnSync(
+				SANDBOX_EXEC,
+				["-p", profile, "bash", "-c", `echo new > "${auth}"`],
+				{ cwd: piDir, encoding: "utf8" },
+			);
+			assert.notEqual(result.status, 0, "creating the sensitive file should have failed");
+			assert.ok(/Operation not permitted/i.test(result.stderr), result.stderr);
+			assert.ok(!existsSync(auth));
+		} finally {
+			rmSync(base, { recursive: true, force: true });
+		}
+	});
+
+	it("allows editing extension source under the agent dir from an outside cwd", () => {
+		const { base, piDir, agent, auth, ext } = makeAgentTree();
+		const cwd = join(base, "proj");
+		mkdirSync(cwd, { recursive: true });
+		try {
+			const profile = buildProfile(cwd, [], [], [agent, piDir], [auth], [ext]);
+			const target = join(ext, "new-extension.ts");
+			const result = spawnSync(
+				SANDBOX_EXEC,
+				["-p", profile, "bash", "-c", `echo 'export default function(){}' > "${target}"`],
+				{ cwd, encoding: "utf8" },
+			);
+			assert.equal(result.status, 0, result.stderr);
+			assert.ok(existsSync(target));
+		} finally {
+			rmSync(base, { recursive: true, force: true });
+		}
+	});
+
+	it("still denies writes to a sensitive config file from an outside cwd", () => {
+		const { base, piDir, agent, auth, ext } = makeAgentTree();
+		const cwd = join(base, "proj");
+		mkdirSync(cwd, { recursive: true });
+		try {
+			const profile = buildProfile(cwd, [], [], [agent, piDir], [auth], [ext]);
+			const result = spawnSync(
+				SANDBOX_EXEC,
+				["-p", profile, "bash", "-c", `echo no > "${auth}"`],
+				{ cwd, encoding: "utf8" },
+			);
+			assert.notEqual(result.status, 0, "write into the sensitive file should have failed");
+			assert.ok(/Operation not permitted/i.test(result.stderr), result.stderr);
+			assert.equal(readFileSync(auth, "utf8"), "{}");
+		} finally {
+			rmSync(base, { recursive: true, force: true });
+		}
+	});
+
+	it("still denies other files under the agent dir from an outside cwd (dir-level deny intact)", () => {
+		const { base, piDir, agent, auth, ext } = makeAgentTree();
+		const cwd = join(base, "proj");
+		mkdirSync(cwd, { recursive: true });
+		try {
+			const profile = buildProfile(cwd, [], [], [agent, piDir], [auth], [ext]);
+			const sessions = join(agent, "sessions.jsonl");
+			const result = spawnSync(
+				SANDBOX_EXEC,
+				["-p", profile, "bash", "-c", `echo hi > "${sessions}"`],
+				{ cwd, encoding: "utf8" },
+			);
+			assert.notEqual(result.status, 0, "write under the agent dir should have failed");
+			assert.ok(/Operation not permitted/i.test(result.stderr), result.stderr);
+			assert.ok(!existsSync(sessions));
+		} finally {
+			rmSync(base, { recursive: true, force: true });
+		}
+	});
+});
+
+describe("sandbox-exec: rename-trick hardening (cwd inside sensitive tree)", { skip: SANDBOX_SKIP }, () => {
+	function makeAgentTree(): { base: string; piDir: string; agent: string; auth: string; ext: string } {
+		const base = mkdtempSync(join(tmpdir(), "sb-rename-"));
+		const piDir = join(base, ".pi");
+		const agent = join(piDir, "agent");
+		const ext = join(agent, "extensions");
+		mkdirSync(ext, { recursive: true });
+		const auth = join(agent, "auth.json");
+		writeFileSync(auth, "{}");
+		return { base, piDir, agent, auth, ext };
+	}
+
+	it("blocks renaming the sensitive child dir when cwd == the sensitive dir", () => {
+		const { base, piDir, agent, auth, ext } = makeAgentTree();
+		try {
+			const profile = buildProfile(piDir, [], [], [agent, piDir], [auth], [ext]);
+			const result = spawnSync(
+				SANDBOX_EXEC,
+				["-p", profile, "bash", "-c", "mv agent agent.bak"],
+				{ cwd: piDir, encoding: "utf8" },
+			);
+			assert.notEqual(result.status, 0, "renaming the protected child dir should have failed");
+			assert.ok(existsSync(agent), "the agent dir must still exist");
+		} finally {
+			rmSync(base, { recursive: true, force: true });
+		}
+	});
+
+	it("keeps extension source editable when cwd == the sensitive dir", () => {
+		const { base, piDir, agent, auth, ext } = makeAgentTree();
+		try {
+			const profile = buildProfile(piDir, [], [], [agent, piDir], [auth], [ext]);
+			const target = join(ext, "tweak.ts");
+			const result = spawnSync(
+				SANDBOX_EXEC,
+				["-p", profile, "bash", "-c", `echo 'export default 1' > "${target}"`],
+				{ cwd: piDir, encoding: "utf8" },
+			);
+			assert.equal(result.status, 0, result.stderr);
+			assert.ok(existsSync(target));
+		} finally {
+			rmSync(base, { recursive: true, force: true });
 		}
 	});
 });

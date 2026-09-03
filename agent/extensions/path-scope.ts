@@ -9,6 +9,22 @@
  *   - bash is intentionally NOT restricted here and runs without path-scope
  *     checks.
  *
+ * Two additional, cwd-independent protections ride on this gate:
+ *   - denyRead (user-level sandbox-bash.json): read / grep / find / ls are
+ *     blocked on paths at/under the listed deny roots (canonical, symlinks
+ *     resolved; grep/find additionally block a search root that CONTAINS a
+ *     deny root, since recursion would enter it). Path resolution mirrors the
+ *     built-in tools' resolveToCwd() then canonicalizes. If sandbox-bash.json
+ *     is invalid/unreadable, denyRead is treated as absent and the ordinary
+ *     path-scope/extraRoots rules continue to apply. write/edit are
+ *     NOT affected by denyRead.
+ *   - sensitive config files (auth.json, oauth.json, trust.json, settings.json,
+ *     models.json, models-store.json, path-scope.json, sandbox-bash.json,
+ *     bash-guard.json — absolute paths derived from getAgentDir() and its
+ *     parent): write / edit are blocked on them regardless of cwd, extraRoots
+ *     or approval. Agent/extensions source code is NOT in this list and stays
+ *     editable.
+ *
  * Once a path is approved, it stays approved for the rest of the session.
  *
  * Controls (config file, takes precedence over environment variables):
@@ -58,6 +74,18 @@ import {
 	ProjectTrustStore,
 	type ExtensionAPI,
 } from "@earendil-works/pi-coding-agent";
+import {
+	CWD_DEFAULT_TOOLS,
+	DENY_READ_TOOLS,
+	WRITE_TOOLS,
+	buildSensitiveWriteForms,
+	canonicalizeDenyEntries,
+	canonicalizeForWriteTarget,
+	canonicalizePath,
+	evaluateReadDeny,
+	readSandboxBashConfig,
+	resolveLikeBuiltin,
+} from "./sandbox-bash/deny-core";
 
 export interface PathScopeConfig {
 	enabled?: boolean;
@@ -155,39 +183,6 @@ export function isPathInside(root: string, target: string): boolean {
 	return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
 }
 
-/**
- * Resolve symlinks for an existing path. For a not-yet-existing write path,
- * resolve the nearest existing ancestor and append the missing suffix. If an
- * existing path cannot be realpathed (including a broken symlink), fail closed.
- */
-function canonicalizePath(input: string): string | undefined {
-	const resolved = path.resolve(input);
-	let candidate = resolved;
-	const missingSuffix: string[] = [];
-
-	while (true) {
-		try {
-			const canonical = fs.realpathSync(candidate);
-			return path.join(canonical, ...missingSuffix);
-		} catch {
-			try {
-				// An existing but unreadable/broken path must not be guessed at.
-				fs.lstatSync(candidate);
-				return undefined;
-			} catch (error) {
-				if (!(typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT")) {
-					return undefined;
-				}
-			}
-		}
-
-		const parent = path.dirname(candidate);
-		if (parent === candidate) return undefined;
-		missingSuffix.unshift(path.basename(candidate));
-		candidate = parent;
-	}
-}
-
 interface LoadedConfig {
 	cacheKey: string;
 	config: PathScopeConfig;
@@ -269,6 +264,82 @@ export default function (pi: ExtensionAPI) {
 	const approved = new Set<string>();
 	const warned = new Set<string>();
 
+	// denyRead (from the USER-level sandbox-bash.json) restricts the built-in
+	// read tool family. Cached per instance; roots are canonicalized per cwd.
+	interface DenyState {
+		status: "absent" | "valid" | "invalid";
+		reason?: string;
+		denyRead: string[];
+	}
+	let denyState: DenyState | undefined;
+	let denyRootsCache: { cwd: string; roots: string[] } | undefined;
+	let sensitiveFormsCache: string[] | undefined;
+
+	const getDenyState = (): DenyState => {
+		if (denyState) return denyState;
+		try {
+			const result = readSandboxBashConfig(path.join(getAgentDir(), "sandbox-bash.json"));
+			if (result.status === "invalid") {
+				denyState = { status: "invalid", reason: result.reason, denyRead: [] };
+			} else {
+				denyState = { status: result.status, denyRead: result.denyRead ?? [] };
+			}
+		} catch {
+			// getAgentDir()/read must never let the tool_call handler throw: an
+			// unreadable deny source means "no usable blacklist", so the ordinary
+			// read/extraRoots rules continue.
+			denyState = { status: "absent", denyRead: [] };
+		}
+		return denyState;
+	};
+
+	/**
+	 * Canonical denyRead roots anchored to the session cwd (like the Seatbelt
+	 * side). Every entry is isolated by canonicalizeDenyEntries (shared
+	 * failure handling with core.canonicalDenyRoots): an illegal file: URL
+	 * (fileURLToPath throws) or an unresolvable entry is skipped with a
+	 * warning and never throws out of the tool_call handler, nor blocks the
+	 * normal extraRoots flow. Resolution itself stays built-in specific
+	 * (resolveToCwd) so coverage never shifts when the helper is reused.
+	 */
+	const denyRootsFor = (cwd: string, ctx: { ui: { notify(message: string, type?: "info" | "warning" | "error"): void } }): string[] => {
+		if (denyRootsCache?.cwd === cwd) return denyRootsCache.roots;
+		try {
+			const state = getDenyState();
+			if (state.status !== "valid") {
+				denyRootsCache = { cwd, roots: [] };
+				return denyRootsCache.roots;
+			}
+			const roots = canonicalizeDenyEntries(state.denyRead, cwd, (entry, reason) => {
+				warn(ctx, `denyRead 路径无法规范化，已忽略：${entry}（${reason}）`);
+			});
+			denyRootsCache = { cwd, roots };
+			return denyRootsCache.roots;
+		} catch {
+			// Total: a blacklist failure must never break unrelated reads.
+			if (denyRootsCache?.cwd !== cwd) denyRootsCache = { cwd, roots: [] };
+			return denyRootsCache.roots;
+		}
+	};
+
+	/**
+	 * Absolute sensitive config files write/edit must never touch. Derived
+	 * from an absolute getAgentDir() (buildSensitiveWriteForms forces
+	 * path.resolve) in raw + canonical form; never throws, never reads file
+	 * contents. Checked BEFORE the enabled flag so enabled:false cannot
+	 * bypass it, and compared against the dangling-aware target form so a
+	 * symlink to a not-yet-existing sensitive file still matches.
+	 */
+	const sensitiveForms = (): string[] => {
+		if (sensitiveFormsCache) return sensitiveFormsCache;
+		try {
+			sensitiveFormsCache = buildSensitiveWriteForms(getAgentDir());
+		} catch {
+			sensitiveFormsCache = [];
+		}
+		return sensitiveFormsCache;
+	};
+
 	const warn = (ctx: { ui: { notify(message: string, type?: "info" | "warning" | "error"): void } }, message: string) => {
 		if (!warned.has(message)) {
 			warned.add(message);
@@ -307,14 +378,77 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("session_start", (_event, ctx) => {
 		loadedConfig = undefined;
+		denyState = undefined;
+		denyRootsCache = undefined;
+		sensitiveFormsCache = undefined;
 		getConfig(ctx.cwd, ctx.isProjectTrusted(), ctx);
 	});
 
 	pi.on("tool_call", async (event, ctx) => {
-		const loaded = getConfig(ctx.cwd, ctx.isProjectTrusted(), ctx);
-		if (!isEnabled(loaded.config, loaded.suppressEnvironment)) return undefined;
-
 		if (event.toolName === "bash") return undefined;
+
+		const loaded = getConfig(ctx.cwd, ctx.isProjectTrusted(), ctx);
+
+		// --- denyRead gate: built-in read/grep/find/ls (user-level sandbox-bash.json) ---
+		// Runs BEFORE the path-scope boundary checks, so a configured deny list beats
+		// cwd / extraRoots / session approval. An invalid sandbox-bash.json has no
+		// usable deny list and therefore does not disable the normal read behavior.
+		if (DENY_READ_TOOLS.has(event.toolName)) {
+			const state = getDenyState();
+			const rawPath = (event.input as { path?: unknown }).path;
+			const hasPath = typeof rawPath === "string" && rawPath.trim().length > 0;
+			// grep/find/ls default a missing `path` to the session cwd (the built-ins
+			// resolve `path || "."`), so a cwd-wide search must still be checked here.
+			const inputPath = hasPath ? (rawPath as string) : CWD_DEFAULT_TOOLS.has(event.toolName) ? "." : undefined;
+			if (state.status === "invalid") {
+				warn(ctx, `sandbox-bash.json 无效，denyRead 已按未配置处理：${state.reason}；修复后请 /reload`);
+			}
+			if (inputPath !== undefined) {
+				let denyTarget: string | undefined;
+				try {
+					denyTarget = canonicalizePath(resolveLikeBuiltin(inputPath, ctx.cwd));
+				} catch {
+					denyTarget = undefined;
+				}
+				const decision = evaluateReadDeny({
+					toolName: event.toolName,
+					target: denyTarget,
+					denyRoots: denyRootsFor(ctx.cwd, ctx),
+					configBroken: false,
+					configReason: state.reason,
+				});
+				if (decision.block) return decision;
+			}
+		}
+
+		// --- sensitive config file write protection (write/edit) ---
+		// Absolute, cwd-independent, derived from getAgentDir(); beats extraRoots,
+		// session approval and the enabled flag. denyRead itself does NOT restrict
+		// write/edit — only these exact pi config/credential files do.
+		if (WRITE_TOOLS.has(event.toolName)) {
+			const rawPath = (event.input as { path?: unknown }).path;
+			if (typeof rawPath === "string" && rawPath.trim()) {
+				// Dangling-aware: a symlink to a not-yet-existing sensitive config
+				// file must still match (canonicalizePath alone returns undefined
+				// there and would bypass). Never throws; unresolvable input simply
+				// falls through to the boundary flow below.
+				let target: string | undefined;
+				try {
+					target = canonicalizeForWriteTarget(resolveLikeBuiltin(rawPath, ctx.cwd));
+				} catch {
+					target = undefined;
+				}
+				if (target !== undefined && sensitiveForms().includes(target)) {
+					return {
+						block: true,
+						reason: `受保护配置文件，禁止 ${event.toolName === "write" ? "写入" : "编辑"}: ${target}`,
+					};
+				}
+			}
+		}
+
+		// From here on: the ordinary path-scope boundary flow.
+		if (!isEnabled(loaded.config, loaded.suppressEnvironment)) return undefined;
 
 		const raw = (event.input as { path?: unknown }).path;
 		if (typeof raw !== "string" || !raw.trim()) return undefined;

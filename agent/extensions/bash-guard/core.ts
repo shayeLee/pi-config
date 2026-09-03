@@ -19,6 +19,8 @@ export interface BashGuardConfig {
 	noUI?: "block" | "allow";
 	allowlist?: string[];
 	patterns?: string[];
+	/** Explicit roots whose strict descendants may be removed without a guard. */
+	rmExemptRoots?: string[];
 	/**
 	 * When true (default), a command whose *write/delete targets* all live inside
 	 * the authorized roots (project cwd + path-scope extraRoots) is let through
@@ -89,7 +91,7 @@ export function validateBashGuardConfig(value: unknown): BashGuardConfigValidati
 		return { error: "expected a JSON object" };
 	}
 
-	const allowedKeys = new Set(["enabled", "mode", "noUI", "allowlist", "patterns", "scopeExempt"]);
+	const allowedKeys = new Set(["enabled", "mode", "noUI", "allowlist", "patterns", "rmExemptRoots", "scopeExempt"]);
 	for (const key of Object.keys(value)) {
 		if (!allowedKeys.has(key)) return { error: `unknown property ${JSON.stringify(key)}` };
 	}
@@ -112,6 +114,10 @@ export function validateBashGuardConfig(value: unknown): BashGuardConfigValidati
 		!candidate.patterns.every((s) => typeof s === "string" && s.length > 0))) {
 		return { error: "patterns must be an array of non-empty strings" };
 	}
+	if (candidate.rmExemptRoots !== undefined && (!Array.isArray(candidate.rmExemptRoots) ||
+		!candidate.rmExemptRoots.every((s) => typeof s === "string" && s.trim().length > 0))) {
+		return { error: "rmExemptRoots must be an array of non-empty strings" };
+	}
 	if (candidate.scopeExempt !== undefined && typeof candidate.scopeExempt !== "boolean") {
 		return { error: "scopeExempt must be a boolean" };
 	}
@@ -122,6 +128,7 @@ export function validateBashGuardConfig(value: unknown): BashGuardConfigValidati
 	if (candidate.noUI !== undefined) config.noUI = candidate.noUI as "block" | "allow";
 	if (candidate.allowlist !== undefined) config.allowlist = candidate.allowlist as string[];
 	if (candidate.patterns !== undefined) config.patterns = candidate.patterns as string[];
+	if (candidate.rmExemptRoots !== undefined) config.rmExemptRoots = candidate.rmExemptRoots as string[];
 	if (candidate.scopeExempt !== undefined) config.scopeExempt = candidate.scopeExempt as boolean;
 	return { config };
 }
@@ -194,8 +201,12 @@ export interface LexedSegment {
 	redirectTargets: string[];
 }
 
+interface LexerOptions {
+	allowGlob?: boolean;
+}
+
 /** Split into whitespace-separated tokens, keeping separators and redirects. */
-function tokenize(input: string): string[] | undefined {
+function tokenize(input: string, options: LexerOptions = {}): string[] | undefined {
 	const tokens: string[] = [];
 	let buffer = "";
 	let started = false;
@@ -238,7 +249,7 @@ function tokenize(input: string): string[] | undefined {
 			tokens.push("\n");
 			continue;
 		}
-		if (UNSAFE_CHARACTERS.includes(ch)) return undefined;
+		if (UNSAFE_CHARACTERS.includes(ch) && !(options.allowGlob && (ch === "*" || ch === "?" || ch === "[" || ch === "]"))) return undefined;
 
 		if (ch === ";") {
 			flush();
@@ -307,8 +318,8 @@ function tokenize(input: string): string[] | undefined {
  * analysed reliably (expansion, globs, subshells, heredocs, fd duplication,
  * unbalanced quotes, dangling redirect).
  */
-export function lexCommand(command: string): LexedSegment[] | undefined {
-	const tokens = tokenize(command);
+export function lexCommand(command: string, options: LexerOptions = {}): LexedSegment[] | undefined {
+	const tokens = tokenize(command, options);
 	if (!tokens) return undefined;
 
 	const segments: LexedSegment[] = [];
@@ -461,6 +472,90 @@ function segmentWriteTargets(
 
 	if (PRODUCER_COMMANDS.has(commandWord)) return { ok: true, targets };
 	return { ok: false, reason: `命令 ${commandWord} 不在可豁免集合内` };
+}
+
+/**
+ * A deliberately narrow parser for explicit rmExemptRoots. It permits terminal
+ * shell globs only for rm operands and allows read-only inspection commands
+ * after the final rm. Every other shell construct stays fail-closed.
+ */
+function isReadOnlyTailSegment(segment: LexedSegment): boolean {
+	if (segment.redirectTargets.some((target) => target !== "/dev/null" && target !== "/dev/zero")) return false;
+	const [command, ...args] = segment.tokens;
+	if (!command) return false;
+	if (command === "ls" || command === "grep" || command === "pwd" || command === "echo" || command === "printf" || command === "true" || command === "false" || command === "cd") return true;
+	return command === "git" && args[0] === "status";
+}
+
+function hasTerminalGlob(operand: string): boolean {
+	const firstGlob = operand.search(/[?*[]/);
+	return firstGlob >= 0 && !operand.slice(firstGlob).includes("/");
+}
+
+function globParent(absolute: string): string | undefined {
+	const firstGlob = absolute.search(/[?*[]/);
+	if (firstGlob < 0) return undefined;
+	const slash = absolute.lastIndexOf("/", firstGlob);
+	return slash <= 0 ? "/" : absolute.slice(0, slash);
+}
+
+function isPathWithinExplicitRoot(root: string, target: string, allowRootForGlob: boolean): boolean {
+	return (allowRootForGlob && root === target) || isPathStrictlyInside(root, target);
+}
+
+/**
+ * Check an rm command against explicit rmExemptRoots. Unlike the legacy scope
+ * exemption this accepts `foo-*` only in the final path component: its parent
+ * is canonicalized before the shell expands it, so symlinked prefixes cannot
+ * escape the explicit root. The root itself can never be a literal rm target.
+ */
+export function analyseExplicitRmExemption(command: string, input: ScopeAnalysisInput): ScopeAnalysisResult {
+	const segments = lexCommand(command, { allowGlob: true });
+	if (!segments) return { exempt: false, reason: "命令含无法解析的 shell 语法" };
+
+	const rmIndexes = segments
+		.map((segment, index) => segment.tokens[0] === "rm" ? index : -1)
+		.filter((index) => index >= 0);
+	if (rmIndexes.length === 0) return { exempt: false, reason: "未识别到 rm 删除段" };
+	const lastRmIndex = rmIndexes[rmIndexes.length - 1]!;
+	const operands: string[] = [];
+
+	for (const [index, segment] of segments.entries()) {
+		const commandWord = segment.tokens[0];
+		if (commandWord === "rm") {
+			if (segment.redirectTargets.length > 0) return { exempt: false, reason: "rm 带重定向，无法确认所有写入目标" };
+			const parsed = positionalOperands("rm", segment.tokens.slice(1), RM_SHORT_FLAGS, RM_LONG_FLAGS);
+			if (!parsed.ok || parsed.operands.length === 0) return { exempt: false, reason: parsed.ok ? "rm 未给出目标路径" : parsed.reason };
+			operands.push(...parsed.operands);
+			continue;
+		}
+		// A cd before any later rm changes relative-path meaning, so do not infer it.
+		if (commandWord === "cd" && index < lastRmIndex) return { exempt: false, reason: "rm 前存在 cd，无法确认相对路径" };
+		if (index <= lastRmIndex || !isReadOnlyTailSegment(segment)) {
+			return { exempt: false, reason: `rm 删除链包含无法确认的命令段：${commandWord ?? "(empty)"}` };
+		}
+	}
+
+	for (const operand of operands) {
+		const absolute = resolveOperandPath(input.cwd, operand);
+		if (!absolute) return { exempt: false, reason: `删除目标格式无效：${operand}` };
+		const terminalGlob = hasTerminalGlob(operand);
+		// Any glob not confined to the final component is unsafe: it could traverse
+		// a symlink selected by an earlier wildcard component.
+		if (/[?*[]/.test(operand) && !terminalGlob) return { exempt: false, reason: `glob 必须位于最后一个路径段：${operand}` };
+		const candidate = terminalGlob ? globParent(absolute) : absolute;
+		if (!candidate) return { exempt: false, reason: `glob 目标格式无效：${operand}` };
+		const canonical = input.canonicalize(candidate);
+		if (!canonical) return { exempt: false, reason: `无法安全规范化删除目标：${operand}` };
+		const sensitive = input.sensitiveDirs ?? [];
+		const sensitiveHit = sensitive.some((root) => isPathCoveredBy(absolute, root) || isPathCoveredBy(canonical, root));
+		const inProject = input.projectRoot !== undefined && isPathCoveredBy(canonical, input.projectRoot);
+		if (sensitiveHit && !inProject) return { exempt: false, reason: `删除目标命中受保护路径：${canonical}` };
+		if (!input.roots.some((root) => isPathWithinExplicitRoot(root, canonical, terminalGlob))) {
+			return { exempt: false, reason: `删除目标越出 rmExemptRoots：${canonical}` };
+		}
+	}
+	return { exempt: true, targets: operands };
 }
 
 export interface ScopeAnalysisInput {
