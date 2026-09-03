@@ -1,21 +1,25 @@
 # agent-team 自动化 harness
 
 独立的 Node 测试（仓库无现有测试框架），加载真实的扩展源码验证数据流与展示层语义，
-全程不调用任何真实模型。两个入口：
+全程不调用任何真实模型。三个入口：
 
 - `run.mjs`：数据流 harness——加载 `../index.ts`，注册并调用 `subagent` 工具，用临时
   fake `pi` 可执行文件驱动子代理进程（确定性 JSONL 事件）。
 - `presentation.mjs`：展示层 harness——加载 `fleet-view.ts` / `fleet-web.ts`，验证
   FleetStore、FleetWidget、Web payload 序列化与 FleetWebServer HTTP。
+- `overrides.mjs`：角色发现 harness——加载 `../agents.ts`，验证 `agents.override.json`
+  对 Markdown frontmatter 的字段级覆盖（model/tools/thinking）与清除/忽略语义。
 
 对应 README 的"核心原则：数据与展示分离"：`run.mjs` 守护数据流产物（`content` /
-`details` / `{previous}`），`presentation.mjs` 守护展示层作为只读消费者时的行为。
+`details` / `{previous}`），`presentation.mjs` 守护展示层作为只读消费者时的行为；
+`overrides.mjs` 守护角色配置的覆盖优先级。
 
 ## 运行
 
 ```bash
 node agent/extensions/agent-team/harness/run.mjs
 node agent/extensions/agent-team/harness/presentation.mjs
+node agent/extensions/agent-team/harness/overrides.mjs
 ```
 
 要求：
@@ -84,6 +88,23 @@ node agent/extensions/agent-team/harness/presentation.mjs
    token 鉴权（错误 token 404）、data 端点 JSON 与 revision 递增（变化 +1、不变保持）、
    no-store 头、HTML 页面、SSE `event: update` 推送（含 store 变更广播）、close 后
    端口拒绝。
+
+## overrides.mjs（角色发现覆盖）
+
+1. 在临时项目 `.pi/agents/` 生成 `worker.md`（frontmatter 含 `model`/`tools`/
+   `thinking`）和 `agents.override.json`，用 jiti 加载 `../agents.ts` 的
+   `discoverAgents` 后断言；`both` 场景通过 `PI_CODING_AGENT_DIR` 指向临时用户目录
+   隔离用户级角色。
+2. **覆盖**：JSON 显式字段替换 frontmatter（model/tools/thinking），description 与
+   正文（systemPrompt）保留；JSON 中无对应 Markdown 角色的键被忽略；键名去除首尾
+   空格后匹配。
+3. **清除**：`""` / `[]` 清空 frontmatter 值，回退默认。
+4. **类型**：`tools` 支持逗号分隔字符串或数组；不合法类型（含数组含非字符串元素）
+   忽略并保留 Markdown 值。
+5. **容错**：无法解析的 JSON、数组根节点、缺失 override 文件均静默忽略，行为等同
+   未覆盖。
+6. **作用域**：`both` 下项目级角色（含项目 override）整体覆盖同名用户级角色（含
+   用户 override），用户 override 不泄漏到项目角色。
 
 ## 真实 Pi 冒烟清单（剩余手测项）
 

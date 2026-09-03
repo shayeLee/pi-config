@@ -46,6 +46,30 @@ model: provider/model
 
 Markdown 正文是该角色的系统提示词。
 
+### JSON 覆盖（agents.override.json）
+
+角色目录下可放置同名的 `agents.override.json`，按角色名对 Markdown frontmatter 做字段级覆盖：
+
+```json
+{
+  "worker": {
+    "model": "provider/model",
+    "thinking": "high",
+    "tools": ["read", "bash", "edit", "write"]
+  }
+}
+```
+
+覆盖规则：
+
+- 只覆盖 JSON 里显式出现的字段；未出现的字段沿用 Markdown frontmatter 的值。
+- `tools` 可以是逗号分隔字符串或字符串数组，替换（而非合并）Markdown 里的工具列表。
+- 传空值表示清除 Markdown 值、回退到子进程默认：`"model": ""`、`"thinking": ""`、`"tools": []`（清除后不再传 `--tools`）。
+- 字段类型不合法（如 `"model": 123`，或 `tools` 数组含非字符串元素）时忽略该字段，保留 Markdown 值。
+- 角色键名会去除首尾空格后再匹配。
+- 无法解析的 JSON、非对象根节点静默忽略；JSON 里没有对应 Markdown 角色的键也会被忽略。
+- 覆盖只作用于同目录：用户级 `agents.override.json` 只覆盖用户级角色，项目级只覆盖项目级角色；`both` 作用域下仍由项目级角色整体覆盖同名用户级角色。
+
 `agentScope` 决定发现范围：
 
 - `both`：默认值。同时读取用户级角色和当前工作目录向上最近的 `.pi/agents`；同名角色由项目级配置覆盖用户级配置。
@@ -245,7 +269,7 @@ FleetView、对话浮层和运行注册表只消费现有的 JSON 事件与 `Sin
 
 ## 自动化测试
 
-`harness/` 下的两个独立 Node harness（全程不调用真实模型）守护核心原则的两层：
+`harness/` 下的独立 Node harness（全程不调用真实模型）守护核心原则的两层，外加角色发现的覆盖规则：
 
 - `harness/run.mjs`（数据流）：加载真实 `index.ts`，用临时 fake `pi` 可执行文件驱动子代理，
   断言数据流产物语义——`tool_result_end` 兼容与去重、transient 事件隔离、chain `{previous}`
@@ -261,6 +285,7 @@ FleetView、对话浮层和运行注册表只消费现有的 JSON 事件与 `Sin
 ```bash
 node agent/extensions/agent-team/harness/run.mjs
 node agent/extensions/agent-team/harness/presentation.mjs
+node agent/extensions/agent-team/harness/overrides.mjs
 ```
 
 ## 真实 Pi 冒烟清单（剩余手测项）
