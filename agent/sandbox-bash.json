@@ -1,4 +1,0 @@
-{
-  "enabled": true,
-  "denyRead": ["~/.ssh", "~/.aws", "~/.gnupg", "~/Documents"]
-}
