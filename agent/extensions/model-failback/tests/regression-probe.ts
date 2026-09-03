@@ -232,6 +232,41 @@ async function runRegressionTests(): Promise<TestResult[]> {
     expect(verdict.scope === "cross-provider", `unexpected scope: ${verdict.scope}`);
   }));
 
+  results.push(await runTest("opencode-go 503 endpoint unavailable is detected", () => {
+    const verdict = opencodeGoHandler.inspect(
+      assistantFailure(
+        "opencode-go",
+        "deepseek-v4-flash",
+        'Error: 503: {"type":"server_error","message":"Error from provider (Console Go): Upstream request failed: Endpoint is unavailable."}',
+      ),
+    );
+    expect(verdict, "opencode-go 503 endpoint error was not detected");
+    expect(verdict.reason === "endpoint_unavailable", `unexpected reason: ${verdict.reason}`);
+    expect(verdict.scope === "cross-provider", `unexpected scope: ${verdict.scope}`);
+  }));
+
+  results.push(await runTest("opencode endpoint 503 remains non-terminal", () => {
+    const verdict = opencodeHandler.inspect(
+      assistantFailure(
+        "opencode",
+        "gpt-5.6-sol",
+        '503: {"type":"server_error","message":"Endpoint is unavailable"}',
+      ),
+    );
+    expect(verdict === null, "opencode endpoint error should remain non-terminal");
+  }));
+
+  results.push(await runTest("opencode-go ModelError remains non-terminal", () => {
+    const verdict = opencodeGoHandler.inspect(
+      assistantFailure(
+        "opencode-go",
+        "gpt-5.6-sol",
+        'ModelError: 503: {"type":"server_error","message":"Endpoint is unavailable"}',
+      ),
+    );
+    expect(verdict === null, "opencode-go ModelError should remain non-terminal");
+  }));
+
   results.push(await runTest("ModelError does not match CreditsError", () => {
     const verdict = opencodeHandler.inspect(
       assistantFailure(
@@ -624,6 +659,29 @@ async function runRegressionTests(): Promise<TestResult[]> {
     expect(called[1].provider === "rightcode-codex", "second hop should be rightcode-codex");
     expect(harness.pi.userMessages.length === 2, "expected 2 steering messages");
     expect(harness.state.chain.length === 3, `expected chain length 3, got ${harness.state.chain.length}`);
+  }));
+
+  results.push(await runTest("engine fails back after opencode-go 503", async () => {
+    const harness = engineHarness(
+      {
+        fallbacks: { "opencode-go/deepseek-v4-flash": "rightcode-codex/gpt-5.6-luna" },
+      },
+      CHAIN_MODELS,
+      { provider: "opencode-go", id: "deepseek-v4-flash" },
+    );
+    await harness.emit(
+      assistantFailure(
+        "opencode-go",
+        "deepseek-v4-flash",
+        'Error: 503: {"type":"server_error","message":"Error from provider (Console Go): Upstream request failed: Endpoint is unavailable."}',
+      ),
+    );
+
+    const called = harness.pi.setModelCalls as Array<{ provider: string; id: string }>;
+    expect(called.length === 1, "503 failure did not trigger failback");
+    expect(called[0].provider === "rightcode-codex", "503 failure selected wrong fallback");
+    expect(harness.pi.entries.some((entry) => entry.type === "model-failback-ban"), "503 failure was not banned");
+    expect(harness.pi.userMessages.length === 1, "503 failure did not send steering");
   }));
 
   results.push(await runTest("engine skips a previously banned chain node", async () => {

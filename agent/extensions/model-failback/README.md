@@ -40,7 +40,7 @@ message_end(assistant, error)
 
 ## 工作原理(opencode)
 
-`opencode` 与 `opencode-go` 当前都仅覆盖账户余额耗尽终态:assistant 消息必须是 `stopReason === "error"`，且 `errorMessage` 命中 JSON body 的 `type=CreditsError`，或包含 `Insufficient balance` / `insufficient credits`。两者共享同一份 `CreditsError` 判定实现，但作为不同 provider 拥有独立的额度与映射；判定结果为 `reason: "credits_exhausted"`、`scope: "cross-provider"`，因此只会跨 provider 切换。
+`opencode` 仅覆盖账户余额耗尽终态；`opencode-go` 除此之外还覆盖 Console Go 返回的 `503` + `Endpoint is unavailable` 端点故障。assistant 消息必须是 `stopReason === "error"`，且 `errorMessage` 命中对应错误形态。两者作为不同 provider 拥有独立的额度与映射；判定结果分别为 `credits_exhausted` 或 `endpoint_unavailable`，均为 `scope: "cross-provider"`，因此只会跨 provider 切换。
 
 `ModelError` 属于模型/端点错误，不会触发；无 API key 属于初始化阶段错误，发生在扩展能收到 `message_end` 之前，扩展没有机会覆盖，同样不会触发。
 
@@ -171,7 +171,7 @@ export const myProviderHandler: ProviderFailbackHandler = {
 - 四个 provider 的终态判定、provider 隔离和无关错误过滤
 - Codex 流式原文 `Codex error: The usage limit has been reached`
 - compaction summarization 期间的 Codex 额度终态，以及切换后重新压缩上下文
-- OpenCode `CreditsError / Insufficient balance`
+- OpenCode `CreditsError / Insufficient balance` 与 OpenCode Go `503 / Endpoint is unavailable`
 - ModelScope `insufficient_quota` 与 `429 {"message":"insufficient balance"}`
 - ModelScope Qwen 的 `insufficient balance` 真实 lite subagent 接续
 - 两层 failback、链内已 ban 节点跳过、环检测、连跳上限和 cross-provider 守卫
@@ -182,7 +182,7 @@ export const myProviderHandler: ProviderFailbackHandler = {
   - `opencode/gpt-5.6-sol` → `rightcode-codex/gpt-5.6-sol`
   - `modelscope/deepseek-ai/DeepSeek-V4-Flash-0731` → `openai-codex/gpt-5.6-luna`
   - `openai-codex/gpt-5.6-terra` → `rightcode-codex/gpt-5.6-terra`
-- 离线回归测试 `24/24` 通过
+- 离线回归测试全部通过
 
 ## 待观察
 
