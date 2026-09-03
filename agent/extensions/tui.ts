@@ -1,5 +1,4 @@
 import { isAbsolute, relative, resolve, sep } from "node:path";
-import type { AssistantMessage } from "@earendil-works/pi-ai";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 
@@ -9,6 +8,31 @@ function formatTokens(count: number): string {
 	if (count < 1_000_000) return `${Math.round(count / 1000)}k`;
 	if (count < 10_000_000) return `${(count / 1_000_000).toFixed(1)}M`;
 	return `${Math.round(count / 1_000_000)}M`;
+}
+
+interface FooterUsage {
+	input: number;
+	output: number;
+	cacheRead: number;
+	cacheWrite: number;
+	cost: number;
+}
+
+function numberOrZero(value: unknown): number {
+	return typeof value === "number" && Number.isFinite(value) ? value : 0;
+}
+
+function readFooterUsage(value: unknown): FooterUsage | undefined {
+	if (!value || typeof value !== "object") return undefined;
+	const usage = value as Record<string, unknown>;
+	const cost = usage.cost && typeof usage.cost === "object" ? (usage.cost as Record<string, unknown>) : undefined;
+	return {
+		input: numberOrZero(usage.input),
+		output: numberOrZero(usage.output),
+		cacheRead: numberOrZero(usage.cacheRead),
+		cacheWrite: numberOrZero(usage.cacheWrite),
+		cost: numberOrZero(cost?.total),
+	};
 }
 
 function formatCwd(cwd: string): string {
@@ -151,31 +175,46 @@ export default function (pi: ExtensionAPI) {
 						cost: 0,
 					};
 					let latestCacheHitRate: number | undefined;
+					let cachePromptTokens = 0;
+					let cacheReadTokens = 0;
+					let cacheWriteTokens = 0;
 
-					for (const entry of ctx.sessionManager.getEntries() as any[]) {
-						if (entry.type === "message" && entry.message.role === "assistant") {
-							const usage = (entry.message as AssistantMessage).usage;
+					for (const entry of ctx.sessionManager.getBranch()) {
+						if (entry.type === "message") {
+							const message = entry.message;
+							if (!message || typeof message !== "object") continue;
+							const usage = readFooterUsage("usage" in message ? message.usage : undefined);
+							if (!usage) continue;
+
+							if (message.role === "assistant") {
+								totals.input += usage.input;
+								totals.output += usage.output;
+								totals.cacheRead += usage.cacheRead;
+								totals.cacheWrite += usage.cacheWrite;
+								totals.cost += usage.cost;
+								const promptTokens = usage.input + usage.cacheRead + usage.cacheWrite;
+								latestCacheHitRate = promptTokens > 0 ? (usage.cacheRead / promptTokens) * 100 : undefined;
+								cachePromptTokens += promptTokens;
+								cacheReadTokens += usage.cacheRead;
+								cacheWriteTokens += usage.cacheWrite;
+							} else if (message.role === "toolResult") {
+								totals.input += usage.input;
+								totals.output += usage.output;
+								totals.cacheRead += usage.cacheRead;
+								totals.cacheWrite += usage.cacheWrite;
+								totals.cost += usage.cost;
+							}
+						} else if (entry.type === "branch_summary" || entry.type === "compaction") {
+							const usage = readFooterUsage(entry.usage);
+							if (!usage) continue;
 							totals.input += usage.input;
 							totals.output += usage.output;
 							totals.cacheRead += usage.cacheRead;
 							totals.cacheWrite += usage.cacheWrite;
-							totals.cost += usage.cost.total;
-							const promptTokens = usage.input + usage.cacheRead + usage.cacheWrite;
-							latestCacheHitRate = promptTokens > 0 ? (usage.cacheRead / promptTokens) * 100 : undefined;
-						} else if (entry.type === "message" && entry.message.role === "toolResult" && entry.message.usage) {
-							const usage = entry.message.usage;
-							totals.input += usage.input ?? 0;
-							totals.output += usage.output ?? 0;
-							totals.cacheRead += usage.cacheRead ?? 0;
-							totals.cacheWrite += usage.cacheWrite ?? 0;
-							totals.cost += usage.cost?.total ?? 0;
-						} else if ((entry.type === "branch_summary" || entry.type === "compaction") && entry.usage) {
-							const usage = entry.usage;
-							totals.input += usage.input ?? 0;
-							totals.output += usage.output ?? 0;
-							totals.cacheRead += usage.cacheRead ?? 0;
-							totals.cacheWrite += usage.cacheWrite ?? 0;
-							totals.cost += usage.cost?.total ?? 0;
+							totals.cost += usage.cost;
+							cachePromptTokens += usage.input + usage.cacheRead + usage.cacheWrite;
+							cacheReadTokens += usage.cacheRead;
+							cacheWriteTokens += usage.cacheWrite;
 						}
 					}
 
@@ -197,8 +236,11 @@ export default function (pi: ExtensionAPI) {
 					if (totals.cacheWrite) stats.push(`W${formatTokens(totals.cacheWrite)}`);
 					const totalTokens = totals.input + totals.output + totals.cacheRead + totals.cacheWrite;
 					if (totalTokens) stats.push(`Σ${formatTokens(totalTokens)}`);
+					const cumulativeCacheHitRate = cachePromptTokens > 0 ? (cacheReadTokens / cachePromptTokens) * 100 : undefined;
 					if ((totals.cacheRead > 0 || totals.cacheWrite > 0) && latestCacheHitRate !== undefined)
 						stats.push(`CH${latestCacheHitRate.toFixed(1)}%`);
+					if ((cacheReadTokens > 0 || cacheWriteTokens > 0) && cumulativeCacheHitRate !== undefined)
+						stats.push(`ΣCH${cumulativeCacheHitRate.toFixed(1)}%`);
 					if (totals.cost || model?.provider === "kimi-coding")
 						stats.push(`$${totals.cost.toFixed(3)}${model?.provider === "kimi-coding" ? " (sub)" : ""}`);
 					stats.push(theme.fg(contextColor, contextDisplay));
