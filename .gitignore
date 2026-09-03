@@ -7,6 +7,9 @@ agent/trust.json
 agent/model-failback.json
 agent/model-failback-bans-*.json
 agent/model-failback-bans-*.json.*
+agent/models.json
+agent/path-scope.json
+agent/sandbox-bash.json
 
 agent/bin
 agent/sessions
