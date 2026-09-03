@@ -1,5 +1,0 @@
-{
-  "worker": {
-    "model": "opencode-go/deepseek-v4-flash"
-  }
-}

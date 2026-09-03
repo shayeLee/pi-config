@@ -11,6 +11,7 @@ agent/models.json
 agent/path-scope.json
 agent/sandbox-bash.json
 agent/agents/agents.override.json
+agent/profiles/project/agents/agents.override.json
 
 agent/bin
 agent/sessions
