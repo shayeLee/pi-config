@@ -14,12 +14,24 @@
  *
  * Authorized write roots = cwd + path-scope extraRoots + /tmp + /private/tmp
  * + os.tmpdir(), MINUS the pi agent dir and its parent (~/.pi), which hold
- * credentials/config (auth.json, settings.json, this extension's own code).
- * Reads are deliberately NOT restricted (the model can already read files via
- * the `read` tool; the highest-impact surface is write), except the denyRead
- * denylist. Network is also NOT restricted: the earlier `sandbox` extension
- * (sandbox-runtime) failed on macOS because its proxy-based network allowlist
- * broke DNS/direct connections.
+ * credentials/config (auth.json, settings.json, this extension's own code). The
+ * exclusion is enforced twice: roots reaching a sensitive dir are dropped after
+ * comparing their raw, `..`-preserving and realpath forms, and the profile also
+ * denies the sensitive dirs *after* every allow clause, so a broad root (`~`)
+ * cannot be written through. When cwd itself lives under a sensitive dir (pi
+ * was started inside it, so the project must stay writable), the sensitive dirs
+ * are classified instead: dirs inside the cwd subtree stay writable, dirs
+ * strictly containing the cwd get no deny but every root covering them is
+ * dropped, and disjoint dirs are denied as usual — so credentials outside the
+ * cwd are never relaxed just to keep the project writable.
+ * extraRoots are read from the USER-level ~/.pi/agent/path-scope.json only: a
+ * checked-in project must not be able to widen the kernel write boundary.
+ * Relative root entries are anchored to the session cwd. Reads are deliberately
+ * NOT restricted (the model can already read files via the `read` tool; the
+ * highest-impact surface is write), except the denyRead denylist. Network is
+ * also NOT restricted: the earlier `sandbox` extension (sandbox-runtime) failed
+ * on macOS because its proxy-based network allowlist broke DNS/direct
+ * connections.
  *
  * Config (user-level): ~/.pi/agent/sandbox-bash.json
  *   {
@@ -27,7 +39,7 @@
  *     "allowWrite": ["~/Downloads"],
  *     "denyRead": ["~/.ssh", "~/.aws", "~/.gnupg"]
  *   }
- *   - allowWrite: extra write-authorized roots, absolute or `~`
+ *   - allowWrite: extra write-authorized roots, absolute, `~` or cwd-relative
  *   - denyRead:   sensitive paths denied for reads (data + metadata)
  *
  * On platforms without /usr/bin/sandbox-exec, this extension does nothing
@@ -45,7 +57,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import {
 	buildProfile,
-	normalizeConfigPath,
+	filterSensitiveRoots,
 	validateSandboxBashConfig,
 	type SandboxBashConfig,
 } from "./core";
@@ -89,7 +101,7 @@ function readPathScopeRoots(): string[] {
 	try {
 		const parsed = JSON.parse(readFileSync(configPath, "utf8")) as Record<string, unknown>;
 		const roots = parsed.extraRoots;
-		if (Array.isArray(roots) && roots.every((r) => typeof r === "string" && r.trim())) {
+		if (Array.isArray(roots) && roots.every((r) => typeof r === "string" && r.trim() && !r.includes("\0"))) {
 			return roots as string[];
 		}
 	} catch {
@@ -99,25 +111,29 @@ function readPathScopeRoots(): string[] {
 }
 
 /**
- * True when a candidate root is the pi agent dir (~/.pi/agent) or its parent
- * (~/.pi) or a subpath of either. These hold credentials/config (auth.json,
- * settings.json, extension code) and must never become sandbox write roots.
+ * The pi agent dir (~/.pi/agent) and its parent (~/.pi) hold credentials/config
+ * (auth.json, settings.json, this extension's own code) and must never become
+ * sandbox write roots. Comparison against symlinks and `..` detours happens in
+ * core.filterSensitiveRoots, which checks the raw *and* the realpath form.
  */
-function isSensitiveRoot(value: string): boolean {
-	const agentDir = normalizeConfigPath(getAgentDir());
-	const parentDir = dirname(agentDir);
-	const abs = normalizeConfigPath(value);
-	return (
-		abs === agentDir ||
-		abs === parentDir ||
-		abs.startsWith(agentDir + "/") ||
-		abs.startsWith(parentDir + "/")
-	);
+function sensitiveDirs(): string[] {
+	const agentDir = getAgentDir();
+	return [agentDir, dirname(agentDir)];
 }
 
 /** Authorized write roots = path-scope roots + allowWrite, minus sensitive paths. */
-function authorizedRoots(cfg: LoadedConfig): string[] {
-	return [...cfg.pathScopeRoots, ...(cfg.config.allowWrite ?? [])].filter((r) => !isSensitiveRoot(r));
+function authorizedRoots(
+	cfg: LoadedConfig,
+	cwd: string,
+	onDropped: (entry: string) => void,
+): string[] {
+	const candidates = [...cfg.pathScopeRoots, ...(cfg.config.allowWrite ?? [])];
+	const sensitive = sensitiveDirs();
+	const kept = filterSensitiveRoots(candidates, sensitive, cwd);
+	for (const entry of candidates) {
+		if (!kept.includes(entry)) onDropped(entry);
+	}
+	return kept;
 }
 
 const SUPPORTED = process.platform === "darwin" && existsSync("/usr/bin/sandbox-exec");
@@ -195,6 +211,13 @@ export default function (pi: ExtensionAPI) {
 		}
 	};
 
+	const note = (ctx: UI, message: string) => {
+		if (!warned.has(message)) {
+			warned.add(message);
+			ctx.ui.notify(`sandbox-bash: ${message}`, "info");
+		}
+	};
+
 	const getConfig = (ctx: UI): LoadedConfig => {
 		if (loaded) return loaded;
 		const configPath = join(getAgentDir(), "sandbox-bash.json");
@@ -220,6 +243,17 @@ export default function (pi: ExtensionAPI) {
 
 	const toolTemplate = createBashToolDefinition(".");
 
+	/** One profile per call: the tool path and the `!` path must never diverge. */
+	const profileFor = (ctx: UI): string => {
+		const cfg = getConfig(ctx);
+		return buildProfile(
+			ctx.cwd,
+			authorizedRoots(cfg, ctx.cwd, (entry) => note(ctx, `已从写授权根中排除 pi 配置/凭据目录（设计如此）：${entry}`)),
+			cfg.config.denyRead ?? [],
+			sensitiveDirs(),
+		);
+	};
+
 	pi.registerTool({
 		...toolTemplate,
 		label: "bash (sandboxed)",
@@ -229,7 +263,7 @@ export default function (pi: ExtensionAPI) {
 			if (!currentEnabled) {
 				return createBashToolDefinition(ctx.cwd).execute(id, params, signal, onUpdate, ctx);
 			}
-			const profile = buildProfile(ctx.cwd, authorizedRoots(cfg), cfg.config.denyRead ?? []);
+			const profile = profileFor(ctx);
 			const bash = createBashToolDefinition(ctx.cwd, {
 				operations: createSandboxedBashOps(profile),
 			});
@@ -241,7 +275,7 @@ export default function (pi: ExtensionAPI) {
 		const cfg = getConfig(ctx);
 		const currentEnabled = cfg.config.enabled ?? true;
 		if (!currentEnabled) return undefined;
-		const profile = buildProfile(ctx.cwd, authorizedRoots(cfg), cfg.config.denyRead ?? []);
+		const profile = profileFor(ctx);
 		return { operations: createSandboxedBashOps(profile) };
 	});
 }

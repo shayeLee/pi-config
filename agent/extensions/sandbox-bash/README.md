@@ -18,12 +18,13 @@
 
 ## 行为
 
-写授权根 = **cwd（项目目录） + `path-scope.json` 的 `extraRoots` + `/tmp` + `/private/tmp` + `os.tmpdir()`**，再**减去 `~/.pi` 及其子目录**（凭据/配置目录，永不授权）。每个根同时列「原始路径 + realpath」双变体，以兼容目录符号链接（如 `/var`→`/private/var`）。
+写授权根 = **cwd（项目目录） + `path-scope.json` 的 `extraRoots` + `/tmp` + `/private/tmp` + `os.tmpdir()`**，再**减去 `~/.pi` 及其子目录**（凭据/配置目录，永不授权）。每个根同时列「原始路径 + realpath」双变体，以兼容目录符号链接（如 `/var`→`/private/var`）。根与 `denyRead` 条目中的**相对路径都按会话 cwd 解析**（不是按 pi 启动目录），且比对敏感目录时会考察原始、`..` 保留、realpath 三种形式。
 
 | 操作 | 结果 |
 |------|------|
 | 写授权根内 | 放行 |
 | 写授权根外任何路径 | **内核拒绝** |
+| 写 `~/.pi`、`~/.pi/agent`（含通过符号链接、`..` 绕行、或被 `~` 这样的宽根包含） | **内核拒绝** |
 | 写 `/dev/null`、`/dev/zero` | 放行（`file-write*`，覆盖 `>`、`>>`、`touch` 等变体，git 等工具依赖） |
 | 读 / 执行 / 网络 | **完全放行** |
 | 读 `denyRead` 配置的路径 | **内核拒绝**（data + metadata） |
@@ -45,7 +46,7 @@
 ```json
 {
   "enabled": true,
-  "allowWrite": ["~/Downloads"],
+  "allowWrite": ["~/Downloads", "./build"],
   "denyRead": ["~/.ssh", "~/.aws", "~/.gnupg"]
 }
 ```
@@ -53,10 +54,14 @@
 | 字段 | 类型 | 默认 | 说明 |
 |------|------|------|------|
 | `enabled` | boolean | `true` | `false` 完全禁用（回到普通 bash） |
-| `allowWrite` | string[] | `[]` | 额外写授权根，绝对/`~` 路径。cwd、`/tmp`、`/private/tmp`、`os.tmpdir()` 恒定包含 |
-| `denyRead` | string[] | `[]` | 禁止读的敏感路径（data + metadata），绝对/`~` 路径。读默认全放行，仅这些路径被内核拒绝 |
+| `allowWrite` | string[] | `[]` | 额外写授权根，绝对/`~`/相对（按会话 cwd 解析）路径。cwd、`/tmp`、`/private/tmp`、`os.tmpdir()` 恒定包含 |
+| `denyRead` | string[] | `[]` | 禁止读的敏感路径（data + metadata），绝对/`~`/相对（按会话 cwd 解析）路径。读默认全放行，仅这些路径被内核拒绝。路径无法规范化（断链/不可读）时不静默取消：退而拒绝其字面锚定形式（fail-closed） |
 
-写授权根的来源：**cwd + `/tmp` + `/private/tmp` + `os.tmpdir()` 恒定**，再叠加 `path-scope.json` 的 `extraRoots` 和本配置的 `allowWrite`，但**自动过滤掉 `~/.pi`（含 `~/.pi/agent`）及其子路径**——这些目录存有 `auth.json`、`settings.json`、扩展自身代码，绝不能成为 bash 写授权根。改任一配置后 `/reload` 重读。
+写授权根的来源：**cwd + `/tmp` + `/private/tmp` + `os.tmpdir()` 恒定**，再叠加 `~/.pi/agent/path-scope.json` 的 `extraRoots` 和本配置的 `allowWrite`，但**自动过滤掉 `~/.pi`（含 `~/.pi/agent`）及其子路径**——这些目录存有 `auth.json`、`settings.json`、扩展自身代码，绝不能成为 bash 写授权根。被排除时会推一条 `info` 提醒（不是错误：例如 `extraRoots` 里写了 `~/.pi` 就是这个结果）。改任一配置后 `/reload` 重读。
+
+> `extraRoots` **只读用户级** `~/.pi/agent/path-scope.json`，不读项目级 `.pi/path-scope.json`：一个仓库不应能自行拓宽内核写授权面。`path-scope`（文件工具弹窗）则会在项目受信任时叠加项目级配置——这是有意的不对称：前者只决定“问不问”，后者决定“能不能写”。
+
+除过滤根列表外，profile 会在**所有 allow 子句之后**再为与项目无关的敏感目录补上 `(deny file-write* (subpath …))`，因此一个包含敏感目录的宽根（如 `~` 或 `/`）也不能写入 `~/.pi`。当 cwd 本身就在敏感目录下（例如就在 `~/.pi` 里跑 pi）时，敏感目录按位置分类而不是整体免 deny：cwd 子树内（含 cwd 本身）属于项目、保持可写；**严格包含 cwd** 的敏感目录不能 deny（会连项目一起拒），改为**丢弃所有覆盖它的宽根**（如 `~`、`/`），于是 cwd 子树之外的凭据（如 `agent/auth.json` 相对 cwd 在 `agent/sessions` 下时）依然够不到；与项目不相交的照常 deny。这与 bash-guard 的 cwd 优先豁免保持一致。
 
 ## 环境要求
 
@@ -70,10 +75,13 @@ cd ~/.pi/agent/extensions/sandbox-bash
 volta run node --test core.test.ts
 ```
 
-纯函数测试（schema、path 转义/规范化、profile 生成、双变体）任何时候可跑；6 个 `sandbox-exec` 集成测试在非 macOS 自动跳过，覆盖「cwd 内可写 / `/dev/null` 可写（`>` 与 `>>`/`touch`）/ cwd 外写被拒 / 读任意路径放行 / denyRead 被拒」。
+纯函数测试（schema、path 转义/规范化、敏感根过滤（含真实符号链接与 `..` 绕行）、profile 生成、双变体）任何时候可跑；`sandbox-exec` 集成测试覆盖「cwd 内可写 / extraRoots 可写 / 相对根按 cwd 锚定 / `/dev/null` 可写（`>` 与 `>>`/`touch`）/ cwd 外写被拒 / 宽根下的敏感子目录仍被拒 / 读任意路径放行 / denyRead 被拒」。
+
+集成测试在非 macOS **或已处于沙箱内**时自动跳过：嵌套 `sandbox_apply` 会被内核拒绝（`Operation not permitted`），例如在本扩展已生效的 pi 会话里跑测试——此时跳过信息会写明原因，应到普通终端里跑完整集成测试。
 
 ## 已知局限
 
 1. **写隔离 + 读黑名单（denyRead）**，读默认放行、网络不碰。这是刻意的取舍，见「设计取舍」。
 2. **目录符号链接（如 `/var`→`/private/var`）不解析**，故每个根同时列 raw + realpath 双变体；**文件符号链接会被解析**（写指向授权根外的符号链接被内核拒绝，已实测）。
-3. **这是护栏，不是完整安全边界**：不可信/对抗性代码请用容器或 VM。
+3. **含 `..` 的根按内核语义解析**（`realpath(3)`，仅用 `realpathSync.native`；JS 实现会词法折叠，不可用/失败时 fail-closed，不做 JS 回退）：`a/link/../b` 不会在比对敏感目录前被词法折叠，以免“看似安全”的路径实际落在凭据目录。路径尚不存在时，解析**最近一个存在的祖先**再拼回缺失后缀（与 path-scope、bash-guard 同一契约）——纯词法回退会让 `link/newsub`（`link` → 敏感目录）在过滤时看似无害、写入时却落进敏感目录。祖先存在但不可解析（断链/不可读）则 fail-closed（该根被丢弃，即使它与敏感目录无关）。
+4. **这是护栏，不是完整安全边界**：不可信/对抗性代码请用容器或 VM。

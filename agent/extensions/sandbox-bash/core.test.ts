@@ -11,7 +11,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert";
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -19,6 +19,7 @@ import {
 	buildProfile,
 	canonicalPath,
 	escapeProfilePath,
+	filterSensitiveRoots,
 	normalizeConfigPath,
 	validateSandboxBashConfig,
 } from "./core.ts";
@@ -92,6 +93,174 @@ describe("absolutePath", () => {
 		assert.ok(!raw.startsWith("~"));
 		assert.ok(raw.endsWith("/foo"));
 	});
+	it("anchors relative entries to the provided base, not process.cwd()", () => {
+		assert.equal(absolutePath("./extra", "/srv/proj"), "/srv/proj/extra");
+		assert.equal(absolutePath("../sibling", "/srv/proj"), "/srv/sibling");
+	});
+});
+
+describe("filterSensitiveRoots", () => {
+	it("drops exact, nested, `..`-detour and symlinked paths into a sensitive dir", () => {
+		const base = mkdtempSync(join(tmpdir(), "sb-filter-"));
+		try {
+			const secret = join(base, "secret");
+			mkdirSync(secret);
+			const link = join(base, "link");
+			symlinkSync(secret, link);
+			const allowed = join(base, "allowed");
+
+			assert.deepEqual(filterSensitiveRoots([secret], [secret], base), []);
+			assert.deepEqual(filterSensitiveRoots([join(secret, "auth.json")], [secret], base), []);
+			assert.deepEqual(filterSensitiveRoots([join(base, "other/../secret")], [secret], base), []);
+			// a symlink that points at the sensitive dir must not smuggle it in
+			assert.deepEqual(filterSensitiveRoots([link], [secret], base), []);
+			// ...and a sensitive dir given as a symlink must still filter its target
+			assert.deepEqual(filterSensitiveRoots([secret], [link], base), []);
+			// unrelated roots survive, including relative ones
+			assert.deepEqual(filterSensitiveRoots([allowed, "./keep"], [secret], base), [allowed, "./keep"]);
+		} finally {
+			rmSync(base, { recursive: true, force: true });
+		}
+	});
+	it("drops a root whose `..` only resolves through a symlink into a sensitive dir", () => {
+		const base = mkdtempSync(join(tmpdir(), "sb-detour-"));
+		const secretParent = mkdtempSync(join(tmpdir(), "sb-secret-"));
+		try {
+			const secret = join(secretParent, "agent");
+			mkdirSync(secret);
+			const link = join(base, "link");
+			symlinkSync(secret, link);
+			// Kernel: link/.. == secretParent, so this is `secret` itself.
+			// Lexical: it collapses to `base/agent`, which would be a different dir.
+			const detour = `${link}/../agent`;
+
+			assert.deepEqual(filterSensitiveRoots([detour], [secret], base), []);
+			const profile = buildProfile(base, [detour], [], [secret]);
+			const allows = [...profile.matchAll(/\(allow file-write\* \(subpath "([^"]+)"\)\)/g)].map((m) => m[1]);
+			assert.ok(!allows.includes(join(base, "agent")), `lexical detour must not become a root: ${allows}`);
+			assert.ok(!allows.includes(secret), `sensitive dir must not become a root: ${allows}`);
+			assert.ok(!allows.includes(canonicalPath(secret) ?? ""), `realpath of the sensitive dir must not be a root: ${allows}`);
+			assert.ok(profile.includes(`(deny file-write* (subpath "${secret}"))`), profile);
+		} finally {
+			rmSync(base, { recursive: true, force: true });
+			rmSync(secretParent, { recursive: true, force: true });
+		}
+	});
+	it("is a no-op when no sensitive dirs are configured", () => {
+		assert.deepEqual(filterSensitiveRoots(["/a", "/b"], [], "/base"), ["/a", "/b"]);
+	});
+	it("drops a root that cannot be canonicalized at all (broken symlink) and keeps legitimate ones", () => {
+		const base = mkdtempSync(join(tmpdir(), "sb-badroot-"));
+		try {
+			const secret = join(base, "secret");
+			mkdirSync(secret);
+			symlinkSync(join(base, "missing"), join(base, "broken"));
+			const good = join(base, "good");
+			mkdirSync(good);
+			const bad = `${base}/broken/newsub`;
+
+			// Fail closed: the unresolvable root is dropped even though it never
+			// touches the sensitive dir; legitimate roots (incl. relative) survive.
+			assert.deepEqual(filterSensitiveRoots([bad, good, "./keep"], [secret], base), [good, "./keep"]);
+
+			const profile = buildProfile(base, [bad, good], [], [secret]);
+			assert.ok(!profile.includes(`(allow file-write* (subpath "${base}/broken`), profile);
+			assert.ok(profile.includes(`(allow file-write* (subpath "${base}")`), profile);
+			assert.ok(profile.includes(`(allow file-write* (subpath "${good}")`), profile);
+		} finally {
+			rmSync(base, { recursive: true, force: true });
+		}
+	});
+	it("drops a sensitive dir smuggled through a symlink with a not-yet-existing suffix", () => {
+		const base = mkdtempSync(join(tmpdir(), "sb-smuggle-"));
+		try {
+			const secret = join(base, "secret");
+			mkdirSync(secret);
+			const link = join(base, "link");
+			symlinkSync(secret, link);
+			// Lexically this looks like an unrelated dir under base; a write
+			// through it would land inside the sensitive dir.
+			assert.deepEqual(filterSensitiveRoots([`${link}/newsub`], [secret], base), []);
+			const profile = buildProfile(base, [`${link}/newsub`], [], [secret]);
+			assert.ok(!profile.includes(`(allow file-write* (subpath "${link}`), profile);
+			assert.ok(!profile.includes(`(allow file-write* (subpath "${secret}"))`), profile);
+			assert.ok(profile.includes(`(deny file-write* (subpath "${secret}"))`), profile);
+		} finally {
+			rmSync(base, { recursive: true, force: true });
+		}
+	});
+});
+
+describe("canonicalPath: kernel path semantics (regressions)", () => {
+	it("resolves `..` against the real parent of a symlinked component, not lexically", () => {
+		const base = mkdtempSync(join(tmpdir(), "sb-kernel-"));
+		const otherParent = mkdtempSync(join(tmpdir(), "sb-kernel-p-"));
+		try {
+			const real = join(otherParent, "real");
+			mkdirSync(real);
+			const link = join(base, "link");
+			symlinkSync(real, link);
+			// Kernel: link/.. === otherParent. A lexically-collapsing resolver
+			// (JS realpath) would report `base/marker` instead. Expected uses the
+			// realpath of otherParent (macOS /var -> /private/var etc.).
+			assert.equal(canonicalPath(`${link}/../marker`, base), join(realpathSync(otherParent), "marker"));
+			assert.notEqual(canonicalPath(`${link}/../marker`, base), join(base, "marker"));
+		} finally {
+			rmSync(base, { recursive: true, force: true });
+			rmSync(otherParent, { recursive: true, force: true });
+		}
+	});
+
+	it("fails closed when fs.realpathSync.native fails (no lexically-collapsing JS fallback)", () => {
+		const base = mkdtempSync(join(tmpdir(), "sb-native-"));
+		try {
+			const real = join(base, "real");
+			mkdirSync(real);
+			const native = realpathSync.native;
+			assert.equal(typeof native, "function");
+			(realpathSync as { native?: unknown }).native = () => {
+				throw Object.assign(new Error("simulated native realpath failure"), { code: "EACCES" });
+			};
+			try {
+				assert.equal(canonicalPath(real, base), undefined);
+				assert.equal(canonicalPath(`${base}/real/newsub`, base), undefined);
+			} finally {
+				(realpathSync as { native?: unknown }).native = native;
+			}
+			assert.equal(canonicalPath(real, base), realpathSync(real));
+		} finally {
+			rmSync(base, { recursive: true, force: true });
+		}
+	});
+});
+
+describe("canonicalPath", () => {
+	it("resolves a symlinked ancestor even when the suffix does not exist yet", () => {
+		const base = mkdtempSync(join(tmpdir(), "sb-canon-"));
+		try {
+			const real = join(base, "real");
+			mkdirSync(real);
+			const link = join(base, "link");
+			symlinkSync(real, link);
+			// A purely lexical fallback would return `${link}/newsub` here; the
+			// resolved form is what the kernel actually hits on write.
+			assert.equal(canonicalPath(`${link}/newsub`, base), join(realpathSync(real), "newsub"));
+			// Plain non-existent paths under real dirs stay themselves (modulo
+			// symlinked ancestors like /var -> /private/var on macOS).
+			assert.equal(canonicalPath(join(base, "real/newsub"), base), join(realpathSync(real), "newsub"));
+		} finally {
+			rmSync(base, { recursive: true, force: true });
+		}
+	});
+	it("fails closed on a broken symlink ancestor", () => {
+		const base = mkdtempSync(join(tmpdir(), "sb-canon-"));
+		try {
+			symlinkSync(join(base, "missing"), join(base, "broken"));
+			assert.equal(canonicalPath(`${base}/broken/x`, base), undefined);
+		} finally {
+			rmSync(base, { recursive: true, force: true });
+		}
+	});
 });
 
 describe("buildProfile", () => {
@@ -126,11 +295,165 @@ describe("buildProfile", () => {
 		const occurrences = profile.split('/cwd"').length - 1;
 		assert.equal(occurrences, 1, "cwd should appear once");
 	});
+	it("denies an unresolvable denyRead path via its anchored literal form instead of dropping it", () => {
+		const base = mkdtempSync(join(tmpdir(), "sb-denybad-"));
+		try {
+			symlinkSync(join(base, "missing"), join(base, "broken"));
+			const profile = buildProfile(base, [], [`${base}/broken/secret`]);
+			assert.ok(profile.includes(`(deny file-read* (subpath "${base}/broken/secret")`), profile);
+
+			// ...while a resolvable denyRead entry still uses its canonical form.
+			const goodProfile = buildProfile(base, [], [`${base}/plain`]);
+			const expected = canonicalPath(`${base}/plain`, base);
+			assert.ok(expected !== undefined);
+			assert.ok(goodProfile.includes(`(deny file-read* (subpath "${expected}")`), goodProfile);
+		} finally {
+			rmSync(base, { recursive: true, force: true });
+		}
+	});
+	it("anchors relative extra roots and denyRead entries to the session cwd", () => {
+		const profile = buildProfile("/real/cwd", ["./extra", "../sibling"], ["secrets"]);
+		assert.ok(profile.includes('(allow file-write* (subpath "/real/cwd/extra"'), profile);
+		assert.ok(profile.includes('(allow file-write* (subpath "/real/sibling"'), profile);
+		assert.ok(profile.includes('(deny file-read* (subpath "/real/cwd/secrets"'), profile);
+	});
+	it("never authorizes a sensitive root, but keeps an unrelated extra root", () => {
+		const profile = buildProfile("/real/cwd", ["/Users/mz/.pi", "/Users/mz/.pi/agent/sessions", "/Users/mz/.volta"], [], ["/Users/mz/.pi/agent", "/Users/mz/.pi"]);
+		assert.ok(!profile.includes('(allow file-write* (subpath "/Users/mz/.pi'), profile);
+		assert.ok(profile.includes('(allow file-write* (subpath "/Users/mz/.volta"'), profile);
+		assert.ok(profile.includes('(deny file-write* (subpath "/Users/mz/.pi"))'), profile);
+	});
+	it("denies sensitive dirs after the allows so a broad root cannot be written through", () => {
+		const profile = buildProfile("/real/cwd", ["/Users/mz"], [], ["/Users/mz/.pi"]);
+		assert.ok(profile.includes('(allow file-write* (subpath "/Users/mz")'), profile);
+		const allowIndex = profile.lastIndexOf("(allow file-write*");
+		const denyIndex = profile.indexOf('(deny file-write* (subpath "/Users/mz/.pi"))');
+		assert.ok(denyIndex > allowIndex, "the sensitive deny must come after every allow");
+	});
+	it("keeps the project writable when cwd itself lives under a sensitive dir", () => {
+		const profile = buildProfile("/Users/mz/.pi", ["/Users/mz/.pi"], [], ["/Users/mz/.pi/agent", "/Users/mz/.pi"]);
+		assert.ok(profile.includes('(allow file-write* (subpath "/Users/mz/.pi")'), profile);
+		assert.ok(!profile.includes("(deny file-write* (subpath"), profile);
+	});
+	it("still denies a sensitive dir inside a broad cwd when the cwd is not sensitive (cwd = ~)", () => {
+		// cwd = `~` is NOT itself a sensitive dir: the project root merely happens
+		// to contain it, so the credential dirs must stay denied.
+		const profile = buildProfile("/Users/mz", [], [], ["/Users/mz/.pi/agent", "/Users/mz/.pi"]);
+		assert.ok(profile.includes('(deny file-write* (subpath "/Users/mz/.pi/agent"))'), profile);
+		assert.ok(profile.includes('(deny file-write* (subpath "/Users/mz/.pi"))'), profile);
+	});
+	it("cwd strictly inside a sensitive dir: keeps the project, drops covering broad roots, no blanket deny of the containing dir", () => {
+		const broad = "/Users/mz/broad";
+		const pi = join(broad, ".pi");
+		const agent = join(pi, "agent");
+		const cwd = join(agent, "sessions");
+		const profile = buildProfile(cwd, [broad], [], [agent, pi]);
+		const allows = [...profile.matchAll(/\(allow file-write\* \(subpath "([^"]+)"\)\)/g)].map((m) => m[1]);
+		// the project subtree itself stays writable...
+		assert.ok(allows.includes(cwd), allows.join(", "));
+		// ...but the broad root that covers the containing sensitive dir is
+		// dropped, so credentials next to (not inside) the cwd are unreachable.
+		assert.ok(!allows.includes(broad), allows.join(", "));
+		assert.ok(!allows.some((a) => a === agent || a === pi), allows.join(", "));
+		// and the containing sensitive dirs are NOT denied (that would deny the
+		// project too) — protection comes from the dropped broad root instead.
+		assert.ok(!profile.includes(`(deny file-write* (subpath "${agent}"))`), profile);
+		assert.ok(!profile.includes(`(deny file-write* (subpath "${pi}"))`), profile);
+	});
+	it("cwd strictly inside a sensitive dir without a broad root: unrelated extra roots survive", () => {
+		const pi = "/Users/mz/broad/.pi";
+		const agent = join(pi, "agent");
+		const cwd = join(agent, "sessions");
+		const profile = buildProfile(cwd, ["/Users/mz/.volta"], [], [agent, pi]);
+		assert.ok(profile.includes('(allow file-write* (subpath "/Users/mz/.volta")'), profile);
+		assert.ok(profile.includes(`(allow file-write* (subpath "${cwd}"`), profile);
+	});
 });
 
 const SANDBOX_EXEC = "/usr/bin/sandbox-exec";
 
-describe("sandbox-exec integration (write isolation)", { skip: !existsSync(SANDBOX_EXEC) }, () => {
+/**
+ * Nested sandboxing is refused (`sandbox_apply: Operation not permitted`) when the
+ * tests themselves run inside an already-sandboxed shell — e.g. from a pi session
+ * whose bash tool is wrapped by this very extension. Detect that and skip, so a
+ * nested run does not report the write-isolation behaviour as broken.
+ */
+function sandboxExecUsable(): boolean {
+	if (!existsSync(SANDBOX_EXEC)) return false;
+	const probe = spawnSync(SANDBOX_EXEC, ["-p", "(version 1)(allow default)", "true"], { encoding: "utf8" });
+	return probe.status === 0;
+}
+
+const SANDBOX_SKIP = sandboxExecUsable()
+	? false
+	: "sandbox-exec unavailable (non-macOS) or nested sandboxing refused (this shell is already sandboxed)";
+
+describe("sandbox-exec integration (write isolation)", { skip: SANDBOX_SKIP }, () => {
+	it("allows writes to a configured extra root (path-scope extraRoots)", () => {
+		const root = mkdtempSync(join(tmpdir(), "sb-cwd-"));
+		const extra = mkdtempSync(join(tmpdir(), "sb-extra-"));
+		try {
+			const profile = buildProfile(root, [extra], []);
+			const target = join(extra, "allowed.txt");
+			const result = spawnSync(
+				SANDBOX_EXEC,
+				["-p", profile, "bash", "-c", `echo ok > "${target}"`],
+				{ cwd: root, encoding: "utf8" },
+			);
+			assert.equal(result.status, 0, result.stderr);
+			assert.ok(existsSync(target));
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+			rmSync(extra, { recursive: true, force: true });
+		}
+	});
+
+	it("resolves a cwd-relative extra root against the session cwd", () => {
+		const root = mkdtempSync(join(tmpdir(), "sb-cwd-"));
+		mkdirSync(join(root, "cache"));
+		try {
+			const profile = buildProfile(root, ["./cache"], []);
+			const target = join(root, "cache", "written.txt");
+			const result = spawnSync(
+				SANDBOX_EXEC,
+				["-p", profile, "bash", "-c", `echo ok > "${target}"`],
+				{ cwd: root, encoding: "utf8" },
+			);
+			assert.equal(result.status, 0, result.stderr);
+			assert.ok(existsSync(target));
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("denies a sensitive dir even when a broader authorized root contains it", () => {
+		const root = mkdtempSync(join(tmpdir(), "sb-cwd-"));
+		const broad = mkdtempSync(join(tmpdir(), "sb-broad-"));
+		const sensitive = join(broad, ".pi");
+		mkdirSync(sensitive);
+		try {
+			const profile = buildProfile(root, [broad], [], [sensitive]);
+			const inside = spawnSync(
+				SANDBOX_EXEC,
+				["-p", profile, "bash", "-c", `echo ok > "${join(broad, "work.txt")}"`],
+				{ cwd: root, encoding: "utf8" },
+			);
+			assert.equal(inside.status, 0, `write inside the broad root should pass: ${inside.stderr}`);
+
+			const denied = spawnSync(
+				SANDBOX_EXEC,
+				["-p", profile, "bash", "-c", `echo no > "${join(sensitive, "auth.json")}"`],
+				{ cwd: root, encoding: "utf8" },
+			);
+			assert.notEqual(denied.status, 0, "write into the sensitive dir should have failed");
+			assert.ok(/Operation not permitted/i.test(denied.stderr), denied.stderr);
+			assert.ok(!existsSync(join(sensitive, "auth.json")));
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+			rmSync(broad, { recursive: true, force: true });
+		}
+	});
+
 	it("allows writes under the project cwd", () => {
 		const root = mkdtempSync(join(tmpdir(), "sb-cwd-"));
 		try {
