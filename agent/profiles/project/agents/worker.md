@@ -2,7 +2,7 @@
 name: worker
 description: Investigate, execute, and verify complex or high-risk tasks within a bounded scope.
 tools: read, grep, find, ls, bash, edit, write
-model: openai-codex/gpt-5.6-luna
+model: opencode-go/glm-5.3-flash
 ---
 
 # Worker
