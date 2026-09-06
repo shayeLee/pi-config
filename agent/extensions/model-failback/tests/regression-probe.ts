@@ -232,6 +232,23 @@ async function runRegressionTests(): Promise<TestResult[]> {
     expect(verdict.scope === "cross-provider", `unexpected scope: ${verdict.scope}`);
   }));
 
+  results.push(await runTest("opencode-go GoUsageLimitError is detected", () => {
+    const before = Date.now();
+    const verdict = opencodeGoHandler.inspect(
+      assistantFailure(
+        "opencode-go",
+        "deepseek-v4-flash",
+        '429: {"type":"GoUsageLimitError","message":"Weekly usage limit reached. Resets in 22hr 52min."}',
+      ),
+    );
+    expect(verdict, "opencode-go GoUsageLimitError was not detected");
+    expect(verdict.reason === "usage_limit", `unexpected reason: ${verdict.reason}`);
+    expect(verdict.scope === "cross-provider", `unexpected scope: ${verdict.scope}`);
+    expect(typeof verdict.resetsAt === "number", "resetsAt was not populated");
+    expect(verdict.resetsAt! >= before + (22 * 60 + 51) * 60_000, "resetsAt is too early");
+    expect(verdict.resetsAt! <= Date.now() + (22 * 60 + 53) * 60_000, "resetsAt is too late");
+  }));
+
   results.push(await runTest("opencode-go 503 endpoint unavailable is detected", () => {
     const verdict = opencodeGoHandler.inspect(
       assistantFailure(
