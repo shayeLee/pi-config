@@ -10,9 +10,9 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { Key, matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 
-type Period = "day" | "week" | "month" | "all";
+type Period = "day" | "yesterday" | "week" | "month" | "all";
 
-const PERIODS: readonly Period[] = ["day", "week", "month", "all"];
+const PERIODS: readonly Period[] = ["day", "yesterday", "week", "month", "all"];
 const UNKNOWN_MODEL = { provider: "unknown", model: "unknown" };
 
 interface UsageTotals {
@@ -29,9 +29,16 @@ interface ModelUsage {
 	periods: Record<Period, UsageTotals>;
 }
 
+interface CurrentSessionUsage {
+	main: UsageTotals;
+	subagents: UsageTotals;
+	subagentRecords: number;
+}
+
 interface UsageReport {
 	rows: ModelUsage[];
 	totals: Record<Period, UsageTotals>;
+	currentSession?: CurrentSessionUsage;
 	sessionCount: number;
 	runtimeRecords: number;
 	skippedFiles: number;
@@ -47,12 +54,15 @@ interface RuntimeUsageRecord {
 	model: string;
 	kind: "assistant" | "tool" | "compaction" | "branch_summary";
 	usage: unknown;
+	/** Root persisted session that spawned this --no-session process, if any. */
+	rootSessionId?: string;
 }
 
 interface CachedUsageRecord {
 	model: { provider: string; model: string };
 	usage: UsageTotals;
 	timestamp?: number;
+	rootSessionId?: string;
 }
 
 interface FileFingerprint {
@@ -129,7 +139,8 @@ function isCachedUsageRecord(value: unknown): value is CachedUsageRecord {
 		typeof model.model === "string" &&
 		model.model.length > 0 &&
 		isUsageTotals(record.usage) &&
-		(record.timestamp === undefined || isFiniteNumber(record.timestamp)),
+		(record.timestamp === undefined || isFiniteNumber(record.timestamp)) &&
+		(record.rootSessionId === undefined || (typeof record.rootSessionId === "string" && record.rootSessionId.length > 0)),
 	);
 }
 
@@ -156,7 +167,7 @@ async function loadPersistentFileCache(): Promise<void> {
 			try {
 				await privateFileStat(persistentCachePath());
 				const parsed = JSON.parse(await readFile(persistentCachePath(), "utf8")) as unknown;
-				if (!parsed || typeof parsed !== "object" || (parsed as { version?: unknown }).version !== 1) {
+				if (!parsed || typeof parsed !== "object" || (parsed as { version?: unknown }).version !== 2) {
 					fileAggregateCacheDirty = true;
 				} else {
 					const files = (parsed as { files?: unknown }).files;
@@ -187,7 +198,7 @@ async function savePersistentFileCache(): Promise<void> {
 	const temporaryPath = `${path}.${process.pid}.tmp`;
 	try {
 		const files = Object.fromEntries(fileAggregateCache.entries());
-		await writeFile(temporaryPath, JSON.stringify({ version: 1, files }), { encoding: "utf8", mode: 0o600 });
+		await writeFile(temporaryPath, JSON.stringify({ version: 2, files }), { encoding: "utf8", mode: 0o600 });
 		await chmod(temporaryPath, 0o600);
 		await rename(temporaryPath, path);
 		await chmod(path, 0o600);
@@ -211,11 +222,17 @@ function runtimeUsagePath(date: Date): string {
 	return join(runtimeUsageDirectory(), `${localDateKey(date)}.jsonl`);
 }
 
+function rootSessionId(): string | undefined {
+	const value = process.env.PI_USAGE_ROOT_SESSION_ID?.trim();
+	return value || undefined;
+}
+
 function persistRuntimeUsage(
 	model: { provider: string; model: string },
 	kind: RuntimeUsageRecord["kind"],
 	usage: unknown,
 ): Promise<void> {
+	const sessionId = rootSessionId();
 	const record: RuntimeUsageRecord = {
 		version: 1,
 		timestamp: new Date().toISOString(),
@@ -223,6 +240,7 @@ function persistRuntimeUsage(
 		model: model.model,
 		kind,
 		usage,
+		...(sessionId ? { rootSessionId: sessionId } : {}),
 	};
 
 	runtimeWriteQueue = runtimeWriteQueue
@@ -241,6 +259,10 @@ function persistRuntimeUsage(
 interface ScanResult {
 	report?: UsageReport;
 	error?: string;
+	/** OpenAI Codex subscription quota from the ChatGPT usage endpoint, when resolvable. */
+	codexQuota?: CodexQuotaInfo;
+	/** OpenCode Go subscription quota from its official usage endpoint, when resolvable. */
+	opencodeGoQuota?: OpenCodeGoQuotaInfo;
 }
 
 function emptyTotals(): UsageTotals {
@@ -250,6 +272,7 @@ function emptyTotals(): UsageTotals {
 function emptyPeriods(): Record<Period, UsageTotals> {
 	return {
 		day: emptyTotals(),
+		yesterday: emptyTotals(),
 		week: emptyTotals(),
 		month: emptyTotals(),
 		all: emptyTotals(),
@@ -313,6 +336,311 @@ function formatCost(value: number): string {
 	return `$${value.toFixed(4)}`;
 }
 
+// --- OpenAI Codex subscription quota (ChatGPT non-public usage endpoint) ---
+//
+// Mirrors the Codex CLI (`backend-client::Client::get_rate_limits`, ChatGPT path
+// style): GET {chatgpt-base}/wham/usage with the OAuth access token that pi has
+// already resolved for provider `openai-codex`. Never displays or persists the
+// token; any failure skips the quota row without affecting the rest of /usage.
+
+const OPENAI_CODEX_PROVIDER_ID = "openai-codex";
+const OPENAI_CODEX_DEFAULT_BASE_URL = "https://chatgpt.com/backend-api";
+const OPENAI_CODEX_USAGE_PATH = "/wham/usage";
+const OPENAI_CODEX_REQUEST_TIMEOUT_MS = 8_000;
+const OPENAI_CODEX_QUOTA_CACHE_MS = 90_000;
+
+interface CodexQuotaWindow {
+	label: string;
+	percent: number;
+	resetsAt?: Date;
+}
+
+interface CodexQuotaInfo {
+	planType?: string;
+	windows: CodexQuotaWindow[];
+}
+
+let codexQuotaInFlight: Promise<CodexQuotaInfo | undefined> | undefined;
+let codexQuotaCached: { at: number; value: CodexQuotaInfo | undefined } | undefined;
+
+/** Minimal structural view of the model registry auth resolution used by the quota fetch. */
+interface CodexAuthResolver {
+	getProviderAuth(provider: string): Promise<{ auth?: { apiKey?: string; baseUrl?: string } } | undefined>;
+}
+
+function numericValue(value: unknown): number | undefined {
+	if (typeof value === "number" && Number.isFinite(value)) return value;
+	if (typeof value === "string" && value.trim() !== "") {
+		const parsed = Number(value.trim());
+		return Number.isFinite(parsed) ? parsed : undefined;
+	}
+	return undefined;
+}
+
+function windowPercent(record: Record<string, unknown>): number | undefined {
+	const direct = numericValue(record.used_percent);
+	if (direct !== undefined) return Math.max(0, Math.min(100, direct));
+	const used = numericValue(record.used);
+	const max = numericValue(record.max);
+	if (used !== undefined && max !== undefined && max > 0) return Math.max(0, Math.min(100, (used / max) * 100));
+	return undefined;
+}
+
+function windowMinutes(record: Record<string, unknown>): number | undefined {
+	const seconds = numericValue(record.limit_window_seconds);
+	if (seconds !== undefined && seconds > 0) return seconds / 60;
+	const minutes = numericValue(record.window_minutes);
+	return minutes !== undefined && minutes > 0 ? minutes : undefined;
+}
+
+function windowResetTime(record: Record<string, unknown>): Date | undefined {
+	const resetAt = numericValue(record.reset_at);
+	if (resetAt !== undefined) return new Date(resetAt * 1000);
+	const resetsAt = record.resets_at;
+	if (typeof resetsAt === "string" && resetsAt.length > 0) {
+		const parsed = Date.parse(resetsAt);
+		if (!Number.isNaN(parsed)) return new Date(parsed);
+	}
+	const after = numericValue(record.reset_after_seconds) ?? numericValue(record.resets_in_secs);
+	if (after !== undefined && after >= 0) return new Date(Date.now() + after * 1000);
+	return undefined;
+}
+
+function minutesLabel(minutes: number): string {
+	if (minutes <= 0) return "limit";
+	if (minutes === 300) return "5h";
+	if (minutes === 10_080) return "weekly";
+	if (minutes % 60 === 0) return `${Math.round(minutes / 60)}h`;
+	if (minutes < 60) return `${Math.round(minutes)}m`;
+	return `${Math.floor(minutes / 60)}h ${Math.round(minutes % 60)}m`;
+}
+
+function parseCodexWindow(value: unknown, fallbackLabel: string, fallbackMinutes: number | undefined): CodexQuotaWindow | undefined {
+	if (!value || typeof value !== "object") return undefined;
+	const record = value as Record<string, unknown>;
+	const percent = windowPercent(record);
+	if (percent === undefined) return undefined;
+	const minutes = windowMinutes(record) ?? fallbackMinutes;
+	return {
+		label: minutes === undefined ? fallbackLabel : minutesLabel(minutes),
+		percent,
+		resetsAt: windowResetTime(record),
+	};
+}
+
+function parseCodexQuota(json: unknown): CodexQuotaInfo | undefined {
+	if (!json || typeof json !== "object") return undefined;
+	const root = json as Record<string, unknown>;
+	const windows: CodexQuotaWindow[] = [];
+
+	// Current ChatGPT usage endpoint shape: rate_limit.primary/secondary_window.
+	const rateLimit = root.rate_limit;
+	if (rateLimit && typeof rateLimit === "object") {
+		const details = rateLimit as Record<string, unknown>;
+		const primary = parseCodexWindow(details.primary_window ?? details.primary, "5h", 300);
+		const secondary = parseCodexWindow(details.secondary_window ?? details.secondary, "weekly", 10_080);
+		if (primary) windows.push(primary);
+		if (secondary) windows.push(secondary);
+	}
+
+	// Legacy shape (older /backend-api/usage): limits["5h"] / limits["1week"] entries.
+	if (windows.length === 0 && root.limits && typeof root.limits === "object") {
+		for (const [key, value] of Object.entries(root.limits as Record<string, unknown>)) {
+			const entry = Array.isArray(value) ? value[0] : value;
+			if (/5h|300/i.test(key)) {
+				const window = parseCodexWindow(entry, "5h", 300);
+				if (window) windows.push(window);
+			} else if (/week|10080|7d/i.test(key)) {
+				const window = parseCodexWindow(entry, "weekly", 10_080);
+				if (window) windows.push(window);
+			}
+		}
+	}
+
+	if (windows.length === 0) return undefined;
+	const rawPlan = root.plan_type ?? root.planType;
+	const planType = typeof rawPlan === "string" && /^[A-Za-z0-9_. -]+$/.test(rawPlan) ? rawPlan : undefined;
+	return { planType, windows };
+}
+
+/** Extracts the ChatGPT account id from the access-token JWT claim, in memory only. */
+function chatgptAccountIdFromAccessToken(accessToken: string): string | undefined {
+	try {
+		const payloadPart = accessToken.split(".")[1];
+		if (!payloadPart) return undefined;
+		const base64 = payloadPart.replace(/-/g, "+").replace(/_/g, "/");
+		const padded = base64.padEnd(Math.ceil(base64.length / 4) * 4, "=");
+		const payload = JSON.parse(Buffer.from(padded, "base64").toString("utf8")) as Record<string, unknown>;
+		const auth = payload["https://api.openai.com/auth"];
+		if (!auth || typeof auth !== "object") return undefined;
+		const accountId = (auth as Record<string, unknown>).chatgpt_account_id;
+		return typeof accountId === "string" && accountId.length > 0 ? accountId : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+async function fetchOpenAICodexQuota(resolver: CodexAuthResolver, signal?: AbortSignal): Promise<CodexQuotaInfo | undefined> {
+	try {
+		const authResult = await resolver.getProviderAuth(OPENAI_CODEX_PROVIDER_ID);
+		const accessToken = authResult?.auth?.apiKey;
+		if (!accessToken) return undefined;
+		const baseUrl = (authResult?.auth?.baseUrl?.trim() || OPENAI_CODEX_DEFAULT_BASE_URL).replace(/\/+$/, "");
+
+		const controller = new AbortController();
+		const onAbort = () => controller.abort();
+		signal?.addEventListener("abort", onAbort, { once: true });
+		const timer = setTimeout(() => controller.abort(), OPENAI_CODEX_REQUEST_TIMEOUT_MS);
+		try {
+			const headers: Record<string, string> = {
+				Authorization: `Bearer ${accessToken}`,
+				Accept: "application/json",
+				"Content-Type": "application/json",
+				"User-Agent": "codex-cli",
+			};
+			const accountId = chatgptAccountIdFromAccessToken(accessToken);
+			if (accountId) headers["ChatGPT-Account-Id"] = accountId;
+			const response = await fetch(`${baseUrl}${OPENAI_CODEX_USAGE_PATH}`, { headers, signal: controller.signal });
+			if (!response.ok) return undefined;
+			return parseCodexQuota((await response.json()) as unknown);
+		} finally {
+			clearTimeout(timer);
+			signal?.removeEventListener("abort", onAbort);
+		}
+	} catch {
+		// Quota display is best-effort; any failure leaves /usage unchanged.
+		return undefined;
+	}
+}
+
+async function getCodexQuota(resolver: CodexAuthResolver, signal?: AbortSignal): Promise<CodexQuotaInfo | undefined> {
+	const cached = codexQuotaCached;
+	if (cached && Date.now() - cached.at < OPENAI_CODEX_QUOTA_CACHE_MS) return cached.value;
+	if (!codexQuotaInFlight) {
+		codexQuotaInFlight = fetchOpenAICodexQuota(resolver, signal)
+			.then((value) => {
+				codexQuotaCached = { at: Date.now(), value };
+				return value;
+			})
+			.finally(() => {
+				codexQuotaInFlight = undefined;
+			});
+	}
+	return codexQuotaInFlight;
+}
+
+function formatResetTime(date: Date): string {
+	const hhmm = `${String(date.getHours()).padStart(2, "0")}:${String(date.getMinutes()).padStart(2, "0")}`;
+	const now = new Date();
+	const sameDay =
+		date.getFullYear() === now.getFullYear() &&
+		date.getMonth() === now.getMonth() &&
+		date.getDate() === now.getDate();
+	if (sameDay) return hhmm;
+	return `${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")} ${hhmm}`;
+}
+
+function renderCodexQuotaLines(quota: CodexQuotaInfo, width: number, theme: any): string[] {
+	const innerWidth = Math.max(1, width - 2);
+	const planType = quota.planType ? ` (${quota.planType})` : "";
+	const parts = quota.windows.map((window) => {
+		const reset = window.resetsAt ? ` · resets ${formatResetTime(window.resetsAt)}` : "";
+		return `${window.label} ${Math.round(100 - window.percent)}% left${reset}`;
+	});
+	const line = truncateToWidth(theme.fg("accent", `Codex quota${planType}: ${parts.join("  │  ")}`), innerWidth, "");
+	return [line];
+}
+
+// --- OpenCode Go subscription quota ---
+
+const OPENCODE_GO_PROVIDER_ID = "opencode-go";
+const OPENCODE_GO_USAGE_URL = "https://opencode.ai/zen/go/v1/usage";
+
+interface OpenCodeGoQuotaWindow {
+	label: string;
+	percent: number;
+	resetsAt?: Date;
+}
+
+interface OpenCodeGoQuotaInfo {
+	windows: OpenCodeGoQuotaWindow[];
+}
+
+let openCodeGoQuotaInFlight: Promise<OpenCodeGoQuotaInfo | undefined> | undefined;
+let openCodeGoQuotaCached: { at: number; value: OpenCodeGoQuotaInfo | undefined } | undefined;
+
+function parseOpenCodeGoQuota(json: unknown): OpenCodeGoQuotaInfo | undefined {
+	if (!json || typeof json !== "object") return undefined;
+	const usage = (json as Record<string, unknown>).usage;
+	if (!usage || typeof usage !== "object") return undefined;
+	const records = usage as Record<string, unknown>;
+	const windows: OpenCodeGoQuotaWindow[] = [];
+	for (const [key, label] of [["rolling", "5h"], ["weekly", "weekly"], ["monthly", "monthly"]] as const) {
+		const value = records[key];
+		if (!value || typeof value !== "object") continue;
+		const record = value as Record<string, unknown>;
+		const percent = numericValue(record.percent);
+		if (percent === undefined) continue;
+		const resetsAt = record.resetsAt;
+		const resetTime = typeof resetsAt === "string" && !Number.isNaN(Date.parse(resetsAt))
+			? new Date(resetsAt)
+			: undefined;
+		windows.push({ label, percent: Math.max(0, Math.min(100, percent)), resetsAt: resetTime });
+	}
+	return windows.length > 0 ? { windows } : undefined;
+}
+
+async function fetchOpenCodeGoQuota(resolver: CodexAuthResolver, signal?: AbortSignal): Promise<OpenCodeGoQuotaInfo | undefined> {
+	try {
+		const authResult = await resolver.getProviderAuth(OPENCODE_GO_PROVIDER_ID);
+		const apiKey = authResult?.auth?.apiKey;
+		if (!apiKey) return undefined;
+		const controller = new AbortController();
+		const onAbort = () => controller.abort();
+		signal?.addEventListener("abort", onAbort, { once: true });
+		const timer = setTimeout(() => controller.abort(), OPENAI_CODEX_REQUEST_TIMEOUT_MS);
+		try {
+			const response = await fetch(OPENCODE_GO_USAGE_URL, {
+				headers: { Authorization: `Bearer ${apiKey}`, Accept: "application/json" },
+				signal: controller.signal,
+			});
+			if (!response.ok) return undefined;
+			return parseOpenCodeGoQuota((await response.json()) as unknown);
+		} finally {
+			clearTimeout(timer);
+			signal?.removeEventListener("abort", onAbort);
+		}
+	} catch {
+		// Quota display is best-effort; any failure leaves /usage unchanged.
+		return undefined;
+	}
+}
+
+async function getOpenCodeGoQuota(resolver: CodexAuthResolver, signal?: AbortSignal): Promise<OpenCodeGoQuotaInfo | undefined> {
+	const cached = openCodeGoQuotaCached;
+	if (cached && Date.now() - cached.at < OPENAI_CODEX_QUOTA_CACHE_MS) return cached.value;
+	if (!openCodeGoQuotaInFlight) {
+		openCodeGoQuotaInFlight = fetchOpenCodeGoQuota(resolver, signal)
+			.then((value) => {
+				openCodeGoQuotaCached = { at: Date.now(), value };
+				return value;
+			})
+			.finally(() => {
+				openCodeGoQuotaInFlight = undefined;
+			});
+	}
+	return openCodeGoQuotaInFlight;
+}
+
+function renderOpenCodeGoQuotaLines(quota: OpenCodeGoQuotaInfo, width: number, theme: any): string[] {
+	const innerWidth = Math.max(1, width - 2);
+	const parts = quota.windows.map((window) => {
+		const reset = window.resetsAt ? ` · resets ${formatResetTime(window.resetsAt)}` : "";
+		return `${window.label} ${Math.round(100 - window.percent)}% left${reset}`;
+	});
+	return [truncateToWidth(theme.fg("accent", `OpenCode Go quota: ${parts.join("  │  ")}`), innerWidth, "")];
+}
+
 function parseTimestamp(value: unknown): number | undefined {
 	if (typeof value === "number" && Number.isFinite(value)) return value;
 	if (typeof value !== "string" || value.length === 0) return undefined;
@@ -335,6 +663,12 @@ function getEntryTimestamp(entry: Record<string, unknown>, fallback?: number): n
 
 function startOfToday(now: Date): number {
 	return new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
+}
+
+function startOfYesterday(now: Date): number {
+	const start = new Date(startOfToday(now));
+	start.setDate(start.getDate() - 1);
+	return start.getTime();
 }
 
 function startOfWeek(now: Date): number {
@@ -376,13 +710,17 @@ function addToPeriods(
 	totals: Record<Period, UsageTotals>,
 	usage: UsageTotals,
 	timestamp: number | undefined,
-	periodStarts: Pick<Record<Period, number>, "day" | "week" | "month">,
+	periodStarts: Pick<Record<Period, number>, "day" | "yesterday" | "week" | "month">,
 	now: number,
 ): void {
 	addTotals(model.periods.all, usage);
 	addTotals(totals.all, usage);
 
 	if (timestamp === undefined || timestamp > now) return;
+	if (timestamp >= periodStarts.yesterday && timestamp < periodStarts.day) {
+		addTotals(model.periods.yesterday, usage);
+		addTotals(totals.yesterday, usage);
+	}
 	for (const period of ["day", "week", "month"] as const) {
 		if (timestamp >= periodStarts[period]) {
 			addTotals(model.periods[period], usage);
@@ -495,7 +833,10 @@ async function parseRuntimeAggregate(path: string, fingerprint: FileFingerprint,
 					invalidLines++;
 					continue;
 				}
-				records.push({ model, usage: normalizedUsage(parsed.usage), timestamp: parseTimestamp(parsed.timestamp) });
+				const rootSessionId = typeof parsed.rootSessionId === "string" && parsed.rootSessionId.trim()
+					? parsed.rootSessionId.trim()
+					: undefined;
+				records.push({ model, usage: normalizedUsage(parsed.usage), timestamp: parseTimestamp(parsed.timestamp), rootSessionId });
 			} catch {
 				invalidLines++;
 			}
@@ -539,7 +880,10 @@ function removeMissingCachedFiles(prefix: string, activeKeys: Set<string>): void
 	}
 }
 
-async function scanUsage(signal: AbortSignal): Promise<UsageReport> {
+async function scanUsage(
+	signal: AbortSignal,
+	currentSession?: { path: string; id: string },
+): Promise<UsageReport> {
 	await loadPersistentFileCache();
 	const sessions = await SessionManager.listAll();
 	if (signal.aborted) throw cancelled();
@@ -549,6 +893,7 @@ async function scanUsage(signal: AbortSignal): Promise<UsageReport> {
 	const now = nowDate.getTime();
 	const periodStarts = {
 		day: startOfToday(nowDate),
+		yesterday: startOfYesterday(nowDate),
 		week: startOfWeek(nowDate),
 		month: startOfMonth(nowDate),
 	};
@@ -560,6 +905,9 @@ async function scanUsage(signal: AbortSignal): Promise<UsageReport> {
 	let skippedFiles = 0;
 	let invalidLines = 0;
 	let unattributedEntries = 0;
+	const currentSessionUsage = currentSession
+		? { main: emptyTotals(), subagents: emptyTotals(), subagentRecords: 0 }
+		: undefined;
 
 	for (const path of sessionPaths) {
 		if (signal.aborted) throw cancelled();
@@ -577,6 +925,7 @@ async function scanUsage(signal: AbortSignal): Promise<UsageReport> {
 		for (const record of aggregate.records) {
 			const model = getOrCreateModel(models, record.model);
 			addToPeriods(model, totals, record.usage, record.timestamp, periodStarts, now);
+			if (currentSessionUsage && path === currentSession?.path) addTotals(currentSessionUsage.main, record.usage);
 		}
 	}
 	removeMissingCachedFiles("session:", sessionKeys);
@@ -613,6 +962,10 @@ async function scanUsage(signal: AbortSignal): Promise<UsageReport> {
 		for (const record of aggregate.records) {
 			const model = getOrCreateModel(models, record.model);
 			addToPeriods(model, totals, record.usage, record.timestamp, periodStarts, now);
+			if (currentSessionUsage && record.rootSessionId === currentSession?.id) {
+				addTotals(currentSessionUsage.subagents, record.usage);
+				currentSessionUsage.subagentRecords++;
+			}
 		}
 	}
 	if (runtimeListingReliable) removeMissingCachedFiles("runtime:", runtimeKeys);
@@ -628,6 +981,7 @@ async function scanUsage(signal: AbortSignal): Promise<UsageReport> {
 	return {
 		rows,
 		totals,
+		currentSession: currentSessionUsage,
 		sessionCount,
 		runtimeRecords,
 		skippedFiles,
@@ -643,6 +997,7 @@ function dateText(date: Date): string {
 
 function periodLabel(period: Period, now: Date): string {
 	if (period === "day") return `Today ${dateText(now)}`;
+	if (period === "yesterday") return `Yesterday ${dateText(new Date(startOfYesterday(now)))}`;
 	if (period === "week") {
 		const start = new Date(startOfWeek(now));
 		return `This week ${dateText(start)}+`;
@@ -655,6 +1010,7 @@ function periodFromArgs(args: string): Period {
 	const value = args.trim().toLowerCase();
 	if (!value) return "week";
 	if (value === "day" || value === "today" || value === "daily") return "day";
+	if (value === "yesterday" || value === "yday") return "yesterday";
 	if (value === "week" || value === "weekly") return "week";
 	if (value === "month" || value === "monthly") return "month";
 	return "all";
@@ -680,6 +1036,8 @@ function renderUsageTable(
 	startIndex: number,
 	width: number,
 	theme: any,
+	codexQuota?: CodexQuotaInfo,
+	openCodeGoQuota?: OpenCodeGoQuotaInfo,
 ): string[] {
 	const innerWidth = Math.max(1, width - 2);
 	const metricWidths = [11, 10, 8, 10, 10, 10, 10];
@@ -705,6 +1063,8 @@ function renderUsageTable(
 			"",
 		),
 	);
+	if (codexQuota) lines.push(...renderCodexQuotaLines(codexQuota, width, theme));
+	if (openCodeGoQuota) lines.push(...renderOpenCodeGoQuotaLines(openCodeGoQuota, width, theme));
 	const headerCells = ["provider/model", "tokens(M)", "cost", "hit%", "input(M)", "output(M)", "cacheR(M)", "cacheW(M)"];
 	const header = headerCells
 		.map((cell, index) => {
@@ -738,6 +1098,23 @@ function renderUsageTable(
 		}
 	}
 
+	if (report.currentSession) {
+		const { main, subagents, subagentRecords } = report.currentSession;
+		const combined = emptyTotals();
+		addTotals(combined, main);
+		addTotals(combined, subagents);
+		const subagentText = subagentRecords > 0
+			? ` · subagents ${formatTokens(totalTokens(subagents))}, ${formatCost(subagents.cost)} (${subagentRecords} records)`
+			: "";
+		lines.push(
+			truncateToWidth(
+				theme.fg("accent", `Current session: ${formatTokens(totalTokens(combined))}, ${formatCost(combined.cost)}${subagentText}`),
+				innerWidth,
+				"",
+			),
+		);
+	}
+
 	const total = report.totals[period];
 	const totalCells = [
 		"TOTAL".padStart(nameWidth),
@@ -756,7 +1133,7 @@ function renderUsageTable(
 	if (report.skippedFiles > 0) notes.push(`${report.skippedFiles} session files skipped`);
 	if (report.invalidLines > 0) notes.push(`${report.invalidLines} invalid JSONL lines ignored`);
 	if (notes.length > 0) lines.push(truncateToWidth(theme.fg("warning", notes.join(" · ")), innerWidth, "…"));
-	lines.push(truncateToWidth(theme.fg("dim", "1-4 period · ↑↓/PgUp/PgDn scroll · Esc close"), innerWidth, ""));
+	lines.push(truncateToWidth(theme.fg("dim", "1-5 period · ↑↓/PgUp/PgDn scroll · Esc close"), innerWidth, ""));
 	return frameUsageLines(lines, width, theme);
 }
 
@@ -802,9 +1179,18 @@ export default function (pi: ExtensionAPI) {
 					const loader = new BorderedLoader(tui, theme, "Scanning all Pi sessions...");
 					loader.onAbort = () => done(null);
 
-					scanUsage(loader.signal)
-						.then((report) => {
-							if (!loader.signal.aborted) done({ report });
+					Promise.all([
+						scanUsage(
+							loader.signal,
+							ctx.sessionManager.getSessionFile()
+								? { path: ctx.sessionManager.getSessionFile()!, id: ctx.sessionManager.getSessionId() }
+								: undefined,
+						),
+						getCodexQuota(ctx.modelRegistry, loader.signal),
+						getOpenCodeGoQuota(ctx.modelRegistry, loader.signal),
+					])
+						.then(([report, codexQuota, opencodeGoQuota]) => {
+							if (!loader.signal.aborted) done({ report, codexQuota, opencodeGoQuota });
 						})
 						.catch((error: unknown) => {
 							if (!loader.signal.aborted) {
@@ -827,6 +1213,8 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			const report = scanResult.report;
+			const codexQuota = scanResult.codexQuota;
+			const opencodeGoQuota = scanResult.opencodeGoQuota;
 			const initialPeriod = periodFromArgs(args);
 			await ctx.ui.custom<void>(
 				(tui, theme, _keybindings, done) => {
@@ -844,15 +1232,16 @@ export default function (pi: ExtensionAPI) {
 
 					return {
 						render(width: number): string[] {
-							return renderUsageTable(report, period, selectedIndex, startIndex, width, theme);
+							return renderUsageTable(report, period, selectedIndex, startIndex, width, theme, codexQuota, opencodeGoQuota);
 						},
 						handleInput(data: string): void {
 							if (matchesKey(data, Key.escape) || matchesKey(data, Key.ctrl("c"))) {
 								done(undefined);
 								return;
 							}
-							if (data === "1" || data === "2" || data === "3" || data === "4") {
-								period = PERIODS[Number(data) - 1]!;
+							const periodIndex = Number(data) - 1;
+							if (/^[1-9]$/.test(data) && periodIndex >= 0 && periodIndex < PERIODS.length) {
+								period = PERIODS[periodIndex]!;
 								requestRender();
 								return;
 							}

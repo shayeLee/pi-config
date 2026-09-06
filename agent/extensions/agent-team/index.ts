@@ -650,6 +650,7 @@ async function runSingleAgent(
 	fleetStore: FleetStore,
 	modelRegistry: ModelRegistry | undefined,
 	projectTrusted: boolean | undefined,
+	usageRootSessionId: string | undefined,
 ): Promise<SingleResult> {
 	const configuredAgent = agents.find((a) => a.name === agentName);
 
@@ -920,6 +921,7 @@ async function runSingleAgent(
 					...(failbackSessionId
 						? { MODEL_FAILBACK_SESSION_ID: failbackSessionId }
 						: {}),
+					...(usageRootSessionId ? { PI_USAGE_ROOT_SESSION_ID: usageRootSessionId } : {}),
 					MODEL_FAILBACK_CHILD: "1",
 				},
 			});
@@ -1189,6 +1191,8 @@ export default function (pi: ExtensionAPI) {
 
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
 			const agentScope: AgentScope = params.agentScope ?? "both";
+			// Retain the persisted root session across nested --no-session subagents.
+			const usageRootSessionId = process.env.PI_USAGE_ROOT_SESSION_ID ?? ctx.sessionManager.getSessionId();
 			const discovery = discoverAgents(ctx.cwd, agentScope);
 			const agents = discovery.agents;
 
@@ -1256,6 +1260,7 @@ export default function (pi: ExtensionAPI) {
 						fleetStore,
 						ctx.modelRegistry,
 						ctx.isProjectTrusted?.(),
+						usageRootSessionId,
 					);
 					results.push(result);
 
@@ -1338,6 +1343,7 @@ export default function (pi: ExtensionAPI) {
 						fleetStore,
 						ctx.modelRegistry,
 						ctx.isProjectTrusted?.(),
+						usageRootSessionId,
 					);
 					allResults[index] = result;
 					emitParallelUpdate();
@@ -1380,6 +1386,7 @@ export default function (pi: ExtensionAPI) {
 					fleetStore,
 					ctx.modelRegistry,
 					ctx.isProjectTrusted?.(),
+					usageRootSessionId,
 				);
 				const isError = isFailedResult(result);
 				if (isError) {
