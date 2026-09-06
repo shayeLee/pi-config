@@ -15,6 +15,21 @@ type Period = "day" | "yesterday" | "week" | "month" | "all";
 const PERIODS: readonly Period[] = ["day", "yesterday", "week", "month", "all"];
 const UNKNOWN_MODEL = { provider: "unknown", model: "unknown" };
 
+interface UsageStatsConfig {
+	showOpenCodeGoQuota?: boolean;
+}
+
+async function readUsageStatsConfig(): Promise<UsageStatsConfig> {
+	try {
+		const parsed = JSON.parse(await readFile(join(getAgentDir(), "usage-stats.json"), "utf8")) as unknown;
+		if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
+		const value = (parsed as Record<string, unknown>).showOpenCodeGoQuota;
+		return typeof value === "boolean" ? { showOpenCodeGoQuota: value } : {};
+	} catch {
+		return {};
+	}
+}
+
 interface UsageTotals {
 	input: number;
 	output: number;
@@ -1174,6 +1189,7 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 
+			const usageStatsConfig = await readUsageStatsConfig();
 			const scanResult = await ctx.ui.custom<ScanResult | null>(
 				(tui, theme, _keybindings, done) => {
 					const loader = new BorderedLoader(tui, theme, "Scanning all Pi sessions...");
@@ -1187,7 +1203,9 @@ export default function (pi: ExtensionAPI) {
 								: undefined,
 						),
 						getCodexQuota(ctx.modelRegistry, loader.signal),
-						getOpenCodeGoQuota(ctx.modelRegistry, loader.signal),
+						usageStatsConfig.showOpenCodeGoQuota === true
+							? getOpenCodeGoQuota(ctx.modelRegistry, loader.signal)
+							: Promise.resolve(undefined),
 					])
 						.then(([report, codexQuota, opencodeGoQuota]) => {
 							if (!loader.signal.aborted) done({ report, codexQuota, opencodeGoQuota });

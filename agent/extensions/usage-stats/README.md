@@ -19,7 +19,7 @@ Pi usage 统计扩展，按 `provider/model` 汇总 Token 与费用。
 provider/model | tokens(M) | cost | hit% | input(M) | output(M) | cacheR(M) | cacheW(M)
 ```
 
-若当前已配置 `openai-codex`（ChatGPT OAuth）或 `opencode-go` 登录，面板顶部会额外显示对应的订阅额度（见下文）；未配置或请求失败时不显示。
+若当前已配置 `openai-codex`（ChatGPT OAuth）登录，面板顶部会额外显示对应的订阅额度；`opencode-go` 额度默认隐藏，可通过配置开启。未配置或请求失败时不显示。
 
 `hit%` 是当前选定时间范围的累计缓存命中率：
 
@@ -35,6 +35,18 @@ cacheRead / (input + cacheRead + cacheWrite) × 100%
 - `↑` / `↓`：滚动
 - `PgUp` / `PgDn`：翻页
 - `Esc`：关闭
+
+## 配置
+
+配置文件：`~/.pi/agent/usage-stats.json`。`opencode-go` 额度默认隐藏；如需显示，写入：
+
+```json
+{
+  "showOpenCodeGoQuota": true
+}
+```
+
+配置在每次打开 `/usage` 时读取，关闭时不会请求 OpenCode Go 额度接口，也不影响 `opencode-go` 的 Token/费用统计。
 
 昨日按本地时区计算，统计区间为 `[昨日 00:00, 今日 00:00)`。
 
@@ -78,7 +90,7 @@ Codex quota (plus): 5h 58% left · resets 14:32  │  weekly 93% left · resets 
 
 ## OpenCode Go 订阅额度
 
-使用 Pi 已解析的 `opencode-go` API key 请求官方 Go 额度端点：
+该功能默认关闭，由 `~/.pi/agent/usage-stats.json` 中的 `showOpenCodeGoQuota` 控制。开启后，使用 Pi 已解析的 `opencode-go` API key 请求官方 Go 额度端点：
 
 ```text
 GET https://opencode.ai/zen/go/v1/usage

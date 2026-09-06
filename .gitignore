@@ -13,6 +13,7 @@ agent/sandbox-bash.json
 agent/bash-guard.json
 agent/agents/agents.override.json
 agent/profiles/project/agents/agents.override.json
+agent/usage-stats.json
 
 agent/bin
 agent/sessions
