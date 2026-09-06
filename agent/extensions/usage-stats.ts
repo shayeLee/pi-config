@@ -17,14 +17,18 @@ const UNKNOWN_MODEL = { provider: "unknown", model: "unknown" };
 
 interface UsageStatsConfig {
 	showOpenCodeGoQuota?: boolean;
+	showDeepSeekBalance?: boolean;
 }
 
 async function readUsageStatsConfig(): Promise<UsageStatsConfig> {
 	try {
 		const parsed = JSON.parse(await readFile(join(getAgentDir(), "usage-stats.json"), "utf8")) as unknown;
 		if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
-		const value = (parsed as Record<string, unknown>).showOpenCodeGoQuota;
-		return typeof value === "boolean" ? { showOpenCodeGoQuota: value } : {};
+		const values = parsed as Record<string, unknown>;
+		const config: UsageStatsConfig = {};
+		if (typeof values.showOpenCodeGoQuota === "boolean") config.showOpenCodeGoQuota = values.showOpenCodeGoQuota;
+		if (typeof values.showDeepSeekBalance === "boolean") config.showDeepSeekBalance = values.showDeepSeekBalance;
+		return config;
 	} catch {
 		return {};
 	}
@@ -278,6 +282,8 @@ interface ScanResult {
 	codexQuota?: CodexQuotaInfo;
 	/** OpenCode Go subscription quota from its official usage endpoint, when resolvable. */
 	opencodeGoQuota?: OpenCodeGoQuotaInfo;
+	/** DeepSeek API account balance from its official balance endpoint, when resolvable. */
+	deepSeekBalance?: DeepSeekBalanceInfo;
 }
 
 function emptyTotals(): UsageTotals {
@@ -654,6 +660,113 @@ function renderOpenCodeGoQuotaLines(quota: OpenCodeGoQuotaInfo, width: number, t
 		return `${window.label} ${Math.round(100 - window.percent)}% left${reset}`;
 	});
 	return [truncateToWidth(theme.fg("accent", `OpenCode Go quota: ${parts.join("  │  ")}`), innerWidth, "")];
+}
+
+// --- DeepSeek API account balance ---
+
+const DEEPSEEK_PROVIDER_ID = "deepseek";
+const DEEPSEEK_DEFAULT_BASE_URL = "https://api.deepseek.com";
+const DEEPSEEK_BALANCE_PATH = "/user/balance";
+
+interface DeepSeekBalanceEntry {
+	currency: string;
+	totalBalance: number;
+	grantedBalance?: number;
+	toppedUpBalance?: number;
+}
+
+interface DeepSeekBalanceInfo {
+	isAvailable?: boolean;
+	entries: DeepSeekBalanceEntry[];
+}
+
+let deepSeekBalanceInFlight: Promise<DeepSeekBalanceInfo | undefined> | undefined;
+let deepSeekBalanceCached: { at: number; value: DeepSeekBalanceInfo | undefined } | undefined;
+
+function parseDeepSeekBalance(json: unknown): DeepSeekBalanceInfo | undefined {
+	if (!json || typeof json !== "object") return undefined;
+	const root = json as Record<string, unknown>;
+	if (!Array.isArray(root.balance_infos)) return undefined;
+	const entries: DeepSeekBalanceEntry[] = [];
+	for (const value of root.balance_infos) {
+		if (!value || typeof value !== "object") continue;
+		const record = value as Record<string, unknown>;
+		const currency = typeof record.currency === "string" ? record.currency.trim().toUpperCase() : "";
+		const totalBalance = numericValue(record.total_balance);
+		if (!/^[A-Z]{3}$/.test(currency) || totalBalance === undefined) continue;
+		entries.push({
+			currency,
+			totalBalance,
+			grantedBalance: numericValue(record.granted_balance),
+			toppedUpBalance: numericValue(record.topped_up_balance),
+		});
+	}
+	if (entries.length === 0) return undefined;
+	return {
+		isAvailable: typeof root.is_available === "boolean" ? root.is_available : undefined,
+		entries,
+	};
+}
+
+async function fetchDeepSeekBalance(resolver: CodexAuthResolver, signal?: AbortSignal): Promise<DeepSeekBalanceInfo | undefined> {
+	try {
+		const authResult = await resolver.getProviderAuth(DEEPSEEK_PROVIDER_ID);
+		const apiKey = authResult?.auth?.apiKey;
+		if (!apiKey) return undefined;
+		const baseUrl = (authResult?.auth?.baseUrl?.trim() || DEEPSEEK_DEFAULT_BASE_URL).replace(/\/+$/, "");
+		const controller = new AbortController();
+		const onAbort = () => controller.abort();
+		signal?.addEventListener("abort", onAbort, { once: true });
+		const timer = setTimeout(() => controller.abort(), OPENAI_CODEX_REQUEST_TIMEOUT_MS);
+		try {
+			const response = await fetch(`${baseUrl}${DEEPSEEK_BALANCE_PATH}`, {
+				headers: { Authorization: `Bearer ${apiKey}`, Accept: "application/json" },
+				signal: controller.signal,
+			});
+			if (!response.ok) return undefined;
+			return parseDeepSeekBalance((await response.json()) as unknown);
+		} finally {
+			clearTimeout(timer);
+			signal?.removeEventListener("abort", onAbort);
+		}
+	} catch {
+		// Balance display is best-effort; any failure leaves /usage unchanged.
+		return undefined;
+	}
+}
+
+async function getDeepSeekBalance(resolver: CodexAuthResolver, signal?: AbortSignal): Promise<DeepSeekBalanceInfo | undefined> {
+	const cached = deepSeekBalanceCached;
+	if (cached && Date.now() - cached.at < OPENAI_CODEX_QUOTA_CACHE_MS) return cached.value;
+	if (!deepSeekBalanceInFlight) {
+		deepSeekBalanceInFlight = fetchDeepSeekBalance(resolver, signal)
+			.then((value) => {
+				deepSeekBalanceCached = { at: Date.now(), value };
+				return value;
+			})
+			.finally(() => {
+				deepSeekBalanceInFlight = undefined;
+			});
+	}
+	return deepSeekBalanceInFlight;
+}
+
+function formatDeepSeekBalanceAmount(currency: string, value: number): string {
+	const symbol = currency === "CNY" ? "¥" : currency === "USD" ? "$" : `${currency} `;
+	return `${symbol}${value.toFixed(2)}`;
+}
+
+function renderDeepSeekBalanceLines(balance: DeepSeekBalanceInfo, width: number, theme: any): string[] {
+	const innerWidth = Math.max(1, width - 2);
+	const parts = balance.entries.map((entry) => {
+		const details: string[] = [];
+		if (entry.grantedBalance !== undefined) details.push(`granted ${formatDeepSeekBalanceAmount(entry.currency, entry.grantedBalance)}`);
+		if (entry.toppedUpBalance !== undefined) details.push(`topped-up ${formatDeepSeekBalanceAmount(entry.currency, entry.toppedUpBalance)}`);
+		const detailText = details.length > 0 ? ` (${details.join(" · ")})` : "";
+		return `${entry.currency} ${formatDeepSeekBalanceAmount(entry.currency, entry.totalBalance)}${detailText}`;
+	});
+	const status = balance.isAvailable === undefined ? "" : balance.isAvailable ? " · available" : " · unavailable";
+	return [truncateToWidth(theme.fg("accent", `DeepSeek balance: ${parts.join("  │  ")}${status}`), innerWidth, "")];
 }
 
 function parseTimestamp(value: unknown): number | undefined {
@@ -1053,6 +1166,7 @@ function renderUsageTable(
 	theme: any,
 	codexQuota?: CodexQuotaInfo,
 	openCodeGoQuota?: OpenCodeGoQuotaInfo,
+	deepSeekBalance?: DeepSeekBalanceInfo,
 ): string[] {
 	const innerWidth = Math.max(1, width - 2);
 	const metricWidths = [11, 10, 8, 10, 10, 10, 10];
@@ -1080,6 +1194,7 @@ function renderUsageTable(
 	);
 	if (codexQuota) lines.push(...renderCodexQuotaLines(codexQuota, width, theme));
 	if (openCodeGoQuota) lines.push(...renderOpenCodeGoQuotaLines(openCodeGoQuota, width, theme));
+	if (deepSeekBalance) lines.push(...renderDeepSeekBalanceLines(deepSeekBalance, width, theme));
 	const headerCells = ["provider/model", "tokens(M)", "cost", "hit%", "input(M)", "output(M)", "cacheR(M)", "cacheW(M)"];
 	const header = headerCells
 		.map((cell, index) => {
@@ -1206,9 +1321,12 @@ export default function (pi: ExtensionAPI) {
 						usageStatsConfig.showOpenCodeGoQuota === true
 							? getOpenCodeGoQuota(ctx.modelRegistry, loader.signal)
 							: Promise.resolve(undefined),
+						usageStatsConfig.showDeepSeekBalance === true
+							? getDeepSeekBalance(ctx.modelRegistry, loader.signal)
+							: Promise.resolve(undefined),
 					])
-						.then(([report, codexQuota, opencodeGoQuota]) => {
-							if (!loader.signal.aborted) done({ report, codexQuota, opencodeGoQuota });
+						.then(([report, codexQuota, opencodeGoQuota, deepSeekBalance]) => {
+							if (!loader.signal.aborted) done({ report, codexQuota, opencodeGoQuota, deepSeekBalance });
 						})
 						.catch((error: unknown) => {
 							if (!loader.signal.aborted) {
@@ -1233,6 +1351,7 @@ export default function (pi: ExtensionAPI) {
 			const report = scanResult.report;
 			const codexQuota = scanResult.codexQuota;
 			const opencodeGoQuota = scanResult.opencodeGoQuota;
+			const deepSeekBalance = scanResult.deepSeekBalance;
 			const initialPeriod = periodFromArgs(args);
 			await ctx.ui.custom<void>(
 				(tui, theme, _keybindings, done) => {
@@ -1250,7 +1369,7 @@ export default function (pi: ExtensionAPI) {
 
 					return {
 						render(width: number): string[] {
-							return renderUsageTable(report, period, selectedIndex, startIndex, width, theme, codexQuota, opencodeGoQuota);
+							return renderUsageTable(report, period, selectedIndex, startIndex, width, theme, codexQuota, opencodeGoQuota, deepSeekBalance);
 						},
 						handleInput(data: string): void {
 							if (matchesKey(data, Key.escape) || matchesKey(data, Key.ctrl("c"))) {

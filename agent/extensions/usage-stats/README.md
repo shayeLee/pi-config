@@ -19,7 +19,7 @@ Pi usage 统计扩展，按 `provider/model` 汇总 Token 与费用。
 provider/model | tokens(M) | cost | hit% | input(M) | output(M) | cacheR(M) | cacheW(M)
 ```
 
-若当前已配置 `openai-codex`（ChatGPT OAuth）登录，面板顶部会额外显示对应的订阅额度；`opencode-go` 额度默认隐藏，可通过配置开启。未配置或请求失败时不显示。
+若当前已配置 `openai-codex`（ChatGPT OAuth）登录，面板顶部会额外显示对应的订阅额度；`opencode-go` 额度默认隐藏，可通过配置开启；DeepSeek API 余额也可通过配置开启。未配置或请求失败时不显示。
 
 `hit%` 是当前选定时间范围的累计缓存命中率：
 
@@ -38,15 +38,16 @@ cacheRead / (input + cacheRead + cacheWrite) × 100%
 
 ## 配置
 
-配置文件：`~/.pi/agent/usage-stats.json`。`opencode-go` 额度默认隐藏；如需显示，写入：
+配置文件：`~/.pi/agent/usage-stats.json`。额度和余额默认隐藏；如需显示，可写入：
 
 ```json
 {
-  "showOpenCodeGoQuota": true
+  "showOpenCodeGoQuota": false,
+  "showDeepSeekBalance": true
 }
 ```
 
-配置在每次打开 `/usage` 时读取，关闭时不会请求 OpenCode Go 额度接口，也不影响 `opencode-go` 的 Token/费用统计。
+配置在每次打开 `/usage` 时读取。关闭对应开关时不会请求相应接口，也不影响对应 provider 的 Token/费用统计。
 
 昨日按本地时区计算，统计区间为 `[昨日 00:00, 今日 00:00)`。
 
@@ -87,6 +88,23 @@ Codex quota (plus): 5h 58% left · resets 14:32  │  weekly 93% left · resets 
 - 绝不输出或持久化 access token、响应原文；面板仅显示窗口标签、百分比、重置时间与 plan type
 - 未登录、网络失败、超时（8s）、非 2xx 或解析失败时静默跳过该行，不影响现有统计与面板
 - 请求与扫描并行，不拖慢 `/usage` 打开速度；结果在内存中缓存 90 秒
+
+## DeepSeek API 账户余额
+
+该功能默认关闭，由 `~/.pi/agent/usage-stats.json` 中的 `showDeepSeekBalance` 控制。开启后，使用 Pi 已解析的 `deepseek` API key 请求官方余额接口：
+
+```text
+GET https://api.deepseek.com/user/balance
+Authorization: Bearer <DEEPSEEK_API_KEY>
+```
+
+响应中的 `balance_infos` 按币种显示总余额、赠送余额和充值余额，例如：
+
+```text
+DeepSeek balance: CNY ¥110.00 (granted ¥10.00 · topped-up ¥100.00) · available
+```
+
+接口失败、超时（8s）、非 2xx 或字段无效时，该行会静默隐藏，不影响现有 `/usage`。API key 和原始响应均不会显示或写入磁盘，结果只在内存缓存 90 秒。详情参见 [DeepSeek Get User Balance](https://api-docs.deepseek.com/zh-cn/api/get-user-balance)。
 
 ## OpenCode Go 订阅额度
 
