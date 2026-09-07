@@ -329,7 +329,35 @@ async function main() {
 		});
 	}
 
-	// 12. Agent keys are trimmed, so " worker " matches "worker".
+	// 12. both scope: a project override can configure a same-name user agent
+	// without requiring a project Markdown role.
+	{
+		const dir = path.join(tmpRoot, "both-fallback");
+		const agentsDir = path.join(dir, ".pi", "agents");
+		fs.mkdirSync(agentsDir, { recursive: true });
+		fs.writeFileSync(
+			path.join(agentsDir, "agents.override.json"),
+			JSON.stringify({ worker: { model: "project-fallback/provider", thinking: "high", tools: ["edit", "write"] } }),
+		);
+
+		const userCfg = path.join(tmpRoot, "user-cfg-fallback");
+		writeUserDir(userCfg);
+		withUserDir(userCfg, () => {
+			const { agents } = discoverAgents(dir, "both");
+			const w = agents.find((a) => a.name === "worker");
+			check("both-fallback: source remains user", w?.source === "user");
+			check("both-fallback: project model overrides user", w?.model === "project-fallback/provider", w?.model);
+			check("both-fallback: project thinking overrides user", w?.thinkingLevel === "high", w?.thinkingLevel);
+			check(
+				"both-fallback: project tools replace user",
+				w?.tools?.join(",") === "edit,write",
+				JSON.stringify(w?.tools),
+			);
+			check("both-fallback: user prompt preserved", w?.description === "user agent" && w?.systemPrompt === "user body");
+		});
+	}
+
+	// 13. Agent keys are trimmed, so " worker " matches "worker".
 	{
 		const dir = path.join(tmpRoot, "key-trim");
 		const agentsDir = writeProject(dir);

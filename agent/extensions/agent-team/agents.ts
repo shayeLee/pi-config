@@ -189,11 +189,20 @@ export function discoverAgents(cwd: string, scope: AgentScope): AgentDiscoveryRe
 
 	const userAgents = scope === "project" ? [] : loadAgentsFromDir(userDir, "user");
 	const projectAgents = scope === "user" || !projectAgentsDir ? [] : loadAgentsFromDir(projectAgentsDir, "project");
+	const projectOverrides = scope === "both" && projectAgentsDir
+		? loadOverridesFromDir(projectAgentsDir)
+		: new Map<string, AgentOverride>();
 
 	const agentMap = new Map<string, AgentConfig>();
 
 	if (scope === "both") {
-		for (const agent of userAgents) agentMap.set(agent.name, agent);
+		const projectAgentNames = new Set(projectAgents.map((agent) => agent.name));
+		for (const agent of userAgents) {
+			const effectiveAgent = projectAgentNames.has(agent.name)
+				? agent
+				: applyOverrides(agent, projectOverrides.get(agent.name));
+			agentMap.set(agent.name, effectiveAgent);
+		}
 		for (const agent of projectAgents) agentMap.set(agent.name, agent);
 	} else if (scope === "user") {
 		for (const agent of userAgents) agentMap.set(agent.name, agent);
