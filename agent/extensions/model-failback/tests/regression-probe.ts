@@ -108,7 +108,13 @@ function waitForTimers(): Promise<void> {
 }
 
 function engineHarness(
-  config: { chains?: string[][]; fallbacks: Record<string, string>; cooldownMs?: number; maxConsecutive?: number },
+  config: {
+    chains?: string[][];
+    fallbacks: Record<string, string>;
+    cooldownMs?: number;
+    maxConsecutive?: number;
+    autoRestore?: boolean;
+  },
   models: Array<{ provider: string; id: string }> = [],
   currentModel: { provider: string; id: string } = { provider: "openai-codex", id: "gpt-5.6-sol" },
   autoCompleteCompact = true,
@@ -206,6 +212,35 @@ async function runRegressionTests(): Promise<TestResult[]> {
     expect(verdict.scope === "cross-provider", `unexpected scope: ${verdict.scope}`);
   }));
 
+  results.push(await runTest("openai-codex resolves the conservative reset from shared usage fetch", async () => {
+    const originalFetch = globalThis.fetch;
+    const before = Date.now();
+    let requestedUrl = "";
+    globalThis.fetch = (async (url: string | URL | Request) => {
+      requestedUrl = String(url);
+      return {
+        ok: true,
+        json: async () => ({
+          rate_limit: {
+            primary_window: { used_percent: 100, reset_at: Math.floor((before + 10 * 60_000) / 1000) },
+            secondary_window: { used_percent: 100, reset_at: Math.floor((before + 2 * 60 * 60_000) / 1000) },
+          },
+        }),
+      } as Response;
+    }) as typeof fetch;
+    try {
+      const resetsAt = await openaiCodexHandler.resolveResetsAt?.(
+        { reason: "usage_limit", scope: "cross-provider" },
+        { getProviderAuth: async () => ({ auth: { apiKey: "test-access-token" } }) },
+      );
+      expect(requestedUrl === "https://chatgpt.com/backend-api/wham/usage", `unexpected quota URL: ${requestedUrl}`);
+      expect(resetsAt !== undefined, "shared Codex usage fetch did not produce a reset estimate");
+      expect(resetsAt! >= before + 119 * 60_000, "selected reset was earlier than the exhausted weekly window");
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  }));
+
   results.push(await runTest("opencode CreditsError is detected", () => {
     const verdict = opencodeHandler.inspect(
       assistantFailure(
@@ -247,6 +282,34 @@ async function runRegressionTests(): Promise<TestResult[]> {
     expect(typeof verdict.resetsAt === "number", "resetsAt was not populated");
     expect(verdict.resetsAt! >= before + (22 * 60 + 51) * 60_000, "resetsAt is too early");
     expect(verdict.resetsAt! <= Date.now() + (22 * 60 + 53) * 60_000, "resetsAt is too late");
+  }));
+
+  results.push(await runTest("opencode-go resolves reset only for a subscription usage limit", async () => {
+    const originalFetch = globalThis.fetch;
+    let fetches = 0;
+    globalThis.fetch = (async () => {
+      fetches += 1;
+      return {
+        ok: true,
+        json: async () => ({
+          usage: { weekly: { percent: 100, resetsAt: new Date(Date.now() + 60 * 60_000).toISOString() } },
+        }),
+      } as Response;
+    }) as typeof fetch;
+    try {
+      const resolver = { getProviderAuth: async () => ({ auth: { apiKey: "test-key" } }) };
+      const reset = await opencodeGoHandler.resolveResetsAt?.(
+        { reason: "usage_limit", scope: "cross-provider" }, resolver,
+      );
+      expect(typeof reset === "number", "Go usage endpoint did not produce a reset estimate");
+      const outageReset = await opencodeGoHandler.resolveResetsAt?.(
+        { reason: "endpoint_unavailable", scope: "cross-provider" }, resolver,
+      );
+      expect(outageReset === undefined, "endpoint outage must not be assigned a quota reset");
+      expect(fetches === 1, `endpoint outage unexpectedly queried quota (${fetches} requests)`);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
   }));
 
   results.push(await runTest("opencode-go 503 endpoint unavailable is detected", () => {
@@ -490,6 +553,66 @@ async function runRegressionTests(): Promise<TestResult[]> {
     await harness.emitAgentStart();
     expect(harness.state.chain.length === 0, "new agent run did not reset chain");
     expect(harness.state.consecutive === 0, "new agent run did not reset consecutive count");
+    expect(harness.state.original === null, "autoRestore=false must discard the old restore target on a new task");
+    expect(harness.state.resetsAt === undefined, "autoRestore=false must discard the old reset estimate on a new task");
+  }));
+
+  results.push(await runTest("autoRestore preserves the original snapshot until its deadline, then restores", async () => {
+    const source = { provider: "opencode", id: "gpt-5.6-sol" };
+    const fallback = { provider: "rightcode-codex", id: "gpt-5.6-sol" };
+    const harness = engineHarness(
+      { fallbacks: { "opencode/gpt-5.6-sol": "rightcode-codex/gpt-5.6-sol" }, autoRestore: true },
+      [source, fallback],
+      source,
+    );
+    await harness.emit(creditsFailure(source.provider, source.id));
+    harness.state.resetsAt = Date.now() + 60_000;
+    expect(harness.state.original?.provider === source.provider, "initial restore target was not retained");
+
+    await harness.emitAgentStart();
+    expect(harness.state.chain.length === 2, "steering continuation unexpectedly reset the failback chain");
+    await harness.emitAgentStart();
+    expect(harness.state.chain.length === 0, "new task did not clear the completed failback chain");
+    expect(harness.state.original?.provider === source.provider, "autoRestore lost the original model before its deadline");
+    expect(harness.pi.setModelCalls.length === 1, "autoRestore ran before the original deadline");
+
+    harness.state.resetsAt = Date.now() - 1;
+    (harness.ctx as { model: { provider: string; id: string } }).model = fallback;
+    await harness.emitAgentStart();
+    expect(harness.pi.setModelCalls.length === 2, "autoRestore did not switch back after the deadline");
+    expect((harness.pi.setModelCalls[1] as { provider: string }).provider === source.provider, "autoRestore selected the wrong model");
+    expect(harness.state.original === null && harness.state.resetsAt === undefined, "successful autoRestore did not clear its snapshot");
+  }));
+
+  results.push(await runTest("autoRestore keeps the first model deadline across a fallback chain", async () => {
+    const source = { provider: "openai-codex", id: "gpt-5.6-sol" };
+    const middle = { provider: "opencode-go", id: "deepseek-v4-flash" };
+    const target = { provider: "rightcode-codex", id: "gpt-5.6-sol" };
+    const harness = engineHarness(
+      {
+        chains: [["openai-codex/gpt-5.6-sol", "opencode-go/deepseek-v4-flash", "rightcode-codex/gpt-5.6-sol"]],
+        fallbacks: {},
+        autoRestore: true,
+      },
+      [source, middle, target],
+      source,
+    );
+    await harness.emit(assistantFailure(
+      source.provider,
+      source.id,
+      "You have hit your ChatGPT usage limit. Try again in ~34 min.",
+    ));
+    const originalDeadline = harness.state.resetsAt;
+    expect(originalDeadline !== undefined, "first model did not establish a restore deadline");
+    (harness.ctx as { model: { provider: string; id: string } }).model = middle;
+    await harness.emitAgentStart(); // Consume the steering continuation.
+    await harness.emit(assistantFailure(
+      middle.provider,
+      middle.id,
+      '429: {"type":"GoUsageLimitError","message":"Weekly usage limit reached. Resets in 1min."}',
+    ));
+    expect(harness.state.original?.provider === source.provider, "second fallback replaced the original restore target");
+    expect(harness.state.resetsAt === originalDeadline, "second fallback overwrote the original restore deadline");
   }));
 
   results.push(await runTest("engine retries compaction after terminal model failback", async () => {

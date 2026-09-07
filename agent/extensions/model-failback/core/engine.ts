@@ -149,15 +149,50 @@ export function createEngine(
 
   // 每个 agent-team child 都先在这里读取共享 ban，避免首个请求再次撞已耗尽模型。
   // 新用户请求开始时结束上一条连续 failback 链；steering continuation 保留链状态。
+  // autoRestore 的恢复快照必须跨新任务保留到真正到期，不能先被链清理抹掉。
   let continuationPending = false;
-  pi.on("agent_start", async () => {
-    if (!continuationPending && (state.chain.length > 0 || state.consecutive > 0)) {
+  pi.on("agent_start", async (_event, ctx: ExtensionContext) => {
+    const isSteeringContinuation = continuationPending;
+    continuationPending = false;
+    const autoRestoreEnabled = getConfig().autoRestore === true;
+
+    if (!isSteeringContinuation) {
       state.chain = [];
       state.consecutive = 0;
+      // 未开启 autoRestore 时保持既有语义：新任务不携带旧 failback 的恢复意图。
+      if (!autoRestoreEnabled) {
+        state.original = null;
+        state.resetsAt = undefined;
+      }
+    }
+
+    // 不在 failback 后的 steering continuation 中途切回，避免打断正在续跑的任务。
+    if (isSteeringContinuation || !autoRestoreEnabled || !state.original || !state.resetsAt) return;
+    if (Date.now() < state.resetsAt) return;
+
+    const current = ctx.model;
+    if (!current) return;
+    const currentKey = modelKey(current.provider, current.id);
+    const originalKey = modelKey(state.original.provider, state.original.model);
+    if (currentKey === originalKey) {
       state.original = null;
       state.resetsAt = undefined;
+      state.consecutive = 0;
+      state.chain = [];
+      return;
     }
-    continuationPending = false;
+    const originalModelObj = ctx.modelRegistry.find(
+      state.original.provider,
+      state.original.model,
+    );
+    if (!originalModelObj) return;
+    if (await pi.setModel(originalModelObj)) {
+      ctx.ui.notify(`[model-failback] 配额已恢复,切回 ${originalKey}`, "info");
+      state.original = null;
+      state.resetsAt = undefined;
+      state.consecutive = 0;
+      state.chain = [];
+    }
   });
 
   pi.on("session_start", async (_event, ctx: ExtensionContext) => {
@@ -218,6 +253,11 @@ export function createEngine(
     const verdict = handler.inspect(message);
     if (!verdict) return false;
 
+    // 错误文案通常不带倒计时；只对已确认的终态 best-effort 查询 provider
+    // 的额度窗口。查询最多等待共享获取器的 8 秒超时；失败保持未知但仍继续 failback。
+    const resetsAt = verdict.resetsAt
+      ?? await handler.resolveResetsAt?.(verdict, ctx.modelRegistry, ctx.signal);
+
     const sourceProvider = typeof provider === "string" ? provider : "unknown";
     const currentModel = (fail.model as string) ?? ctx.model?.id;
     if (typeof currentModel !== "string") return false;
@@ -231,14 +271,14 @@ export function createEngine(
         reason: verdict.reason,
         note: verdict.note,
         markedAt: Date.now(),
-        resetsAt: verdict.resetsAt,
+        resetsAt,
       });
       banRecorded = true;
       pi.appendEntry("model-failback-ban", {
         key: prevKey,
         reason: verdict.reason,
         scope: verdict.scope,
-        resetsAt: verdict.resetsAt,
+        resetsAt,
         at: Date.now(),
       });
     } catch {
@@ -282,21 +322,28 @@ export function createEngine(
     state.chain.push(target.target);
     state.consecutive += 1;
     state.lastFallbackAt = Date.now();
-    state.original ??= { provider: sourceProvider, model: currentModel };
-    if (verdict.resetsAt) state.resetsAt = verdict.resetsAt;
+    if (state.original === null) {
+      // original/resetsAt 是同一份“最初耗尽模型”的恢复快照。autoRestore
+      // 开启时绝不能被 B→C 的备用模型额度时间覆盖，否则会过早切回 A。
+      state.original = { provider: sourceProvider, model: currentModel };
+      state.resetsAt = resetsAt;
+    } else if (getConfig().autoRestore !== true && resetsAt) {
+      // 未开启自动恢复时保留既有 status 语义：展示最近一次终态的恢复估计。
+      state.resetsAt = resetsAt;
+    }
 
     pi.appendEntry("model-failback", {
       from: prevKey,
       to: target.target,
       reason: verdict.reason,
       banRecorded,
-      resetsAt: verdict.resetsAt,
+      resetsAt,
       at: Date.now(),
     });
 
     const failureReason = verdict.note ?? verdict.reason;
-    const restoreHint = verdict.resetsAt
-      ? `预计 ${new Date(verdict.resetsAt).toLocaleTimeString()} 恢复(/failback status 查看)`
+    const restoreHint = resetsAt
+      ? `预计 ${new Date(resetsAt).toLocaleTimeString()} 恢复(/failback status 查看)`
       : "";
     ctx.ui.notify(
       `⚠️ [model-failback] ${prevKey} 终态错误(${failureReason}) → 已切换 ${target.target}。${restoreHint}`,
@@ -413,37 +460,6 @@ export function createEngine(
     compactionRetryActive = true;
     const epoch = ++compactionRetryEpoch;
     await retryCompaction(failure, epoch);
-  });
-
-  // ---- 自动恢复:autoRestore 打开时,在每次 agent 启动检查配额是否已恢复 ----
-  pi.on("agent_start", async (_event, ctx: ExtensionContext) => {
-    const config = getConfig();
-    if (!config.autoRestore || !state.original || !state.resetsAt) return;
-    if (Date.now() < state.resetsAt) return;
-
-    const current = ctx.model;
-    if (!current) return;
-    const currentKey = modelKey(current.provider, current.id);
-    const originalKey = modelKey(state.original.provider, state.original.model);
-    if (currentKey === originalKey) {
-      state.original = null;
-      state.resetsAt = undefined;
-      state.consecutive = 0;
-      state.chain = [];
-      return;
-    }
-    const originalModelObj = ctx.modelRegistry.find(
-      state.original.provider,
-      state.original.model,
-    );
-    if (!originalModelObj) return;
-    if (await pi.setModel(originalModelObj)) {
-      ctx.ui.notify(`[model-failback] 配额已恢复,切回 ${originalKey}`, "info");
-      state.original = null;
-      state.resetsAt = undefined;
-      state.consecutive = 0;
-      state.chain = [];
-    }
   });
 
   return state;

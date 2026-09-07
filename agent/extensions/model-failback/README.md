@@ -36,7 +36,7 @@ message_end(assistant, error)
   → setModel(备用模型)→ 写入台账 → 通知 → steering 让 agent 继续当前任务
 ```
 
-`resetsAt` 从 pi 文案 "Try again in ~N min." 推算,记入台账;`autoRestore` 打开后,额度到点的下一次任务开始前自动切回原模型。
+`resetsAt` 优先从 pi 文案 `Try again in ~N min.` 推算。若文案未给出倒计时，`openai-codex` 会复用 `usage-stats` 的 ChatGPT/Codex 额度获取器（已解析 OAuth 鉴权、`GET /backend-api/wham/usage`、90 秒内存缓存、8 秒超时），仅在**已耗尽**的窗口中取最晚重置时刻；因此 5h 与 weekly 同时耗尽时不会过早恢复。`opencode-go` 的 `GoUsageLimitError` 同样会在缺失倒计时时查询官方 `/zen/go/v1/usage`；503 端点故障不会误填配额恢复时间。查询失败仍会照常 failback，只保留“未知”。`autoRestore` 打开后，额度到点的下一次任务开始前自动切回原模型。
 
 ## 工作原理(opencode)
 
@@ -105,7 +105,7 @@ message_end(assistant, error)
 
 | 命令 | 说明 |
 |---|---|
-| `/failback` | 状态:支持 providers、当前映射、跨子进程 ban、连续切换次数、切换链、原模型、配额恢复估计 |
+| `/failback` | 状态:支持 providers、当前映射、跨子进程 ban、连续切换次数、切换链、原模型、配额恢复估计；对已有但没有 `resetsAt` 的 Codex / OpenCode Go usage-limit ban，会即时复用 `usage-stats` 的额度接口补查展示，不改写历史 ban |
 | `/failback restore` | 强制切回 failback 前的原模型，并清空当前链状态；不会被 ban 重定向立即撤销 |
 | `/failback unban <provider/model>` | 解除一个精确模型 ban；`all` 清除全部 ban |
 | `/failback reset` | 清空会话状态与全部 ban |

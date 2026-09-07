@@ -279,9 +279,9 @@ interface ScanResult {
 	report?: UsageReport;
 	error?: string;
 	/** OpenAI Codex subscription quota from the ChatGPT usage endpoint, when resolvable. */
-	codexQuota?: CodexQuotaInfo;
+	codexQuota?: SubscriptionQuotaInfo;
 	/** OpenCode Go subscription quota from its official usage endpoint, when resolvable. */
-	opencodeGoQuota?: OpenCodeGoQuotaInfo;
+	opencodeGoQuota?: SubscriptionQuotaInfo;
 	/** DeepSeek API account balance from its official balance endpoint, when resolvable. */
 	deepSeekBalance?: DeepSeekBalanceInfo;
 }
@@ -370,22 +370,26 @@ const OPENAI_CODEX_USAGE_PATH = "/wham/usage";
 const OPENAI_CODEX_REQUEST_TIMEOUT_MS = 8_000;
 const OPENAI_CODEX_QUOTA_CACHE_MS = 90_000;
 
-interface CodexQuotaWindow {
+/**
+ * 订阅额度窗口。导出给 model-failback 复用同一份 endpoint、鉴权与解析逻辑，
+ * 调用方只能取得已解析的额度/重置时间，无法取得 access token 或原始响应。
+ */
+export interface SubscriptionQuotaWindow {
 	label: string;
 	percent: number;
 	resetsAt?: Date;
 }
 
-interface CodexQuotaInfo {
+export interface SubscriptionQuotaInfo {
 	planType?: string;
-	windows: CodexQuotaWindow[];
+	windows: SubscriptionQuotaWindow[];
 }
 
-let codexQuotaInFlight: Promise<CodexQuotaInfo | undefined> | undefined;
-let codexQuotaCached: { at: number; value: CodexQuotaInfo | undefined } | undefined;
+let codexQuotaInFlight: Promise<SubscriptionQuotaInfo | undefined> | undefined;
+let codexQuotaCached: { at: number; value: SubscriptionQuotaInfo | undefined } | undefined;
 
-/** Minimal structural view of the model registry auth resolution used by the quota fetch. */
-interface CodexAuthResolver {
+/** Minimal structural view of the model registry auth resolution used by quota fetches. */
+export interface SubscriptionQuotaAuthResolver {
 	getProviderAuth(provider: string): Promise<{ auth?: { apiKey?: string; baseUrl?: string } } | undefined>;
 }
 
@@ -436,7 +440,7 @@ function minutesLabel(minutes: number): string {
 	return `${Math.floor(minutes / 60)}h ${Math.round(minutes % 60)}m`;
 }
 
-function parseCodexWindow(value: unknown, fallbackLabel: string, fallbackMinutes: number | undefined): CodexQuotaWindow | undefined {
+function parseCodexWindow(value: unknown, fallbackLabel: string, fallbackMinutes: number | undefined): SubscriptionQuotaWindow | undefined {
 	if (!value || typeof value !== "object") return undefined;
 	const record = value as Record<string, unknown>;
 	const percent = windowPercent(record);
@@ -449,10 +453,10 @@ function parseCodexWindow(value: unknown, fallbackLabel: string, fallbackMinutes
 	};
 }
 
-function parseCodexQuota(json: unknown): CodexQuotaInfo | undefined {
+function parseCodexQuota(json: unknown): SubscriptionQuotaInfo | undefined {
 	if (!json || typeof json !== "object") return undefined;
 	const root = json as Record<string, unknown>;
-	const windows: CodexQuotaWindow[] = [];
+	const windows: SubscriptionQuotaWindow[] = [];
 
 	// Current ChatGPT usage endpoint shape: rate_limit.primary/secondary_window.
 	const rateLimit = root.rate_limit;
@@ -501,7 +505,7 @@ function chatgptAccountIdFromAccessToken(accessToken: string): string | undefine
 	}
 }
 
-async function fetchOpenAICodexQuota(resolver: CodexAuthResolver, signal?: AbortSignal): Promise<CodexQuotaInfo | undefined> {
+async function fetchOpenAICodexQuota(resolver: SubscriptionQuotaAuthResolver, signal?: AbortSignal): Promise<SubscriptionQuotaInfo | undefined> {
 	try {
 		const authResult = await resolver.getProviderAuth(OPENAI_CODEX_PROVIDER_ID);
 		const accessToken = authResult?.auth?.apiKey;
@@ -534,7 +538,14 @@ async function fetchOpenAICodexQuota(resolver: CodexAuthResolver, signal?: Abort
 	}
 }
 
-async function getCodexQuota(resolver: CodexAuthResolver, signal?: AbortSignal): Promise<CodexQuotaInfo | undefined> {
+/**
+ * 获取 ChatGPT/Codex 账户的订阅窗口；结果只保存在内存 90 秒。
+ * 供 /usage 和 model-failback 共用，失败时返回 undefined，绝不抛出凭据或响应内容。
+ */
+export async function getOpenAICodexQuota(
+	resolver: SubscriptionQuotaAuthResolver,
+	signal?: AbortSignal,
+): Promise<SubscriptionQuotaInfo | undefined> {
 	const cached = codexQuotaCached;
 	if (cached && Date.now() - cached.at < OPENAI_CODEX_QUOTA_CACHE_MS) return cached.value;
 	if (!codexQuotaInFlight) {
@@ -561,7 +572,7 @@ function formatResetTime(date: Date): string {
 	return `${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")} ${hhmm}`;
 }
 
-function renderCodexQuotaLines(quota: CodexQuotaInfo, width: number, theme: any): string[] {
+function renderCodexQuotaLines(quota: SubscriptionQuotaInfo, width: number, theme: any): string[] {
 	const innerWidth = Math.max(1, width - 2);
 	const planType = quota.planType ? ` (${quota.planType})` : "";
 	const parts = quota.windows.map((window) => {
@@ -577,25 +588,15 @@ function renderCodexQuotaLines(quota: CodexQuotaInfo, width: number, theme: any)
 const OPENCODE_GO_PROVIDER_ID = "opencode-go";
 const OPENCODE_GO_USAGE_URL = "https://opencode.ai/zen/go/v1/usage";
 
-interface OpenCodeGoQuotaWindow {
-	label: string;
-	percent: number;
-	resetsAt?: Date;
-}
+let openCodeGoQuotaInFlight: Promise<SubscriptionQuotaInfo | undefined> | undefined;
+let openCodeGoQuotaCached: { at: number; value: SubscriptionQuotaInfo | undefined } | undefined;
 
-interface OpenCodeGoQuotaInfo {
-	windows: OpenCodeGoQuotaWindow[];
-}
-
-let openCodeGoQuotaInFlight: Promise<OpenCodeGoQuotaInfo | undefined> | undefined;
-let openCodeGoQuotaCached: { at: number; value: OpenCodeGoQuotaInfo | undefined } | undefined;
-
-function parseOpenCodeGoQuota(json: unknown): OpenCodeGoQuotaInfo | undefined {
+function parseOpenCodeGoQuota(json: unknown): SubscriptionQuotaInfo | undefined {
 	if (!json || typeof json !== "object") return undefined;
 	const usage = (json as Record<string, unknown>).usage;
 	if (!usage || typeof usage !== "object") return undefined;
 	const records = usage as Record<string, unknown>;
-	const windows: OpenCodeGoQuotaWindow[] = [];
+	const windows: SubscriptionQuotaWindow[] = [];
 	for (const [key, label] of [["rolling", "5h"], ["weekly", "weekly"], ["monthly", "monthly"]] as const) {
 		const value = records[key];
 		if (!value || typeof value !== "object") continue;
@@ -611,7 +612,7 @@ function parseOpenCodeGoQuota(json: unknown): OpenCodeGoQuotaInfo | undefined {
 	return windows.length > 0 ? { windows } : undefined;
 }
 
-async function fetchOpenCodeGoQuota(resolver: CodexAuthResolver, signal?: AbortSignal): Promise<OpenCodeGoQuotaInfo | undefined> {
+async function fetchOpenCodeGoQuota(resolver: SubscriptionQuotaAuthResolver, signal?: AbortSignal): Promise<SubscriptionQuotaInfo | undefined> {
 	try {
 		const authResult = await resolver.getProviderAuth(OPENCODE_GO_PROVIDER_ID);
 		const apiKey = authResult?.auth?.apiKey;
@@ -637,7 +638,11 @@ async function fetchOpenCodeGoQuota(resolver: CodexAuthResolver, signal?: AbortS
 	}
 }
 
-async function getOpenCodeGoQuota(resolver: CodexAuthResolver, signal?: AbortSignal): Promise<OpenCodeGoQuotaInfo | undefined> {
+/** 获取 OpenCode Go 账户的订阅窗口；失败时静默返回 undefined。 */
+export async function getOpenCodeGoQuota(
+	resolver: SubscriptionQuotaAuthResolver,
+	signal?: AbortSignal,
+): Promise<SubscriptionQuotaInfo | undefined> {
 	const cached = openCodeGoQuotaCached;
 	if (cached && Date.now() - cached.at < OPENAI_CODEX_QUOTA_CACHE_MS) return cached.value;
 	if (!openCodeGoQuotaInFlight) {
@@ -653,7 +658,7 @@ async function getOpenCodeGoQuota(resolver: CodexAuthResolver, signal?: AbortSig
 	return openCodeGoQuotaInFlight;
 }
 
-function renderOpenCodeGoQuotaLines(quota: OpenCodeGoQuotaInfo, width: number, theme: any): string[] {
+function renderOpenCodeGoQuotaLines(quota: SubscriptionQuotaInfo, width: number, theme: any): string[] {
 	const innerWidth = Math.max(1, width - 2);
 	const parts = quota.windows.map((window) => {
 		const reset = window.resetsAt ? ` · resets ${formatResetTime(window.resetsAt)}` : "";
@@ -708,7 +713,7 @@ function parseDeepSeekBalance(json: unknown): DeepSeekBalanceInfo | undefined {
 	};
 }
 
-async function fetchDeepSeekBalance(resolver: CodexAuthResolver, signal?: AbortSignal): Promise<DeepSeekBalanceInfo | undefined> {
+async function fetchDeepSeekBalance(resolver: SubscriptionQuotaAuthResolver, signal?: AbortSignal): Promise<DeepSeekBalanceInfo | undefined> {
 	try {
 		const authResult = await resolver.getProviderAuth(DEEPSEEK_PROVIDER_ID);
 		const apiKey = authResult?.auth?.apiKey;
@@ -735,7 +740,7 @@ async function fetchDeepSeekBalance(resolver: CodexAuthResolver, signal?: AbortS
 	}
 }
 
-async function getDeepSeekBalance(resolver: CodexAuthResolver, signal?: AbortSignal): Promise<DeepSeekBalanceInfo | undefined> {
+async function getDeepSeekBalance(resolver: SubscriptionQuotaAuthResolver, signal?: AbortSignal): Promise<DeepSeekBalanceInfo | undefined> {
 	const cached = deepSeekBalanceCached;
 	if (cached && Date.now() - cached.at < OPENAI_CODEX_QUOTA_CACHE_MS) return cached.value;
 	if (!deepSeekBalanceInFlight) {
@@ -1164,8 +1169,8 @@ function renderUsageTable(
 	startIndex: number,
 	width: number,
 	theme: any,
-	codexQuota?: CodexQuotaInfo,
-	openCodeGoQuota?: OpenCodeGoQuotaInfo,
+	codexQuota?: SubscriptionQuotaInfo,
+	openCodeGoQuota?: SubscriptionQuotaInfo,
 	deepSeekBalance?: DeepSeekBalanceInfo,
 ): string[] {
 	const innerWidth = Math.max(1, width - 2);
@@ -1317,7 +1322,7 @@ export default function (pi: ExtensionAPI) {
 								? { path: ctx.sessionManager.getSessionFile()!, id: ctx.sessionManager.getSessionId() }
 								: undefined,
 						),
-						getCodexQuota(ctx.modelRegistry, loader.signal),
+						getOpenAICodexQuota(ctx.modelRegistry, loader.signal),
 						usageStatsConfig.showOpenCodeGoQuota === true
 							? getOpenCodeGoQuota(ctx.modelRegistry, loader.signal)
 							: Promise.resolve(undefined),

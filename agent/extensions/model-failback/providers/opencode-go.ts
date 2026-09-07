@@ -1,3 +1,4 @@
+import { getOpenCodeGoQuota } from "../../usage-stats";
 import type { ProviderFailbackHandler } from "./types";
 import { createOpencodeCreditsHandler } from "./opencode";
 
@@ -33,8 +34,23 @@ function isGoUsageLimit(text: string): boolean {
   return /\bGoUsageLimitError\b/i.test(text) && /usage\s+limit\s+reached/i.test(text);
 }
 
+async function resolveGoResetsAt(
+  verdict: Parameters<NonNullable<ProviderFailbackHandler["resolveResetsAt"]>>[0],
+  resolver: Parameters<NonNullable<ProviderFailbackHandler["resolveResetsAt"]>>[1],
+  signal?: AbortSignal,
+): Promise<number | undefined> {
+  // 503 端点故障没有额度恢复语义，不能借账户窗口制造错误的恢复承诺。
+  if (verdict.reason !== "usage_limit") return undefined;
+  const quota = await getOpenCodeGoQuota(resolver, signal);
+  const resets = quota?.windows
+    .filter((window) => window.percent >= 100 && window.resetsAt && window.resetsAt.getTime() > Date.now())
+    .map((window) => window.resetsAt!.getTime()) ?? [];
+  return resets.length > 0 ? Math.max(...resets) : undefined;
+}
+
 export const opencodeGoHandler: ProviderFailbackHandler = {
   providerId: "opencode-go",
+  resolveResetsAt: resolveGoResetsAt,
 
   inspect(message: unknown) {
     const creditsVerdict = creditsHandler.inspect(message);

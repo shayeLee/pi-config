@@ -27,8 +27,22 @@ export interface TerminalVerdict {
  * Provider 终态判定 handler。
  * message 为失败消息的原样对象(结构化、可选链读取,勿信任任何字段存在)。
  */
+/** model registry 中解析后的最小鉴权能力；不暴露或持久化凭据。 */
+export interface ProviderAuthResolver {
+  getProviderAuth(provider: string): Promise<{ auth?: { apiKey?: string; baseUrl?: string } } | undefined>;
+}
+
 export interface ProviderFailbackHandler {
   providerId: string;
   /** 返回 null = 与该 handler 无关或非终态;返回 verdict = 需要 failback */
   inspect(message: unknown): TerminalVerdict | null;
+  /**
+   * 当错误文本没有恢复时间时，best-effort 查询账户额度窗口。
+   * 仅在已确认终态后由引擎调用；失败返回 undefined，绝不阻断 failback。
+   */
+  resolveResetsAt?(
+    verdict: TerminalVerdict,
+    resolver: ProviderAuthResolver,
+    signal?: AbortSignal,
+  ): Promise<number | undefined>;
 }

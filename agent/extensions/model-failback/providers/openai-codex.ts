@@ -14,6 +14,7 @@
  * 共享同一配额,切换毫无意义,必须跨 provider。
  */
 
+import { getOpenAICodexQuota } from "../../usage-stats";
 import type { ProviderFailbackHandler, TerminalVerdict } from "./types";
 
 /** 从 pi 归一文案 "Try again in ~N min." 推算恢复时刻 */
@@ -41,8 +42,25 @@ function asAssistant(message: unknown): AssistantLike | null {
   return m;
 }
 
+/**
+ * 只在已耗尽的窗口中取最晚重置时刻：5h 与 weekly 同时用尽时，不能因 5h
+ * 先恢复就误判账户可用。额度接口异常、快照尚未达到 100% 时保持未知。
+ */
+async function resolveCodexResetsAt(
+  _verdict: Parameters<NonNullable<ProviderFailbackHandler["resolveResetsAt"]>>[0],
+  resolver: Parameters<NonNullable<ProviderFailbackHandler["resolveResetsAt"]>>[1],
+  signal?: AbortSignal,
+): Promise<number | undefined> {
+  const quota = await getOpenAICodexQuota(resolver, signal);
+  const resets = quota?.windows
+    .filter((window) => window.percent >= 100 && window.resetsAt && window.resetsAt.getTime() > Date.now())
+    .map((window) => window.resetsAt!.getTime()) ?? [];
+  return resets.length > 0 ? Math.max(...resets) : undefined;
+}
+
 export const openaiCodexHandler: ProviderFailbackHandler = {
   providerId: "openai-codex",
+  resolveResetsAt: resolveCodexResetsAt,
 
   inspect(message: unknown): TerminalVerdict | null {
     const msg = asAssistant(message);
