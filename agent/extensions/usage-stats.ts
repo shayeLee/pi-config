@@ -16,6 +16,7 @@ const PERIODS: readonly Period[] = ["day", "yesterday", "week", "month", "all"];
 const UNKNOWN_MODEL = { provider: "unknown", model: "unknown" };
 
 interface UsageStatsConfig {
+	showCommandCodeQuota?: boolean;
 	showOpenCodeGoQuota?: boolean;
 	showDeepSeekBalance?: boolean;
 }
@@ -26,6 +27,7 @@ async function readUsageStatsConfig(): Promise<UsageStatsConfig> {
 		if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
 		const values = parsed as Record<string, unknown>;
 		const config: UsageStatsConfig = {};
+		if (typeof values.showCommandCodeQuota === "boolean") config.showCommandCodeQuota = values.showCommandCodeQuota;
 		if (typeof values.showOpenCodeGoQuota === "boolean") config.showOpenCodeGoQuota = values.showOpenCodeGoQuota;
 		if (typeof values.showDeepSeekBalance === "boolean") config.showDeepSeekBalance = values.showDeepSeekBalance;
 		return config;
@@ -288,6 +290,8 @@ interface ScanResult {
 	error?: string;
 	/** OpenAI Codex subscription quota from the ChatGPT usage endpoint, when resolvable. */
 	codexQuota?: SubscriptionQuotaInfo;
+	/** Command Code credits and rolling quota windows, when resolvable. */
+	commandCodeQuota?: CommandCodeQuotaInfo;
 	/** OpenCode Go subscription quota from its official usage endpoint, when resolvable. */
 	opencodeGoQuota?: SubscriptionQuotaInfo;
 	/** DeepSeek API account balance from its official balance endpoint, when resolvable. */
@@ -673,6 +677,143 @@ function renderOpenCodeGoQuotaLines(quota: SubscriptionQuotaInfo, width: number,
 		return `${window.label} ${Math.round(100 - window.percent)}% left${reset}`;
 	});
 	return [truncateToWidth(theme.fg("accent", `OpenCode Go quota: ${parts.join("  │  ")}`), innerWidth, "")];
+}
+
+// --- Command Code subscription quota ---
+// Command Code documents /usage in its own CLI, but does not publish a quota API.
+// These alpha endpoints are the ones used by that CLI; keep this opt-in and
+// best-effort so a schema or endpoint change simply hides this line.
+
+const COMMAND_CODE_PROVIDER_ID = "command-code";
+const COMMAND_CODE_API_BASE_URL = "https://api.commandcode.ai";
+
+interface CommandCodeQuotaInfo {
+	planId?: string;
+	remainingCredits?: number;
+	windows: SubscriptionQuotaWindow[];
+}
+
+let commandCodeQuotaInFlight: Promise<CommandCodeQuotaInfo | undefined> | undefined;
+let commandCodeQuotaCached: { at: number; value: CommandCodeQuotaInfo | undefined } | undefined;
+
+function commandCodeResetTime(value: unknown): Date | undefined {
+	const number = numericValue(value);
+	if (number !== undefined) {
+		const date = new Date(number < 1e12 ? number * 1000 : number);
+		return Number.isNaN(date.getTime()) ? undefined : date;
+	}
+	if (typeof value !== "string" || value.trim() === "") return undefined;
+	const parsed = Date.parse(value);
+	return Number.isNaN(parsed) ? undefined : new Date(parsed);
+}
+
+function commandCodePlanId(value: unknown): string | undefined {
+	return typeof value === "string" && /^[A-Za-z0-9_. -]{1,60}$/.test(value) ? value : undefined;
+}
+
+function parseCommandCodeQuota(creditsJson: unknown, subscriptionJson: unknown): CommandCodeQuotaInfo | undefined {
+	const root = creditsJson && typeof creditsJson === "object" ? creditsJson as Record<string, unknown> : undefined;
+	const credits = root?.credits && typeof root.credits === "object" ? root.credits as Record<string, unknown> : undefined;
+	const windowsRoot = root?.windowLimits && typeof root.windowLimits === "object"
+		? root.windowLimits as Record<string, unknown>
+		: undefined;
+	const windows: SubscriptionQuotaWindow[] = [];
+	for (const [key, label] of [["fiveHour", "5h"], ["weekly", "weekly"]] as const) {
+		const window = windowsRoot?.[key];
+		if (!window || typeof window !== "object") continue;
+		const values = window as Record<string, unknown>;
+		const used = numericValue(values.used);
+		const cap = numericValue(values.cap);
+		if (used === undefined || cap === undefined || cap <= 0) continue;
+		windows.push({
+			label,
+			percent: Math.max(0, Math.min(100, (used / cap) * 100)),
+			resetsAt: commandCodeResetTime(values.resetAt ?? values.reset_at),
+		});
+	}
+
+	const creditValues = credits
+		? [credits.monthlyCredits, credits.purchasedCredits, credits.freeCredits].map(numericValue)
+		: [];
+	const remainingCredits = creditValues.some((value) => value !== undefined)
+		? creditValues.reduce((total, value) => total + (value ?? 0), 0)
+		: undefined;
+	const subscription = subscriptionJson && typeof subscriptionJson === "object"
+		? (subscriptionJson as Record<string, unknown>).data
+		: undefined;
+	const planId = subscription && typeof subscription === "object"
+		? commandCodePlanId((subscription as Record<string, unknown>).planId)
+		: undefined;
+	return remainingCredits === undefined && windows.length === 0 ? undefined : { planId, remainingCredits, windows };
+}
+
+async function fetchCommandCodeQuota(resolver: SubscriptionQuotaAuthResolver, signal?: AbortSignal): Promise<CommandCodeQuotaInfo | undefined> {
+	try {
+		const authResult = await resolver.getProviderAuth(COMMAND_CODE_PROVIDER_ID);
+		const apiKey = authResult?.auth?.apiKey;
+		if (!apiKey) return undefined;
+		const controller = new AbortController();
+		const onAbort = () => controller.abort();
+		signal?.addEventListener("abort", onAbort, { once: true });
+		const timer = setTimeout(() => controller.abort(), OPENAI_CODEX_REQUEST_TIMEOUT_MS);
+		try {
+			const request = async (path: string) => {
+				const response = await fetch(`${COMMAND_CODE_API_BASE_URL}${path}`, {
+					headers: { Authorization: `Bearer ${apiKey}`, Accept: "application/json" },
+					signal: controller.signal,
+				});
+				return response.ok ? response.json() as Promise<unknown> : undefined;
+			};
+			const whoami = await request("/alpha/whoami");
+			if (!whoami || typeof whoami !== "object") return undefined;
+			const org = (whoami as Record<string, unknown>).org;
+			const orgId = org && typeof org === "object" && typeof (org as Record<string, unknown>).id === "string"
+				? (org as Record<string, unknown>).id
+				: undefined;
+			const query = orgId ? `?orgId=${encodeURIComponent(orgId)}` : "";
+			const [credits, subscription] = await Promise.all([
+				request(`/alpha/billing/credits${query}`),
+				request(`/alpha/billing/subscriptions${query}`),
+			]);
+			return parseCommandCodeQuota(credits, subscription);
+		} finally {
+			clearTimeout(timer);
+			signal?.removeEventListener("abort", onAbort);
+		}
+	} catch {
+		return undefined;
+	}
+}
+
+async function getCommandCodeQuota(
+	resolver: SubscriptionQuotaAuthResolver,
+	signal?: AbortSignal,
+): Promise<CommandCodeQuotaInfo | undefined> {
+	const cached = commandCodeQuotaCached;
+	if (cached && Date.now() - cached.at < OPENAI_CODEX_QUOTA_CACHE_MS) return cached.value;
+	if (!commandCodeQuotaInFlight) {
+		commandCodeQuotaInFlight = fetchCommandCodeQuota(resolver, signal)
+			.then((value) => {
+				if (!signal?.aborted) commandCodeQuotaCached = { at: Date.now(), value };
+				return value;
+			})
+			.finally(() => {
+				commandCodeQuotaInFlight = undefined;
+			});
+	}
+	return commandCodeQuotaInFlight;
+}
+
+function renderCommandCodeQuotaLines(quota: CommandCodeQuotaInfo, width: number, theme: any): string[] {
+	const innerWidth = Math.max(1, width - 2);
+	const plan = quota.planId ? ` (${quota.planId})` : "";
+	const parts: string[] = [];
+	if (quota.remainingCredits !== undefined) parts.push(`credits ${quota.remainingCredits.toFixed(2)} remaining`);
+	for (const window of quota.windows) {
+		const reset = window.resetsAt ? ` · resets ${formatResetTime(window.resetsAt)}` : "";
+		parts.push(`${window.label} ${Math.round(100 - window.percent)}% left${reset}`);
+	}
+	return [truncateToWidth(theme.fg("accent", `Command Code quota${plan}: ${parts.join("  │  ")}`), innerWidth, "")];
 }
 
 // --- DeepSeek API account balance ---
@@ -1233,6 +1374,7 @@ function renderUsageTable(
 	codexQuota?: SubscriptionQuotaInfo,
 	openCodeGoQuota?: SubscriptionQuotaInfo,
 	deepSeekBalance?: DeepSeekBalanceInfo,
+	commandCodeQuota?: CommandCodeQuotaInfo,
 ): string[] {
 	const innerWidth = Math.max(1, width - 2);
 	const metricWidths = [11, 10, 8, 10, 10, 10, 10];
@@ -1261,6 +1403,7 @@ function renderUsageTable(
 	if (codexQuota) lines.push(...renderCodexQuotaLines(codexQuota, width, theme));
 	if (openCodeGoQuota) lines.push(...renderOpenCodeGoQuotaLines(openCodeGoQuota, width, theme));
 	if (deepSeekBalance) lines.push(...renderDeepSeekBalanceLines(deepSeekBalance, width, theme));
+	if (commandCodeQuota) lines.push(...renderCommandCodeQuotaLines(commandCodeQuota, width, theme));
 	const headerCells = ["provider/model", "tokens(M)", "cost", "hit%", "input(M)", "output(M)", "cacheR(M)", "cacheW(M)"];
 	const header = headerCells
 		.map((cell, index) => {
@@ -1343,6 +1486,7 @@ function renderSessionTable(
 	codexQuota?: SubscriptionQuotaInfo,
 	openCodeGoQuota?: SubscriptionQuotaInfo,
 	deepSeekBalance?: DeepSeekBalanceInfo,
+	commandCodeQuota?: CommandCodeQuotaInfo,
 ): string[] {
 	const innerWidth = Math.max(1, width - 2);
 	const metricWidths = [11, 10, 8, 10, 10, 10, 10];
@@ -1361,6 +1505,7 @@ function renderSessionTable(
 	if (codexQuota) lines.push(...renderCodexQuotaLines(codexQuota, width, theme));
 	if (openCodeGoQuota) lines.push(...renderOpenCodeGoQuotaLines(openCodeGoQuota, width, theme));
 	if (deepSeekBalance) lines.push(...renderDeepSeekBalanceLines(deepSeekBalance, width, theme));
+	if (commandCodeQuota) lines.push(...renderCommandCodeQuotaLines(commandCodeQuota, width, theme));
 	if (session) {
 		const subagentText = session.subagentRecords > 0
 			? ` · subagents ${formatTokens(totalTokens(session.subagents))}, ${formatCost(session.subagents.cost)} (${session.subagentRecords} records)`
@@ -1462,6 +1607,9 @@ export default function (pi: ExtensionAPI) {
 								: undefined,
 						),
 						getOpenAICodexQuota(ctx.modelRegistry, loader.signal),
+						usageStatsConfig.showCommandCodeQuota === true
+							? getCommandCodeQuota(ctx.modelRegistry, loader.signal)
+							: Promise.resolve(undefined),
 						usageStatsConfig.showOpenCodeGoQuota === true
 							? getOpenCodeGoQuota(ctx.modelRegistry, loader.signal)
 							: Promise.resolve(undefined),
@@ -1469,8 +1617,8 @@ export default function (pi: ExtensionAPI) {
 							? getDeepSeekBalance(ctx.modelRegistry, loader.signal)
 							: Promise.resolve(undefined),
 					])
-						.then(([report, codexQuota, opencodeGoQuota, deepSeekBalance]) => {
-							if (!loader.signal.aborted) done({ report, codexQuota, opencodeGoQuota, deepSeekBalance });
+						.then(([report, codexQuota, commandCodeQuota, opencodeGoQuota, deepSeekBalance]) => {
+							if (!loader.signal.aborted) done({ report, codexQuota, commandCodeQuota, opencodeGoQuota, deepSeekBalance });
 						})
 						.catch((error: unknown) => {
 							if (!loader.signal.aborted) {
@@ -1496,6 +1644,7 @@ export default function (pi: ExtensionAPI) {
 			const codexQuota = scanResult.codexQuota;
 			const opencodeGoQuota = scanResult.opencodeGoQuota;
 			const deepSeekBalance = scanResult.deepSeekBalance;
+			const commandCodeQuota = scanResult.commandCodeQuota;
 			const initialPeriod = periodFromArgs(args);
 			await ctx.ui.custom<void>(
 				(tui, theme, _keybindings, done) => {
@@ -1518,8 +1667,8 @@ export default function (pi: ExtensionAPI) {
 					return {
 						render(width: number): string[] {
 							return view === "overview"
-								? renderUsageTable(report, period, selectedIndex, startIndex, width, theme, codexQuota, opencodeGoQuota, deepSeekBalance)
-								: renderSessionTable(report, sessionRows, selectedIndex, startIndex, width, theme, codexQuota, opencodeGoQuota, deepSeekBalance);
+								? renderUsageTable(report, period, selectedIndex, startIndex, width, theme, codexQuota, opencodeGoQuota, deepSeekBalance, commandCodeQuota)
+								: renderSessionTable(report, sessionRows, selectedIndex, startIndex, width, theme, codexQuota, opencodeGoQuota, deepSeekBalance, commandCodeQuota);
 						},
 						handleInput(data: string): void {
 							if (matchesKey(data, Key.escape) || matchesKey(data, Key.ctrl("c"))) {

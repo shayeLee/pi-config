@@ -19,7 +19,7 @@ Pi usage 统计扩展，按 `provider/model` 汇总 Token 与费用。
 provider/model | tokens(M) | cost | hit% | input(M) | output(M) | cacheR(M) | cacheW(M)
 ```
 
-若当前已配置 `openai-codex`（ChatGPT OAuth）登录，面板顶部会额外显示对应的订阅额度；`opencode-go` 额度默认隐藏，可通过配置开启；DeepSeek API 余额也可通过配置开启。未配置或请求失败时不显示。
+若当前已配置 `openai-codex`（ChatGPT OAuth）登录，面板顶部会额外显示对应的订阅额度；`command-code`、`opencode-go` 额度与 DeepSeek API 余额默认隐藏，可通过配置开启。未配置或请求失败时不显示。
 
 `hit%` 是当前选定时间范围的累计缓存命中率：
 
@@ -43,6 +43,7 @@ cacheRead / (input + cacheRead + cacheWrite) × 100%
 
 ```json
 {
+  "showCommandCodeQuota": true,
   "showOpenCodeGoQuota": false,
   "showDeepSeekBalance": true
 }
@@ -91,6 +92,25 @@ Codex quota (plus): 5h 58% left · resets 14:32  │  weekly 93% left · resets 
 - 绝不输出或持久化 access token、响应原文；面板仅显示窗口标签、百分比、重置时间与 plan type
 - 未登录、网络失败、超时（8s）、非 2xx 或解析失败时静默跳过该行，不影响现有统计与面板
 - 请求与扫描并行，不拖慢 `/usage` 打开速度；结果在内存中缓存 90 秒
+
+## Command Code 订阅额度
+
+该功能默认关闭，由 `~/.pi/agent/usage-stats.json` 中的 `showCommandCodeQuota` 控制。开启后，扩展使用 Pi 已解析的 `command-code` API key，读取 Command Code CLI `/usage` 所使用的**非公开 alpha 接口**：
+
+```text
+GET https://api.commandcode.ai/alpha/whoami
+GET https://api.commandcode.ai/alpha/billing/credits?orgId=<optional>
+GET https://api.commandcode.ai/alpha/billing/subscriptions?orgId=<optional>
+Authorization: Bearer <COMMAND_CODE_API_KEY>
+```
+
+面板显示订阅计划、可用 credits，以及 5 小时和周滚动窗口的剩余百分比与重置时间，例如：
+
+```text
+Command Code quota (individual-goat): credits 52.13 remaining  │  5h 68% left · resets 14:32  │  weekly 59% left · resets 09-08 00:00
+```
+
+该接口不是 Command Code 对外承诺的 API，字段或路径可能变动。因此请求仅在打开 `/usage` 时发起、结果只在内存缓存 90 秒；未配置、超时（8 秒）、非 2xx 或响应结构变化时会静默隐藏该行，不影响其他统计。API key 和原始响应绝不显示或持久化。`credits` 为服务端返回的 monthly、purchased、free credits 合计；不把它视为月度额度上限。
 
 ## DeepSeek API 账户余额
 
