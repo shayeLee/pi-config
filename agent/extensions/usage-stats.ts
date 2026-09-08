@@ -1340,6 +1340,9 @@ function renderSessionTable(
 	startIndex: number,
 	width: number,
 	theme: any,
+	codexQuota?: SubscriptionQuotaInfo,
+	openCodeGoQuota?: SubscriptionQuotaInfo,
+	deepSeekBalance?: DeepSeekBalanceInfo,
 ): string[] {
 	const innerWidth = Math.max(1, width - 2);
 	const metricWidths = [11, 10, 8, 10, 10, 10, 10];
@@ -1355,6 +1358,9 @@ function renderSessionTable(
 
 	const lines: string[] = [];
 	lines.push(truncateToWidth(theme.bold("Current session by provider/model"), innerWidth, ""));
+	if (codexQuota) lines.push(...renderCodexQuotaLines(codexQuota, width, theme));
+	if (openCodeGoQuota) lines.push(...renderOpenCodeGoQuotaLines(openCodeGoQuota, width, theme));
+	if (deepSeekBalance) lines.push(...renderDeepSeekBalanceLines(deepSeekBalance, width, theme));
 	if (session) {
 		const subagentText = session.subagentRecords > 0
 			? ` · subagents ${formatTokens(totalTokens(session.subagents))}, ${formatCost(session.subagents.cost)} (${session.subagentRecords} records)`
@@ -1513,7 +1519,7 @@ export default function (pi: ExtensionAPI) {
 						render(width: number): string[] {
 							return view === "overview"
 								? renderUsageTable(report, period, selectedIndex, startIndex, width, theme, codexQuota, opencodeGoQuota, deepSeekBalance)
-								: renderSessionTable(report, sessionRows, selectedIndex, startIndex, width, theme);
+								: renderSessionTable(report, sessionRows, selectedIndex, startIndex, width, theme, codexQuota, opencodeGoQuota, deepSeekBalance);
 						},
 						handleInput(data: string): void {
 							if (matchesKey(data, Key.escape) || matchesKey(data, Key.ctrl("c"))) {
