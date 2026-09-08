@@ -5,7 +5,7 @@ Pi usage 统计扩展，按 `provider/model` 汇总 Token 与费用。
 ## 命令
 
 ```text
-/usage             打开统计面板，默认显示本周
+/usage             打开统计面板，默认进入当前 session 视图（无 session 用量时退回全局「当天」）
 /usage day         今日
 /usage yesterday   昨日（别名：yday）
 /usage week        本周
@@ -32,6 +32,7 @@ cacheRead / (input + cacheRead + cacheWrite) × 100%
 操作：
 
 - `1`-`5`：切换时间范围
+- `Tab`：在「全局统计」与「当前 session」视图间切换
 - `↑` / `↓`：滚动
 - `PgUp` / `PgDn`：翻页
 - `Esc`：关闭
@@ -54,6 +55,8 @@ cacheRead / (input + cacheRead + cacheWrite) × 100%
 Token 数值使用 `M` 单位；小于 `0.01M` 的非零数值显示为 `<0.01M`。
 
 面板的 `Current session` 行显示当前 session JSONL 的累计用量；由 `agent-team` 启动的 subagent 会额外计入该行，并标出 subagent 账本记录数。该 session 小计不受上方时间范围 tab 影响，始终是该 session 的完整累计。
+
+按 `Tab` 可进入「当前 session」详情视图，按 `provider/model` 分列展示本 session 的用量，并以 `src` 列区分来源：`main`（本 session JSONL）与 `sub`（由 `agent-team` 启动、`rootSessionId` 归属到本 session 的 subagent 账本记录）。该视图同样不受上方时间范围 tab 影响，始终按 session 完整累计统计。
 
 Session footer 中：
 

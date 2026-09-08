@@ -48,10 +48,18 @@ interface ModelUsage {
 	periods: Record<Period, UsageTotals>;
 }
 
+interface CurrentSessionModelUsage {
+	provider: string;
+	model: string;
+	main: UsageTotals;
+	subagents: UsageTotals;
+}
+
 interface CurrentSessionUsage {
 	main: UsageTotals;
 	subagents: UsageTotals;
 	subagentRecords: number;
+	models: CurrentSessionModelUsage[];
 }
 
 interface UsageReport {
@@ -838,6 +846,19 @@ function getOrCreateModel(map: Map<string, ModelUsage>, model: { provider: strin
 	return result;
 }
 
+function getOrCreateSessionModel(
+	map: Map<string, CurrentSessionModelUsage>,
+	model: { provider: string; model: string },
+): CurrentSessionModelUsage {
+	const key = modelKey(model);
+	let result = map.get(key);
+	if (!result) {
+		result = { provider: model.provider, model: model.model, main: emptyTotals(), subagents: emptyTotals() };
+		map.set(key, result);
+	}
+	return result;
+}
+
 function addToPeriods(
 	model: ModelUsage,
 	totals: Record<Period, UsageTotals>,
@@ -1039,8 +1060,9 @@ async function scanUsage(
 	let invalidLines = 0;
 	let unattributedEntries = 0;
 	const currentSessionUsage = currentSession
-		? { main: emptyTotals(), subagents: emptyTotals(), subagentRecords: 0 }
+		? { main: emptyTotals(), subagents: emptyTotals(), subagentRecords: 0, models: [] as CurrentSessionModelUsage[] }
 		: undefined;
+	const sessionModels = new Map<string, CurrentSessionModelUsage>();
 
 	for (const path of sessionPaths) {
 		if (signal.aborted) throw cancelled();
@@ -1058,7 +1080,10 @@ async function scanUsage(
 		for (const record of aggregate.records) {
 			const model = getOrCreateModel(models, record.model);
 			addToPeriods(model, totals, record.usage, record.timestamp, periodStarts, now);
-			if (currentSessionUsage && path === currentSession?.path) addTotals(currentSessionUsage.main, record.usage);
+			if (currentSessionUsage && path === currentSession?.path) {
+				addTotals(currentSessionUsage.main, record.usage);
+				addTotals(getOrCreateSessionModel(sessionModels, record.model).main, record.usage);
+			}
 		}
 	}
 	removeMissingCachedFiles("session:", sessionKeys);
@@ -1098,11 +1123,24 @@ async function scanUsage(
 			if (currentSessionUsage && record.rootSessionId === currentSession?.id) {
 				addTotals(currentSessionUsage.subagents, record.usage);
 				currentSessionUsage.subagentRecords++;
+				addTotals(getOrCreateSessionModel(sessionModels, record.model).subagents, record.usage);
 			}
 		}
 	}
 	if (runtimeListingReliable) removeMissingCachedFiles("runtime:", runtimeKeys);
 	await savePersistentFileCache();
+
+	if (currentSessionUsage) {
+		currentSessionUsage.models = [...sessionModels.values()]
+			.filter((row) =>
+				totalTokens(row.main) > 0 || row.main.cost > 0 ||
+				totalTokens(row.subagents) > 0 || row.subagents.cost > 0)
+			.sort((a, b) => {
+				const tokenDifference =
+					totalTokens(b.main) + totalTokens(b.subagents) - totalTokens(a.main) - totalTokens(a.subagents);
+				return tokenDifference || (b.main.cost + b.subagents.cost) - (a.main.cost + a.subagents.cost);
+			});
+	}
 
 	const rows = [...models.values()]
 		.filter((row) => totalTokens(row.periods.all) > 0 || row.periods.all.cost > 0)
@@ -1141,7 +1179,7 @@ function periodLabel(period: Period, now: Date): string {
 
 function periodFromArgs(args: string): Period {
 	const value = args.trim().toLowerCase();
-	if (!value) return "week";
+	if (!value) return "day";
 	if (value === "day" || value === "today" || value === "daily") return "day";
 	if (value === "yesterday" || value === "yday") return "yesterday";
 	if (value === "week" || value === "weekly") return "week";
@@ -1160,6 +1198,29 @@ function frameUsageLines(lines: string[], width: number, theme: any): string[] {
 		return `${side}${content}${padding}${side}`;
 	});
 	return [top, ...framed, bottom];
+}
+
+interface SessionRow {
+	provider: string;
+	model: string;
+	src: "main" | "sub";
+	totals: UsageTotals;
+}
+
+function buildSessionRows(report: UsageReport): SessionRow[] {
+	const session = report.currentSession;
+	if (!session) return [];
+	const rows: SessionRow[] = [];
+	for (const model of session.models) {
+		if (totalTokens(model.main) > 0 || model.main.cost > 0) {
+			rows.push({ provider: model.provider, model: model.model, src: "main", totals: model.main });
+		}
+		if (totalTokens(model.subagents) > 0 || model.subagents.cost > 0) {
+			rows.push({ provider: model.provider, model: model.model, src: "sub", totals: model.subagents });
+		}
+	}
+	rows.sort((a, b) => totalTokens(b.totals) - totalTokens(a.totals) || b.totals.cost - a.totals.cost);
+	return rows;
 }
 
 function renderUsageTable(
@@ -1272,6 +1333,78 @@ function renderUsageTable(
 	return frameUsageLines(lines, width, theme);
 }
 
+function renderSessionTable(
+	report: UsageReport,
+	sessionRows: SessionRow[],
+	selectedIndex: number,
+	startIndex: number,
+	width: number,
+	theme: any,
+): string[] {
+	const innerWidth = Math.max(1, width - 2);
+	const metricWidths = [11, 10, 8, 10, 10, 10, 10];
+	const metricWidth = metricWidths.reduce((sum, value) => sum + value, 0) + metricWidths.length;
+	const srcWidth = 5;
+	const nameWidth = Math.max(12, innerWidth - metricWidth - srcWidth - 2);
+	const session = report.currentSession;
+	const combined = emptyTotals();
+	if (session) {
+		addTotals(combined, session.main);
+		addTotals(combined, session.subagents);
+	}
+
+	const lines: string[] = [];
+	lines.push(truncateToWidth(theme.bold("Current session by provider/model"), innerWidth, ""));
+	if (session) {
+		const subagentText = session.subagentRecords > 0
+			? ` · subagents ${formatTokens(totalTokens(session.subagents))}, ${formatCost(session.subagents.cost)} (${session.subagentRecords} records)`
+			: "";
+		lines.push(
+			truncateToWidth(
+				theme.fg("accent", `Session total: ${formatTokens(totalTokens(combined))}, ${formatCost(combined.cost)}${subagentText}`),
+				innerWidth,
+				"",
+			),
+		);
+	} else {
+		lines.push(theme.fg("dim", "No session file for this run."));
+	}
+	lines.push(truncateToWidth(theme.fg("dim", "Tab overview · ↑↓/PgUp/PgDn scroll · Esc close"), innerWidth, ""));
+
+	const headerCells = ["provider/model", "src", "tokens(M)", "cost", "hit%", "input(M)", "output(M)", "cacheR(M)", "cacheW(M)"];
+	const headerWidths = [nameWidth, srcWidth, ...metricWidths];
+	const header = headerCells
+		.map((cell, index) => cell.padStart(headerWidths[index]!))
+		.join(" ");
+	lines.push(truncateToWidth(theme.fg("muted", header), innerWidth, ""));
+
+	if (sessionRows.length === 0) {
+		lines.push(theme.fg("dim", "No usage for the current session yet."));
+	} else {
+		const maxRows = Math.max(1, Math.min(18, sessionRows.length));
+		const visibleRows = sessionRows.slice(startIndex, startIndex + maxRows);
+		for (const [offset, row] of visibleRows.entries()) {
+			const rowIndex = startIndex + offset;
+			const cells = [
+				truncateToWidth(`${row.provider}/${row.model}`, nameWidth, "…").padStart(nameWidth),
+				row.src.padStart(srcWidth),
+				formatTokens(totalTokens(row.totals)).padStart(metricWidths[0]!),
+				formatCost(row.totals.cost).padStart(metricWidths[1]!),
+				formatHitRate(row.totals).padStart(metricWidths[2]!),
+				formatTokens(row.totals.input).padStart(metricWidths[3]!),
+				formatTokens(row.totals.output).padStart(metricWidths[4]!),
+				formatTokens(row.totals.cacheRead).padStart(metricWidths[5]!),
+				formatTokens(row.totals.cacheWrite).padStart(metricWidths[6]!),
+			];
+			let line = cells.join(" ");
+			if (rowIndex === selectedIndex) line = theme.bg("selectedBg", line);
+			lines.push(truncateToWidth(line, innerWidth, ""));
+		}
+	}
+
+	return frameUsageLines(lines, width, theme);
+}
+
 export default function (pi: ExtensionAPI) {
 	// --no-session has no JSONL session file, so persist its usage in a separate
 	// numeric-only ledger. Normal persisted sessions are read from their JSONL files
@@ -1363,22 +1496,38 @@ export default function (pi: ExtensionAPI) {
 					let period = initialPeriod;
 					let selectedIndex = 0;
 					let startIndex = 0;
+					const sessionRows = buildSessionRows(report);
+					let view: "overview" | "session" = sessionRows.length > 0 ? "session" : "overview";
 
 					const requestRender = () => tui.requestRender();
+					const viewRowCount = () => (view === "overview" ? report.rows.length : sessionRows.length);
 					const adjustScroll = () => {
-						const maxRows = Math.max(1, Math.min(18, report.rows.length));
+						const rowCount = viewRowCount();
+						const maxRows = Math.max(1, Math.min(18, rowCount));
 						if (selectedIndex < startIndex) startIndex = selectedIndex;
 						if (selectedIndex >= startIndex + maxRows) startIndex = selectedIndex - maxRows + 1;
-						startIndex = Math.max(0, Math.min(startIndex, Math.max(0, report.rows.length - maxRows)));
+						startIndex = Math.max(0, Math.min(startIndex, Math.max(0, rowCount - maxRows)));
 					};
 
 					return {
 						render(width: number): string[] {
-							return renderUsageTable(report, period, selectedIndex, startIndex, width, theme, codexQuota, opencodeGoQuota, deepSeekBalance);
+							return view === "overview"
+								? renderUsageTable(report, period, selectedIndex, startIndex, width, theme, codexQuota, opencodeGoQuota, deepSeekBalance)
+								: renderSessionTable(report, sessionRows, selectedIndex, startIndex, width, theme);
 						},
 						handleInput(data: string): void {
 							if (matchesKey(data, Key.escape) || matchesKey(data, Key.ctrl("c"))) {
 								done(undefined);
+								return;
+							}
+							if (matchesKey(data, Key.tab)) {
+								const next: "overview" | "session" = view === "overview" ? "session" : "overview";
+								if (next === "overview" || sessionRows.length > 0) {
+									view = next;
+									selectedIndex = 0;
+									startIndex = 0;
+								}
+								requestRender();
 								return;
 							}
 							const periodIndex = Number(data) - 1;
@@ -1387,11 +1536,11 @@ export default function (pi: ExtensionAPI) {
 								requestRender();
 								return;
 							}
-							if (report.rows.length === 0) return;
+							if (viewRowCount() === 0) return;
 							if (matchesKey(data, Key.up)) selectedIndex = Math.max(0, selectedIndex - 1);
-							else if (matchesKey(data, Key.down)) selectedIndex = Math.min(report.rows.length - 1, selectedIndex + 1);
+							else if (matchesKey(data, Key.down)) selectedIndex = Math.min(viewRowCount() - 1, selectedIndex + 1);
 							else if (matchesKey(data, Key.pageUp)) selectedIndex = Math.max(0, selectedIndex - 18);
-							else if (matchesKey(data, Key.pageDown)) selectedIndex = Math.min(report.rows.length - 1, selectedIndex + 18);
+							else if (matchesKey(data, Key.pageDown)) selectedIndex = Math.min(viewRowCount() - 1, selectedIndex + 18);
 							else return;
 							adjustScroll();
 							requestRender();
