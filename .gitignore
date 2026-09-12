@@ -19,3 +19,10 @@ agent/bin
 agent/sessions
 agent/subagent-usage
 agent/usage-cache.json
+
+# 旧 git 包克隆（含嵌套 .git，体积大，不入库）
+agent/git/
+
+# WorkBuddy 凭据与本机状态
+agent/.workbuddy-auth.json
+agent/.workbuddy-settings.json
