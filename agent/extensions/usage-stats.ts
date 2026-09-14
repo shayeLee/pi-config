@@ -19,6 +19,7 @@ interface UsageStatsConfig {
 	showCommandCodeQuota?: boolean;
 	showOpenCodeGoQuota?: boolean;
 	showDeepSeekBalance?: boolean;
+	showWorkBuddyQuota?: boolean;
 }
 
 async function readUsageStatsConfig(): Promise<UsageStatsConfig> {
@@ -30,6 +31,7 @@ async function readUsageStatsConfig(): Promise<UsageStatsConfig> {
 		if (typeof values.showCommandCodeQuota === "boolean") config.showCommandCodeQuota = values.showCommandCodeQuota;
 		if (typeof values.showOpenCodeGoQuota === "boolean") config.showOpenCodeGoQuota = values.showOpenCodeGoQuota;
 		if (typeof values.showDeepSeekBalance === "boolean") config.showDeepSeekBalance = values.showDeepSeekBalance;
+		if (typeof values.showWorkBuddyQuota === "boolean") config.showWorkBuddyQuota = values.showWorkBuddyQuota;
 		return config;
 	} catch {
 		return {};
@@ -296,6 +298,8 @@ interface ScanResult {
 	opencodeGoQuota?: SubscriptionQuotaInfo;
 	/** DeepSeek API account balance from its official balance endpoint, when resolvable. */
 	deepSeekBalance?: DeepSeekBalanceInfo;
+	/** WorkBuddy credit packs from the WorkBuddy plugin billing endpoint, when resolvable. */
+	workBuddyQuota?: WorkBuddyQuotaInfo;
 }
 
 function emptyTotals(): UsageTotals {
@@ -924,6 +928,147 @@ function renderDeepSeekBalanceLines(balance: DeepSeekBalanceInfo, width: number,
 	return [truncateToWidth(theme.fg("accent", `DeepSeek balance: ${parts.join("  │  ")}${status}`), innerWidth, "")];
 }
 
+// --- WorkBuddy credit packs ---
+// Same non-public billing endpoint the WorkBuddy desktop app and the
+// pi-workbuddy-connect sidebar use. Credits are account-level, so this is
+// best-effort like the other quota rows: any failure hides the line only.
+
+const WORKBUDDY_PROVIDER_ID = "workbuddy";
+const WORKBUDDY_BILLING_BASE_URL = "https://www.workbuddy.ai";
+const WORKBUDDY_RESOURCE_PATH = "/v2/billing/meter/get-user-resource";
+const WORKBUDDY_PRODUCT_CODE = "p_tcaca";
+const WORKBUDDY_CLIENT_UA = "CLI/2.63.2 CodeBuddy/2.63.2";
+
+interface WorkBuddyCreditPack {
+	name: string;
+	remain: number;
+	size: number;
+	expiresAt?: Date;
+}
+
+interface WorkBuddyQuotaInfo {
+	total: number;
+	packs: WorkBuddyCreditPack[];
+}
+
+let workBuddyQuotaInFlight: Promise<WorkBuddyQuotaInfo | undefined> | undefined;
+let workBuddyQuotaCached: { at: number; value: WorkBuddyQuotaInfo | undefined } | undefined;
+
+function workBuddyStamp(date: Date): string {
+	const pad = (value: number) => String(value).padStart(2, "0");
+	return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
+}
+
+function parseWorkBuddyQuota(json: unknown): WorkBuddyQuotaInfo | undefined {
+	if (!json || typeof json !== "object") return undefined;
+	const envelope = json as Record<string, unknown>;
+	if (numericValue(envelope.code) !== 0) return undefined;
+	const data = envelope.data && typeof envelope.data === "object" ? envelope.data as Record<string, unknown> : undefined;
+	const response = data?.Response && typeof data.Response === "object" ? data.Response as Record<string, unknown> : undefined;
+	const body = response?.Data && typeof response.Data === "object" ? response.Data as Record<string, unknown> : undefined;
+	const accounts = body?.Accounts;
+	if (!Array.isArray(accounts)) return undefined;
+
+	const packs: WorkBuddyCreditPack[] = [];
+	let total = 0;
+	for (const value of accounts) {
+		if (!value || typeof value !== "object") continue;
+		const account = value as Record<string, unknown>;
+		const size = numericValue(account.CycleCapacitySize) ?? 0;
+		const cycleRemain = numericValue(account.CycleCapacityRemain) ?? 0;
+		const cycleUsed = numericValue(account.CycleCapacityUsed) ?? 0;
+		// 周期额度未下发时退回一次性总额度，与桌面端侧栏口径一致。
+		const remain = Math.max(0, size > 0 || cycleRemain > 0 || cycleUsed > 0
+			? cycleRemain
+			: numericValue(account.CapacityRemain) ?? 0);
+		const expiresAt = typeof account.CycleEndTime === "string" && !Number.isNaN(Date.parse(account.CycleEndTime.replace(" ", "T")))
+			? new Date(account.CycleEndTime.replace(" ", "T"))
+			: undefined;
+		const name = typeof account.PackageName === "string" && account.PackageName.trim() !== ""
+			? account.PackageName.trim()
+			: "(unnamed)";
+		total += remain;
+		packs.push({ name, remain, size: size > 0 ? size : numericValue(account.CapacitySize) ?? 0, expiresAt });
+	}
+	return packs.length > 0 ? { total, packs } : undefined;
+}
+
+async function fetchWorkBuddyQuota(resolver: SubscriptionQuotaAuthResolver, signal?: AbortSignal): Promise<WorkBuddyQuotaInfo | undefined> {
+	try {
+		const authResult = await resolver.getProviderAuth(WORKBUDDY_PROVIDER_ID);
+		const accessToken = authResult?.auth?.apiKey;
+		if (!accessToken) return undefined;
+		const baseUrl = (authResult?.auth?.baseUrl?.trim() || WORKBUDDY_BILLING_BASE_URL).replace(/\/+$/, "");
+		const now = new Date();
+		const controller = new AbortController();
+		const onAbort = () => controller.abort();
+		signal?.addEventListener("abort", onAbort, { once: true });
+		const timer = setTimeout(() => controller.abort(), OPENAI_CODEX_REQUEST_TIMEOUT_MS);
+		try {
+			const response = await fetch(`${baseUrl}${WORKBUDDY_RESOURCE_PATH}`, {
+				method: "POST",
+				headers: {
+					Authorization: `Bearer ${accessToken}`,
+					Accept: "application/json, text/plain, */*",
+					"Content-Type": "application/json",
+					"X-Requested-With": "XMLHttpRequest",
+					Origin: baseUrl,
+					Referer: `${baseUrl}/`,
+					"User-Agent": WORKBUDDY_CLIENT_UA,
+				},
+				body: JSON.stringify({
+					PageNumber: 1,
+					PageSize: 100,
+					ProductCode: WORKBUDDY_PRODUCT_CODE,
+					Status: [0, 3],
+					PackageEndTimeRangeBegin: workBuddyStamp(now),
+					PackageEndTimeRangeEnd: workBuddyStamp(new Date(now.getTime() + 365 * 101 * 24 * 3600 * 1000)),
+				}),
+				signal: controller.signal,
+			});
+			if (!response.ok) return undefined;
+			return parseWorkBuddyQuota((await response.json()) as unknown);
+		} finally {
+			clearTimeout(timer);
+			signal?.removeEventListener("abort", onAbort);
+		}
+	} catch {
+		// Quota display is best-effort; any failure leaves /usage unchanged.
+		return undefined;
+	}
+}
+
+/** 获取 WorkBuddy 账户的积分包余量；失败时静默返回 undefined。 */
+export async function getWorkBuddyQuota(
+	resolver: SubscriptionQuotaAuthResolver,
+	signal?: AbortSignal,
+): Promise<WorkBuddyQuotaInfo | undefined> {
+	const cached = workBuddyQuotaCached;
+	if (cached && Date.now() - cached.at < OPENAI_CODEX_QUOTA_CACHE_MS) return cached.value;
+	if (!workBuddyQuotaInFlight) {
+		workBuddyQuotaInFlight = fetchWorkBuddyQuota(resolver, signal)
+			.then((value) => {
+				workBuddyQuotaCached = { at: Date.now(), value };
+				return value;
+			})
+			.finally(() => {
+				workBuddyQuotaInFlight = undefined;
+			});
+	}
+	return workBuddyQuotaInFlight;
+}
+
+function renderWorkBuddyQuotaLines(quota: WorkBuddyQuotaInfo, width: number, theme: any): string[] {
+	const innerWidth = Math.max(1, width - 2);
+	const parts = [`${quota.total} credits left`];
+	for (const pack of quota.packs) {
+		const amount = pack.size > 0 ? `${pack.remain}/${pack.size}` : String(pack.remain);
+		const expires = pack.expiresAt ? ` · expires ${formatResetTime(pack.expiresAt)}` : "";
+		parts.push(`${pack.name} ${amount}${expires}`);
+	}
+	return [truncateToWidth(theme.fg("accent", `WorkBuddy quota: ${parts.join("  │  ")}`), innerWidth, "")];
+}
+
 function parseTimestamp(value: unknown): number | undefined {
 	if (typeof value === "number" && Number.isFinite(value)) return value;
 	if (typeof value !== "string" || value.length === 0) return undefined;
@@ -1376,6 +1521,7 @@ function renderUsageTable(
 	openCodeGoQuota?: SubscriptionQuotaInfo,
 	deepSeekBalance?: DeepSeekBalanceInfo,
 	commandCodeQuota?: CommandCodeQuotaInfo,
+	workBuddyQuota?: WorkBuddyQuotaInfo,
 ): string[] {
 	const innerWidth = Math.max(1, width - 2);
 	const metricWidths = [11, 10, 8, 10, 10, 10, 10];
@@ -1405,6 +1551,7 @@ function renderUsageTable(
 	if (openCodeGoQuota) lines.push(...renderOpenCodeGoQuotaLines(openCodeGoQuota, width, theme));
 	if (deepSeekBalance) lines.push(...renderDeepSeekBalanceLines(deepSeekBalance, width, theme));
 	if (commandCodeQuota) lines.push(...renderCommandCodeQuotaLines(commandCodeQuota, width, theme));
+	if (workBuddyQuota) lines.push(...renderWorkBuddyQuotaLines(workBuddyQuota, width, theme));
 	const headerCells = ["provider/model", "tokens(M)", "cost", "hit%", "input(M)", "output(M)", "cacheR(M)", "cacheW(M)"];
 	const header = headerCells
 		.map((cell, index) => {
@@ -1488,6 +1635,7 @@ function renderSessionTable(
 	openCodeGoQuota?: SubscriptionQuotaInfo,
 	deepSeekBalance?: DeepSeekBalanceInfo,
 	commandCodeQuota?: CommandCodeQuotaInfo,
+	workBuddyQuota?: WorkBuddyQuotaInfo,
 ): string[] {
 	const innerWidth = Math.max(1, width - 2);
 	const metricWidths = [11, 10, 8, 10, 10, 10, 10];
@@ -1507,6 +1655,7 @@ function renderSessionTable(
 	if (openCodeGoQuota) lines.push(...renderOpenCodeGoQuotaLines(openCodeGoQuota, width, theme));
 	if (deepSeekBalance) lines.push(...renderDeepSeekBalanceLines(deepSeekBalance, width, theme));
 	if (commandCodeQuota) lines.push(...renderCommandCodeQuotaLines(commandCodeQuota, width, theme));
+	if (workBuddyQuota) lines.push(...renderWorkBuddyQuotaLines(workBuddyQuota, width, theme));
 	if (session) {
 		const subagentText = session.subagentRecords > 0
 			? ` · subagents ${formatTokens(totalTokens(session.subagents))}, ${formatCost(session.subagents.cost)} (${session.subagentRecords} records)`
@@ -1617,9 +1766,12 @@ export default function (pi: ExtensionAPI) {
 						usageStatsConfig.showDeepSeekBalance === true
 							? getDeepSeekBalance(ctx.modelRegistry, loader.signal)
 							: Promise.resolve(undefined),
+						usageStatsConfig.showWorkBuddyQuota === false
+							? Promise.resolve(undefined)
+							: getWorkBuddyQuota(ctx.modelRegistry, loader.signal),
 					])
-						.then(([report, codexQuota, commandCodeQuota, opencodeGoQuota, deepSeekBalance]) => {
-							if (!loader.signal.aborted) done({ report, codexQuota, commandCodeQuota, opencodeGoQuota, deepSeekBalance });
+						.then(([report, codexQuota, commandCodeQuota, opencodeGoQuota, deepSeekBalance, workBuddyQuota]) => {
+							if (!loader.signal.aborted) done({ report, codexQuota, commandCodeQuota, opencodeGoQuota, deepSeekBalance, workBuddyQuota });
 						})
 						.catch((error: unknown) => {
 							if (!loader.signal.aborted) {
@@ -1646,6 +1798,7 @@ export default function (pi: ExtensionAPI) {
 			const opencodeGoQuota = scanResult.opencodeGoQuota;
 			const deepSeekBalance = scanResult.deepSeekBalance;
 			const commandCodeQuota = scanResult.commandCodeQuota;
+			const workBuddyQuota = scanResult.workBuddyQuota;
 			const initialPeriod = periodFromArgs(args);
 			await ctx.ui.custom<void>(
 				(tui, theme, _keybindings, done) => {
@@ -1668,8 +1821,8 @@ export default function (pi: ExtensionAPI) {
 					return {
 						render(width: number): string[] {
 							return view === "overview"
-								? renderUsageTable(report, period, selectedIndex, startIndex, width, theme, codexQuota, opencodeGoQuota, deepSeekBalance, commandCodeQuota)
-								: renderSessionTable(report, sessionRows, selectedIndex, startIndex, width, theme, codexQuota, opencodeGoQuota, deepSeekBalance, commandCodeQuota);
+								? renderUsageTable(report, period, selectedIndex, startIndex, width, theme, codexQuota, opencodeGoQuota, deepSeekBalance, commandCodeQuota, workBuddyQuota)
+								: renderSessionTable(report, sessionRows, selectedIndex, startIndex, width, theme, codexQuota, opencodeGoQuota, deepSeekBalance, commandCodeQuota, workBuddyQuota);
 						},
 						handleInput(data: string): void {
 							if (matchesKey(data, Key.escape) || matchesKey(data, Key.ctrl("c"))) {

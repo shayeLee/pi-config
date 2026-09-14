@@ -19,7 +19,7 @@ Pi usage 统计扩展，按 `provider/model` 汇总 Token 与费用。
 provider/model | tokens(M) | cost | hit% | input(M) | output(M) | cacheR(M) | cacheW(M)
 ```
 
-若当前已配置 `openai-codex`（ChatGPT OAuth）登录，面板顶部会额外显示对应的订阅额度；`command-code`、`opencode-go` 额度与 DeepSeek API 余额默认隐藏，可通过配置开启。未配置或请求失败时不显示。
+若当前已配置 `openai-codex`（ChatGPT OAuth）登录，面板顶部会额外显示对应的订阅额度；`workbuddy` 积分默认显示，`command-code`、`opencode-go` 额度与 DeepSeek API 余额默认隐藏，可通过配置开启或关闭。未配置或请求失败时不显示。
 
 `hit%` 是当前选定时间范围的累计缓存命中率：
 
@@ -45,11 +45,12 @@ cacheRead / (input + cacheRead + cacheWrite) × 100%
 {
   "showCommandCodeQuota": true,
   "showOpenCodeGoQuota": false,
-  "showDeepSeekBalance": true
+  "showDeepSeekBalance": true,
+  "showWorkBuddyQuota": true
 }
 ```
 
-配置在每次打开 `/usage` 时读取。关闭对应开关时不会请求相应接口，也不影响对应 provider 的 Token/费用统计。
+配置在每次打开 `/usage` 时读取。关闭对应开关时不会请求相应接口，也不影响对应 provider 的 Token/费用统计。`showWorkBuddyQuota` 默认开启，显式设为 `false` 才会隐藏。
 
 昨日按本地时区计算，统计区间为 `[昨日 00:00, 今日 00:00)`。
 
@@ -111,6 +112,28 @@ Command Code quota (individual-goat): credits 52.13 remaining  │  5h 68% left 
 ```
 
 该接口不是 Command Code 对外承诺的 API，字段或路径可能变动。因此请求仅在打开 `/usage` 时发起、结果只在内存缓存 90 秒；未配置、超时（8 秒）、非 2xx 或响应结构变化时会静默隐藏该行，不影响其他统计。API key 和原始响应绝不显示或持久化。`credits` 为服务端返回的 monthly、purchased、free credits 合计；不把它视为月度额度上限。
+
+## WorkBuddy 积分额度
+
+该功能默认开启，由 `~/.pi/agent/usage-stats.json` 中的 `showWorkBuddyQuota` 控制（设为 `false` 可隐藏）。开启后，使用 Pi 已解析的 `workbuddy` OAuth access token，请求桌面 App 与 `pi-workbuddy-connect` 侧栏使用的**非公开**计费端点：
+
+```text
+POST https://www.workbuddy.ai/v2/billing/meter/get-user-resource
+Authorization: Bearer <workbuddy access token>
+
+{ "PageNumber": 1, "PageSize": 100, "ProductCode": "p_tcaca", "Status": [0, 3],
+  "PackageEndTimeRangeBegin": "<now>", "PackageEndTimeRangeEnd": "<now + 101y>" }
+```
+
+面板显示积分包合计余量，以及每个积分包的剩余/总量与周期到期时间，例如：
+
+```text
+WorkBuddy quota: 350 credits left  │  Bonus Pack 250/250 · expires 09-26 23:05  │  Free Plan Subscription 100/100 · expires 09-30 23:59
+```
+
+余量口径与桌面端侧栏一致：`CycleCapacitySize`/`CycleCapacityRemain`/`CycleCapacityUsed` 任一非零时取周期余量 `CycleCapacityRemain`，否则退回一次性额度 `CapacityRemain`；负值钳制到 0。积分是账户级共享额度，与具体模型无关。
+
+该接口不是 WorkBuddy 对外承诺的 API，字段或路径可能变动。因此请求仅在打开 `/usage` 时发起、结果只在内存缓存 90 秒；未登录、超时（8 秒）、非 2xx、`code !== 0` 或响应结构变化时会静默隐藏该行，不影响其他统计。access token 和原始响应绝不显示或持久化。
 
 ## DeepSeek API 账户余额
 
