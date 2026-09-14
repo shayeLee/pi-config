@@ -9,6 +9,7 @@ import { openaiCodexHandler } from "../providers/openai-codex";
 import { opencodeGoHandler } from "../providers/opencode-go";
 import { opencodeHandler } from "../providers/opencode";
 import { modelscopeHandler } from "../providers/modelscope";
+import { commandCodeHandler } from "../providers/command-code";
 import { supportedProviders } from "../providers/registry";
 
 interface TestResult {
@@ -413,6 +414,291 @@ async function runRegressionTests(): Promise<TestResult[]> {
     expect(rate === null, "modelscope rate limit should not match");
   }));
 
+  results.push(await runTest("command-code USAGE_EXCEEDED is a cross-provider spend limit", () => {
+    const verdict = commandCodeHandler.inspect(
+      assistantFailure(
+        "command-code",
+        "deepseek/deepseek-v4.1-flash",
+        '400: {"message":"Usage limit reached","type":"invalid_request_error","code":"USAGE_EXCEEDED"}',
+      ),
+    );
+    expect(verdict, "command-code USAGE_EXCEEDED was not detected");
+    expect(verdict.reason === "spend_limit", `unexpected reason: ${verdict.reason}`);
+    expect(verdict.scope === "cross-provider", `unexpected scope: ${verdict.scope}`);
+  }));
+
+  results.push(await runTest("command-code org spend cap is detected with resetsAt", () => {
+    const before = Date.now();
+    const verdict = commandCodeHandler.inspect(
+      assistantFailure(
+        "command-code",
+        "glm-5",
+        "You've reached the $10.00/mo spending limit your organization set for GLM-5. It resets in 3 days.",
+      ),
+    );
+    expect(verdict, "command-code org spend cap was not detected");
+    expect(verdict.reason === "spend_limit", `unexpected reason: ${verdict.reason}`);
+    expect(verdict.scope === "cross-provider", `unexpected scope: ${verdict.scope}`);
+    expect(typeof verdict.resetsAt === "number", "org spend cap resetsAt was not populated");
+    const expected = before + 3 * 24 * 60 * 60_000;
+    expect(Math.abs(verdict.resetsAt! - expected) <= 60_000, "org spend cap resetsAt is not ~3 days");
+  }));
+
+  results.push(await runTest("command-code rolling window limit is detected with resetsAt", () => {
+    const before = Date.now();
+    const verdict = commandCodeHandler.inspect(
+      assistantFailure(
+        "command-code",
+        "xiaomi/mimo-v2.5",
+        '429: {"message":"You\'ve reached your 5-hour usage limit. Resets in 2h 41m (3:00 PM).","type":"rate_limit_error","code":"RATE_LIMITED","rateLimit":{"window":"fiveHour","reset":1789388669}}',
+      ),
+    );
+    expect(verdict, "command-code rolling window limit was not detected");
+    expect(verdict.reason === "usage_limit", `unexpected reason: ${verdict.reason}`);
+    expect(verdict.scope === "cross-provider", `unexpected scope: ${verdict.scope}`);
+    expect(typeof verdict.resetsAt === "number", "resetsAt was not populated");
+    // "2h 41m (3:00 PM)" 的括号复述不得被重复累加。
+    const expected = before + (2 * 60 + 41) * 60_000;
+    expect(Math.abs(verdict.resetsAt! - expected) <= 60_000, "resetsAt double-counted the parenthesised restatement");
+  }));
+
+  results.push(await runTest("command-code plain-text window limit variants are detected", () => {
+    const samples = [
+      "You've reached your weekly limit. Resets in 3 days.",
+      "You have exceeded your weekly usage limit",
+      "5-hour limit reached. Try again later.",
+      // 泛化文案自身不够明确,需配合官方限流门禁(官方 CLI 同此语义)。
+      '429: {"code":"RATE_LIMITED","message":"Usage limit for your plan has been reached"}',
+      '429: {"code":"RATE_LIMITED","message":"Usage limit has been reached"}',
+    ];
+    for (const sample of samples) {
+      const verdict = commandCodeHandler.inspect(assistantFailure("command-code", "m", sample));
+      expect(verdict, `plain-text window limit was not detected: ${sample}`);
+      expect(verdict.reason === "usage_limit", `unexpected reason for ${sample}: ${verdict.reason}`);
+      expect(verdict.scope === "cross-provider", `unexpected scope for ${sample}: ${verdict.scope}`);
+    }
+  }));
+
+  results.push(await runTest("command-code premium credits and insufficient credits are quota exhausted", () => {
+    const premium = commandCodeHandler.inspect(
+      assistantFailure(
+        "command-code",
+        "claude-opus-5",
+        '400: {"message":"Premium credits exhausted","type":"invalid_request_error","code":"PREMIUM_CREDITS_EXHAUSTED"}',
+      ),
+    );
+    const insufficient = commandCodeHandler.inspect(
+      assistantFailure(
+        "command-code",
+        "claude-opus-5",
+        '400: {"message":"You have insufficient credits to make this request. Please purchase more credits to continue using Command Code here: https://command-code.ai/billing","type":"invalid_request_error","code":"USAGE_EXCEEDED"}',
+      ),
+    );
+    expect(premium, "PREMIUM_CREDITS_EXHAUSTED was not detected");
+    expect(premium.reason === "quota_exhausted", `unexpected reason: ${premium.reason}`);
+    expect(premium.scope === "cross-provider", `unexpected scope: ${premium.scope}`);
+    expect(insufficient, "insufficient credits was not detected");
+    expect(insufficient.reason === "quota_exhausted", `unexpected reason: ${insufficient.reason}`);
+    expect(insufficient.scope === "cross-provider", `unexpected scope: ${insufficient.scope}`);
+  }));
+
+  results.push(await runTest("command-code model not in plan is model-scoped (any)", () => {
+    const samples = [
+      '400: {"message":"MODEL_NOT_IN_PLAN: claude-opus-5","type":"invalid_request_error"}',
+      '400: {"message":"claude-opus-5 is not included in your current plan"}',
+    ];
+    for (const sample of samples) {
+      const verdict = commandCodeHandler.inspect(assistantFailure("command-code", "claude-opus-5", sample));
+      expect(verdict, `MODEL_NOT_IN_PLAN was not detected: ${sample}`);
+      expect(verdict.reason === "model_not_in_plan", `unexpected reason: ${verdict.reason}`);
+      // 只影响这一个模型,同 provider 的其他模型仍然可用。
+      expect(verdict.scope === "any", `unexpected scope: ${verdict.scope}`);
+    }
+  }));
+
+  results.push(await runTest("command-code transient and configuration errors do not match", () => {
+    const samples = [
+      '429: {"message":"Rate limit exceeded. Please wait a moment and try again.","type":"rate_limit_error","code":"rate_limit_error"}',
+      '429: {"message":"Too many requests","type":"rate_limit_error"}',
+      '429: Too many requests',
+      '401: {"message":"Missing or invalid auth","type":"authentication_error"}',
+      '403: {"message":"You are on the Go plan, the only plan without API access.","type":"permission_error","code":"upgrade_required"}',
+      '400: {"message":"Model \\"foo\\" is not supported on this endpoint.","type":"invalid_request_error","code":"unsupported_model"}',
+      '422: {"message":"no zero-data-retention upstream","code":"cmd_zdr_no_providers"}',
+      '500: {"message":"Internal server error","type":"server_error"}',
+      '502: {"message":"Upstream request failed: Endpoint is unavailable.","type":"api_error"}',
+      // 只有 "Resets in …" 而没有额度文案:不得单独成为终态。
+      "Resets in 30s",
+      "Resets in 5 minutes",
+      "Resets at 2026-09-14T07:00:00Z",
+      // 自然语言里的 window 不是窗口证据。
+      '429: {"message":"upstream said: connection window closed","type":"server_error","code":"RATE_LIMITED"}',
+      // 其他 provider 的额度信号必须保持隔离。
+      '429: {"code":"insufficient_quota","message":"You exceeded your current quota"}',
+      '429: {"message":"insufficient balance"}',
+      '{"type":"CreditsError","message":"Insufficient balance"}',
+      '400: {"code":"Free allocated quota exceeded"}',
+      '400: {"code":"out of budget"}',
+    ];
+    for (const sample of samples) {
+      const verdict = commandCodeHandler.inspect(assistantFailure("command-code", "some-model", sample));
+      expect(verdict === null, `should not match: ${sample}`);
+    }
+  }));
+
+  results.push(await runTest("command-code only parses the error body, never the appended metadata", () => {
+    // pi 的 formatProviderError 会把 error.error.metadata.raw 追加在换行之后。
+    // 判定必须只看第一个括号配平的 JSON 对象,否则元数据/嵌套字段里的
+    // 同名 token 会把非终态错误升级为整 provider 级 ban。
+    const samples = [
+      '400: {"message":"not supported on this endpoint"}\n{"code":"USAGE_EXCEEDED","type":"invalid_request_error"}',
+      '500: {"message":"Internal server error"}\n{"code":"RATE_LIMITED","rateLimit":{"window":"fiveHour"}}',
+      '401: {"message":"Missing or invalid API key"}\n{"code":"RATE_LIMITED","rateLimit":{"window":"weekly"}}',
+      '400: {"message":"not supported","extra":{"code":"USAGE_EXCEEDED"},"code":"unsupported_model"}',
+      '400: {"message":"not supported","extra":{"code":"RATE_LIMITED","rateLimit":{"window":"weekly"}},"code":"unsupported_model"}',
+      '429: {"message":"Rate limit exceeded. Please wait a moment and try again.","type":"rate_limit_error","error":{"code":"USAGE_EXCEEDED"}}',
+    ];
+    for (const sample of samples) {
+      const verdict = commandCodeHandler.inspect(assistantFailure("command-code", "some-model", sample));
+      expect(verdict === null, `metadata/nested token was escalated to a terminal verdict: ${sample}`);
+    }
+  }));
+
+  results.push(await runTest("command-code terminal code wins over a sibling non-terminal type", () => {
+    // 终态 code 不得被同层/嵌套的非终态 type 覆盖,否则真终态会被漏判。
+    const samples = [
+      '400: {"message":"body {\\"code\\":\\"unsupported_model\\"}","code":"USAGE_EXCEEDED","type":"invalid_request_error"}',
+      '400: {"message":"Usage limit reached","extra":{"type":"server_error"},"code":"USAGE_EXCEEDED"}',
+      '429: {"error":{"type":"api_error","message":"upstream failed"},"type":"rate_limit_error","rateLimit":{"window":"fiveHour"},"code":"RATE_LIMITED"}',
+      '400: {"error":{"type":"api_error"},"type":"invalid_request_error","code":"USAGE_EXCEEDED","message":"Usage limit reached"}',
+    ];
+    for (const sample of samples) {
+      const verdict = commandCodeHandler.inspect(assistantFailure("command-code", "some-model", sample));
+      expect(verdict, `terminal code was masked by a non-terminal type: ${sample}`);
+      expect(
+        verdict.reason === "spend_limit" || verdict.reason === "usage_limit",
+        `unexpected reason for ${sample}: ${verdict.reason}`,
+      );
+      expect(verdict.scope === "cross-provider", `unexpected scope for ${sample}: ${verdict.scope}`);
+    }
+    // code 与 type 同层冲突时以 code 为准(与字段顺序无关)。
+    const conflicted = commandCodeHandler.inspect(
+      assistantFailure(
+        "command-code",
+        "some-model",
+        '500: {"type":"server_error","message":"boom","code":"RATE_LIMITED","rateLimit":{"window":"fiveHour"}}',
+      ),
+    );
+    expect(conflicted, "RATE_LIMITED code was masked by a sibling server_error type");
+    expect(conflicted.reason === "usage_limit", `unexpected reason: ${conflicted.reason}`);
+  }));
+
+  results.push(await runTest("command-code drops a reset time that is already in the past", () => {
+    const verdict = commandCodeHandler.inspect(
+      assistantFailure(
+        "command-code",
+        "m",
+        '429: {"code":"RATE_LIMITED","message":"Resets at 2020-01-01T00:00:00Z"}',
+      ),
+    );
+    expect(verdict, "window limit was not detected");
+    expect(verdict.resetsAt === undefined, `a past reset time leaked into the ledger: ${verdict.resetsAt}`);
+  }));
+
+  results.push(await runTest("command-code non-terminal code/type wins over nested terminal tokens", () => {
+    // pi 会把 error.error.metadata.raw 追加进 errorMessage,嵌套字段里的
+    // USAGE_EXCEEDED / window 不得把非终态错误升级为整 provider 级 ban。
+    const samples = [
+      '400: {"code":"unsupported_model","message":"not supported","extra":{"code":"USAGE_EXCEEDED"}}',
+      '400: {"code":"unsupported_model","message":"nope","docLink":"https://x/USAGE_EXCEEDED"}',
+      '500: {"message":"Internal server error","type":"server_error","rateLimit":{"window":"fiveHour","reset":1789388669}}',
+      '502: {"type":"api_error","message":"Endpoint is unavailable","rateLimit":{"window":"weekly"}}',
+      '401: {"type":"authentication_error","message":"Missing or invalid auth","rateLimit":{"window":"weekly"}}',
+      '403: {"code":"upgrade_required","message":"Go plan has no API access","rateLimit":{"window":"weekly"}}',
+      '400: {"code":"unsupported_model","message":"not supported","rateLimit":{"window":"daily"}}',
+      '422: {"code":"cmd_zdr_no_providers","message":"no zdr upstream","rateLimit":{"window":"weekly"}}',
+      '500: {"message":"boom","type":"server_error","window":"weekly","help":"https://x/docs/429"}',
+      // 校验类文案不得当成额度终态。
+      '400: {"message":"Invalid field: usage limit for your plan must be a string","type":"invalid_request_error"}',
+    ];
+    for (const sample of samples) {
+      const verdict = commandCodeHandler.inspect(assistantFailure("command-code", "some-model", sample));
+      expect(verdict === null, `non-terminal error was escalated to a terminal verdict: ${sample}`);
+    }
+  }));
+
+  results.push(await runTest("command-code ignores other providers and non-error messages", () => {
+    const otherProvider = commandCodeHandler.inspect(
+      assistantFailure("opencode", "gpt-5.6-sol", "USAGE_EXCEEDED"),
+    );
+    const wrongStopReason = commandCodeHandler.inspect({
+      role: "assistant",
+      stopReason: "stop",
+      provider: "command-code",
+      model: "m",
+      errorMessage: "USAGE_EXCEEDED",
+    });
+    const emptyMessage = commandCodeHandler.inspect(
+      assistantFailure("command-code", "m", ""),
+    );
+    expect(otherProvider === null, "another provider was incorrectly detected");
+    expect(wrongStopReason === null, "a non-error message was incorrectly detected");
+    expect(emptyMessage === null, "an empty error message was incorrectly detected");
+  }));
+
+  results.push(await runTest("command-code resolveResetsAt only queries for a window usage limit", async () => {
+    const originalFetch = globalThis.fetch;
+    let fetches = 0;
+    const resetAt = Date.now() + 60 * 60_000;
+    globalThis.fetch = (async (url: string | URL) => {
+      fetches += 1;
+      const target = String(url);
+      if (target.includes("/alpha/whoami")) {
+        return { ok: true, json: async () => ({ user: { id: "u" }, org: null }) } as Response;
+      }
+      if (target.includes("/alpha/billing/credits")) {
+        return {
+          ok: true,
+          json: async () => ({
+            credits: { monthlyCredits: 0 },
+            windowLimits: {
+              limited: true,
+              fiveHour: { used: 14, cap: 14, exceeded: true, resetAt },
+              weekly: { used: 1, cap: 35, exceeded: false, resetAt: Date.now() + 7 * 24 * 60 * 60_000 },
+            },
+          }),
+        } as Response;
+      }
+      if (target.includes("/alpha/billing/subscriptions")) {
+        return { ok: true, json: async () => ({ success: true, data: { planId: "indivi" } }) } as Response;
+      }
+      return { ok: false, json: async () => undefined } as Response;
+    }) as typeof fetch;
+    try {
+      const resolver = { getProviderAuth: async () => ({ auth: { apiKey: "test-key" } }) };
+      // 非 usage_limit 的 reason 一律不查额度:必须先断言,避免污染后续 usage_limit
+      // 的首次真实 fetch(usage-stats 有 90s 模块级缓存)。
+      const reasons = ["quota_exhausted", "spend_limit", "model_not_in_plan"];
+      for (const reason of reasons) {
+        const skipped = await commandCodeHandler.resolveResetsAt?.(
+          { reason, scope: reason === "model_not_in_plan" ? "any" : "cross-provider" }, resolver,
+        );
+        expect(skipped === undefined, `${reason} must not be assigned a reset estimate`);
+      }
+      expect(fetches === 0, `non-window reasons unexpectedly queried quota (${fetches} requests)`);
+
+      const before = Date.now();
+      const reset = await commandCodeHandler.resolveResetsAt?.(
+        { reason: "usage_limit", scope: "cross-provider" }, resolver,
+      );
+      expect(typeof reset === "number", "usage endpoint did not produce a reset estimate");
+      expect(Math.abs(reset! - (before + 60 * 60_000)) <= 5 * 60_000, "reset estimate is not the exhausted window");
+      expect(fetches > 0, "usage_limit did not query the quota endpoint");
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  }));
+
   results.push(await runTest("resolveFallback resolves a chain A->B->C", () => {
     const config = {
       chains: [["opencode/*", "opencode-go/deepseek-v4-flash", "rightcode-codex/gpt-5.6-luna"]],
@@ -744,10 +1030,10 @@ async function runRegressionTests(): Promise<TestResult[]> {
     );
   }));
 
-  results.push(await runTest("registry contains all four providers", () => {
+  results.push(await runTest("registry contains all five providers", () => {
     const providers = supportedProviders();
-    expect(providers.length === 4, `expected 4 providers, got ${providers.length}`);
-    for (const provider of ["openai-codex", "opencode", "opencode-go", "modelscope"]) {
+    expect(providers.length === 5, `expected 5 providers, got ${providers.length}`);
+    for (const provider of ["openai-codex", "opencode", "opencode-go", "modelscope", "command-code"]) {
       expect(providers.includes(provider), `missing provider ${provider}`);
     }
   }));
@@ -799,6 +1085,75 @@ async function runRegressionTests(): Promise<TestResult[]> {
     expect(called[1].provider === "rightcode-codex", "second hop should be rightcode-codex");
     expect(harness.pi.userMessages.length === 2, "expected 2 steering messages");
     expect(harness.state.chain.length === 3, `expected chain length 3, got ${harness.state.chain.length}`);
+  }));
+
+  results.push(await runTest("engine fails back from command-code to the next chain node", async () => {
+    const harness = engineHarness(
+      {
+        chains: [["openai-codex/gpt-5.6-luna", "command-code/xiaomi/mimo-v2.5", "deepseek/deepseek-flash"]],
+        fallbacks: {},
+      },
+      [
+        { provider: "openai-codex", id: "gpt-5.6-luna" },
+        { provider: "command-code", id: "xiaomi/mimo-v2.5" },
+        { provider: "deepseek", id: "deepseek-flash" },
+      ],
+      { provider: "openai-codex", id: "gpt-5.6-luna" },
+    );
+
+    await harness.emit(assistantFailure("openai-codex", "gpt-5.6-luna", "usage_limit_reached"));
+    await harness.emit(
+      assistantFailure(
+        "command-code",
+        "xiaomi/mimo-v2.5",
+        "You've reached your 5-hour usage limit. Resets in 2h 41m (3:00 PM).",
+      ),
+    );
+
+    const called = harness.pi.setModelCalls as Array<{ provider: string; id: string }>;
+    expect(called.length === 2, `expected 2 switches, got ${called.length}`);
+    expect(called[0].provider === "command-code", "first hop should be command-code");
+    expect(called[1].provider === "deepseek", "second hop should be deepseek");
+    expect(harness.pi.userMessages.length === 2, "expected 2 steering messages");
+  }));
+
+  results.push(await runTest("engine keeps the same provider when command-code reports model_not_in_plan", async () => {
+    // scope "any":同 provider 的其他模型仍然可用,不能因单个模型不在计划内
+    // 就跳到别的 provider(甚至直接断供)。
+    const harness = engineHarness(
+      {
+        chains: [
+          [
+            "command-code/claude-opus-5",
+            "command-code/deepseek/deepseek-v4.1-flash",
+            "deepseek/deepseek-flash",
+          ],
+        ],
+        fallbacks: {},
+      },
+      [
+        { provider: "command-code", id: "claude-opus-5" },
+        { provider: "command-code", id: "deepseek/deepseek-v4.1-flash" },
+        { provider: "deepseek", id: "deepseek-flash" },
+      ],
+      { provider: "command-code", id: "claude-opus-5" },
+    );
+
+    await harness.emit(
+      assistantFailure(
+        "command-code",
+        "claude-opus-5",
+        '400: {"message":"MODEL_NOT_IN_PLAN: claude-opus-5","type":"invalid_request_error"}',
+      ),
+    );
+
+    const called = harness.pi.setModelCalls as Array<{ provider: string; id: string }>;
+    expect(called.length === 1, `expected 1 switch, got ${called.length}`);
+    expect(called[0].provider === "command-code", "model_not_in_plan must stay on command-code");
+    expect(
+      called[0].id === "deepseek/deepseek-v4.1-flash",
+      `model_not_in_plan skipped the same-provider model: ${called[0].id}`,
+    );
   }));
 
   results.push(await runTest("engine fails back after opencode-go 503", async () => {

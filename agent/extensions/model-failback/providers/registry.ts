@@ -8,12 +8,14 @@ import { openaiCodexHandler } from "./openai-codex";
 import { opencodeHandler } from "./opencode";
 import { opencodeGoHandler } from "./opencode-go";
 import { modelscopeHandler } from "./modelscope";
+import { commandCodeHandler } from "./command-code";
 
 const HANDLERS: readonly ProviderFailbackHandler[] = [
   openaiCodexHandler,
   opencodeHandler,
   opencodeGoHandler,
   modelscopeHandler,
+  commandCodeHandler,
 ];
 
 export function getProviderHandler(provider: unknown): ProviderFailbackHandler | undefined {

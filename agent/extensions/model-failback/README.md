@@ -14,7 +14,7 @@
 
 ## 为什么按 provider 判定
 
-ChatGPT 订阅 backend 与其他 provider 的终态错误形状完全不同(错误码、文案、作用域),因此判定做成了**按 provider 分派**的插拔层。当前已实现并注册 `openai-codex`、`opencode`、`opencode-go` 与 `modelscope`;接入新 provider 只需新增一个文件并注册一行,见下文"扩展新 provider"。
+ChatGPT 订阅 backend 与其他 provider 的终态错误形状完全不同(错误码、文案、作用域),因此判定做成了**按 provider 分派**的插拔层。当前已实现并注册 `openai-codex`、`opencode`、`opencode-go`、`modelscope` 与 `command-code`;接入新 provider 只需新增一个文件并注册一行,见下文"扩展新 provider"。
 
 ## 工作原理(openai-codex)
 
@@ -49,6 +49,30 @@ message_end(assistant, error)
 `modelscope` 推理 API 底层为阿里云百炼(Model Studio)的 OpenAI-compatible completions 端点。仅覆盖账户/计划额度耗尽终态:命中 `insufficient_quota`、`You exceeded your current quota`、`Free allocated quota exceeded`、`insufficient balance`,或 `out of budget` 时,判定为 `reason: "quota_exhausted"`、`scope: "cross-provider"`。
 
 瞬时频率/并发限流(`Throttling.RateQuota`、`BurstRate`、`Concurrency`)与鉴权错误(`InvalidApiKey`)**不会**触发——前者交给 pi 的退避重试,后者属配置问题换 provider 也无效。
+
+## 工作原理(command-code)
+
+`command-code` 是聚合网关(Provider API,OpenAI-compatible 的 completions 端点)。额度由三部分组成:账户 credits(充值/月度额度)、订阅的 5h/weekly 滚动窗口,以及组织级月度 spend cap。
+
+四类终态,按从具体到宽泛的顺序判定:
+
+| reason | 触发信号 | scope | 恢复时间 |
+|---|---|---|---|
+| `model_not_in_plan` | `MODEL_NOT_IN_PLAN`、`is not included in your current plan` | `any` | 无 |
+| `quota_exhausted` | `insufficient credits`、`PREMIUM_CREDITS_EXHAUSTED` | `cross-provider` | 无(充值后手动 `/failback unban`) |
+| `usage_limit` | 具名窗口文案(`You've reached your 5-hour/weekly/daily … limit`、`5-hour limit reached`);或 429/`RATE_LIMITED` + `"window":"fiveHour\|weekly\|daily"`;或泛化文案(`usage limit for your plan`、`usage limit has been reached`)配门禁/倒计时 | `cross-provider` | 文案倒计时就地解析;缺失时复用 `usage-stats` 的 `/alpha/billing/credits` 补查已耗尽窗口 |
+| `spend_limit` | 错误正文顶层 `code: "USAGE_EXCEEDED"`、组织 spend cap 文案 | `cross-provider` | 只取文案里的倒计时,**不**查窗口 |
+
+`model_not_in_plan` 只影响单个模型,因此 `scope: "any"` —— 换同 provider 的其他模型仍然有效(例如 `claude-opus-5` 不在计划内时,`deepseek/deepseek-v4.1-flash` 仍可接续),不会像账户级终态那样强制跨 provider。
+
+`usage_limit` 与 `spend_limit` 分开是有意的:只有**滚动窗口**的耗尽才对应 credits 接口里的窗口重置时刻;把消费限额也套上窗口时间会给出误导性的乐观恢复承诺,并影响 `autoRestore` 时机。
+
+**一律不触发**(交给 pi 退避重试或用户处理):无窗口证据的瞬时限流(`429 rate_limit_error`)、5xx 上游故障(`server_error` / `api_error` / `Endpoint is unavailable`)、`401` 鉴权、`403 upgrade_required`(Go 计划无 API)、`unsupported_model`、`cmd_zdr_no_providers`(ZDR)。这些错误即使带上 `rateLimit` / `window` 元数据也不会触发。
+
+两道解析纪律防止误判:
+
+- **窗口证据必须有限流门禁**。复刻官方 CLI 的语义:只有在 `status === 429`、`code === "RATE_LIMITED"` 或 `type === "rate_limit_error"` 时,错误正文里的 `window` 字段才算额度终态。否则上游透传的 5xx/401/403 响应只要带上 `rateLimit` 元数据就会被误判为额度耗尽。唯一的例外是**具名窗口文案**(`You've reached your 5-hour usage limit` 这类),它本身已经足够明确。
+- **只解析错误正文,且终态 code 优先**。`inspect()` 先取第一个**括号配平**的 JSON 对象,所有字段(`code` / `type` / `rateLimit`)都从该对象读取,绝不做跨文档的正则子串匹配 —— pi 的 `formatProviderError` 会把 `error.error.metadata.raw` 追加在换行之后,元数据里的同名 token 不得把非终态错误升级为整 provider 级 ban。同时,终态 code 优先于同层/嵌套的非终态 `type`,且与字段顺序无关,避免真终态被漏判。
 
 ## 配置
 
@@ -130,7 +154,7 @@ E2E 会真实调用 provider，前提是 `opencode` 账户当前无余额，并�
 
 当前实现已经完成并启用:
 
-- 支持 `openai-codex`、`opencode`、`opencode-go`、`modelscope` 四个 provider;
+- 支持 `openai-codex`、`opencode`、`opencode-go`、`modelscope`、`command-code` 五个 provider;
 - 使用 `chains` 表达多层 failback，精确节点优先于通配节点;
 - 终态发生后只 ban 精确的 `provider/model`，不 ban 整个 provider;
 - ban 在同一主 session 的 worker/reviewer 子进程之间共享，不跨 session;
@@ -168,11 +192,13 @@ export const myProviderHandler: ProviderFailbackHandler = {
 ## 已验证
 
 - 扩展被 pi 正常加载,不干扰正常任务
-- 四个 provider 的终态判定、provider 隔离和无关错误过滤
+- 五个 provider 的终态判定、provider 隔离和无关错误过滤
 - Codex 流式原文 `Codex error: The usage limit has been reached`
 - compaction summarization 期间的 Codex 额度终态，以及切换后重新压缩上下文
 - OpenCode `CreditsError / Insufficient balance`、OpenCode Go `GoUsageLimitError` 与 `503 / Endpoint is unavailable`
 - ModelScope `insufficient_quota` 与 `429 {"message":"insufficient balance"}`
+- Command Code 四类终态(`model_not_in_plan` / `quota_exhausted` / `usage_limit` / `spend_limit`)判定与 `scope` 语义,以及瞬时限流、5xx、`401`、`403 upgrade_required`、`unsupported_model`、`cmd_zdr_no_providers` 的离线排除用例
+- Command Code 解析纪律:换行后追加的 `metadata.raw` 与嵌套字段里的同名 token 不得把非终态错误升级为终态;终态 code 不被同层非终态 `type` 覆盖;`MODEL_NOT_IN_PLAN` 走 `scope:"any"` 时不会跳过同 provider 的可用模型
 - ModelScope Qwen 的 `insufficient balance` 真实 lite subagent 接续
 - 两层 failback、链内已 ban 节点跳过、环检测、连跳上限和 cross-provider 守卫
 - worker/reviewer 子进程启动前跳过已 ban 模型

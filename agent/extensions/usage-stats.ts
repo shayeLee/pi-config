@@ -785,7 +785,8 @@ async function fetchCommandCodeQuota(resolver: SubscriptionQuotaAuthResolver, si
 	}
 }
 
-async function getCommandCodeQuota(
+/** 获取 Command Code 账户的 credits 与订阅窗口；失败时静默返回 undefined。 */
+export async function getCommandCodeQuota(
 	resolver: SubscriptionQuotaAuthResolver,
 	signal?: AbortSignal,
 ): Promise<CommandCodeQuotaInfo | undefined> {
