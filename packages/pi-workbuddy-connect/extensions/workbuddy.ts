@@ -126,9 +126,14 @@ function positiveNumber(value: unknown): number | undefined {
   return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : undefined;
 }
 
+/** 声明价为 0 即为免费。未标价的模型（`undefined` 或空串，如自动路由的 `default-model`）
+ *  同样计入免费：没有任何证据表明它收费，而排除它会把 Auto 从免费清单里悄悄抹掉。
+ *  上游两种写法都存在（`"x0.00"` 与 `"x0.34 credits"`），故先剥掉单位后缀再比对。 */
 export function creditsAreFree(credits: string | undefined): boolean {
-  if (credits === undefined) return false;
-  return /^x?0(?:\.0+)?$/u.test(credits.trim());
+  if (credits === undefined) return true;
+  const price = credits.trim().replace(/\s*credits?\.?$/iu, "").trim();
+  if (price === "") return true;
+  return /^x?0(?:\.0+)?$/u.test(price);
 }
 
 function parseEffort(value: unknown): Effort | undefined {
@@ -225,7 +230,7 @@ export function buildPiModels(config: ProductConfig, scope: Scope) {
     const efforts = row.supportsReasoning
       ? (row.supportedEfforts?.length ? row.supportedEfforts : EFFORTS)
       : [];
-    const credits = row.credits ?? "x?";
+    const credits = row.credits ?? "免费";
     return [{
       id: row.id,
       name: `${row.name} · ${credits}`,
@@ -947,6 +952,19 @@ if (process.argv.includes("--self-check")) {
   if ((prepended.messages as { role: string }[])[0].role !== "system") throw new Error("prepend");
   if (FREE_IDS.length !== 3) throw new Error("count");
   if (!creditsAreFree("x0.00") || creditsAreFree("x1.00")) throw new Error("credits free");
+  if (!creditsAreFree("x0.00 credits") || !creditsAreFree("x0")) throw new Error("credits unit free");
+  if (creditsAreFree("x0.34 credits") || creditsAreFree("x6.67 credits")) throw new Error("credits unit paid");
+  if (!creditsAreFree(undefined) || !creditsAreFree("") || !creditsAreFree("  ")) throw new Error("credits unpriced");
+  const mixed = parseProductConfig(JSON.stringify({
+    models: [
+      { id: "default-model", name: "Auto", credits: "", maxInputTokens: 176_000, maxOutputTokens: 24_000, supportsReasoning: true },
+      { id: "fast-model", name: "Fast", credits: "x0.34 credits", maxInputTokens: 200_000, maxOutputTokens: 32_000, supportsReasoning: true },
+      { id: "hy3", name: "Hy3", credits: "x0.00", maxInputTokens: 192_000, maxOutputTokens: 64_000, supportsReasoning: true },
+    ],
+  }));
+  const mixedFree = freeModelIds(mixed!);
+  if (!mixedFree.includes("default-model") || !mixedFree.includes("hy3")) throw new Error("unpriced free");
+  if (mixedFree.includes("fast-model")) throw new Error("priced unit excluded");
   const flash = buildPiModels({ source: "builtin", models: BUILTIN_MODELS }, "free")
     .find((model) => model.id === "deepseek-v4.1-flash");
   if (flash?.thinkingLevelMap.low !== "low" || flash.thinkingLevelMap.xhigh !== "xhigh" || flash.thinkingLevelMap.max !== "max") {
