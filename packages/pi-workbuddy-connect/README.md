@@ -100,6 +100,26 @@ node --experimental-strip-types extensions/workbuddy.ts --self-check
 - **侧栏显示收敛为两档** `on` / `off`（上游为三档 `full` / `compact` / `off`）。
 - **`off` 时同时清空底部状态栏积分**（上游 `off` 只清 widget，footer 仍显示 `积分 N`）。footer 文本由 `statusText()` 统一产出。
 - 旧设置值向后兼容：`visibility` 为 `full` / `compact` 或缺失时一律视为 `on`，仅 `off` 表示隐藏。
+- **未标价模型计入免费**（上游要求 `credits` 显式声明为 `x0.00`）：`undefined` / 空串同样视为免费，且先剥掉 `credits` 单位后缀再比对（上游两种写法都存在）。
+- **错误信封补全**（见下）：把 WorkBuddy 的 `{code,msg}` 补成 OpenAI 形状，否则 pi 只能看到 `400 status code (no body)`。
+
+### 错误信封补全
+
+WorkBuddy 的错误体是 `{code, msg}`，但 pi 的 openai-completions 路径只保留 OpenAI 形状 `{error:{message,...}}`：`normalizeProviderError` 取 `error.error`，非对象时退化成 `error.message`，最终 `errorMessage` 只剩 `"400 status code (no body)"`。业务码与文案全部丢失，TUI 与 `model-failback` 都看不见原因。
+
+`installErrorEnvelopeRewrite()` 在 `globalThis.fetch` 上装一层（pi 的 OpenAI 客户端用 `options.fetch ?? 默认 fetch`，而 pi 不传 `options.fetch`，这是唯一能触到响应体的位置），只对 `https://www.workbuddy.ai/v2/` 下的**失败响应**生效：
+
+```json
+{"code":14001,"msg":"UsageLimitExceeded"}
+  → {"error":{"message":"UsageLimitExceeded","type":"invalid_request_error","code":"14001"}}
+```
+
+要点：
+
+- `code` 必须保留为**字符串** —— pi 只把 `error.error.code` 透传进 `errorMessage` 的 JSON 里，数字会被丢掉。
+- 已是 OpenAI 形状（`error` 为对象）或无法解析时不二次包装，原响应原样透传。
+- 幂等：重复调用只装一次，避免 `/reload` 后层层包裹。
+- 只做信封补全，不做语义判定 —— 哪些码属于额度终态由 `model-failback` 的 `workbuddy` handler 决定。
 
 其余与上游一致：
 
@@ -115,6 +135,7 @@ node --experimental-strip-types extensions/workbuddy.ts --self-check
 
 ```bash
 node --experimental-strip-types test/scope.test.mts   # 断言 hook 不污染其他 provider 的请求
+node --experimental-strip-types extensions/workbuddy.ts --self-check   # 含错误信封补全的断言
 npx tsc -p tsconfig.json                              # 类型检查
 ```
 

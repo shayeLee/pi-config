@@ -531,6 +531,70 @@ function hasMarker(headers: Record<string, string | null>): boolean {
   return headers[MARKER] === "1" || headers[MARKER.toLowerCase()] === "1";
 }
 
+/**
+ * WorkBuddy 的错误体是 `{code, msg}`，但 pi 的 openai-completions 路径只保留
+ * OpenAI 形状 `{error:{message,...}}`：`normalizeProviderError` 取
+ * `error.error`，非对象时退化成 `error.message`，最终 `errorMessage` 只剩
+ * `"400 status code (no body)"`，业务码与文案全部丢失（TUI 与 model-failback
+ * 都看不见原因）。
+ *
+ * 因此这里在 fetch 层把 `{code,msg}` 补成
+ * `{error:{message, type, code}}`，其中 `code` 原样保留为**字符串**，因为
+ * pi 只把 `error.error.code` 透传进 `errorMessage` 的 JSON 里（数字会被丢掉）。
+ * 这里不做任何语义判定：是否属于额度终态交给 model-failback 的 handler。
+ */
+export function toOpenAIErrorEnvelope(status: number, body: unknown): Record<string, unknown> | undefined {
+  if (typeof body !== "object" || body === null || Array.isArray(body)) return undefined;
+  const record = body as Record<string, unknown>;
+  // 已经是 OpenAI 形状就不要二次包装。
+  if (typeof record.error === "object" && record.error !== null) return undefined;
+  const message = typeof record.msg === "string" && record.msg !== ""
+    ? record.msg
+    : typeof record.message === "string" && record.message !== "" ? record.message : undefined;
+  if (message === undefined) return undefined;
+  const code = record.code === undefined || record.code === null ? undefined : String(record.code);
+  const type = code === undefined
+    ? (status === 429 ? "rate_limit_error" : "invalid_request_error")
+    : "invalid_request_error";
+  return { error: { message, type, ...(code === undefined ? {} : { code }) } };
+}
+
+let errorEnvelopeInstalled = false;
+
+/**
+ * 在 `globalThis.fetch` 上装一层：只改 WorkBuddy 自身的错误响应，其余请求与
+ * 成功响应一律原样透传。pi 的 OpenAI 客户端用 `options.fetch ?? 默认 fetch`，
+ * 而 pi 不传 `options.fetch`，所以这是唯一能触到响应体的位置。
+ *
+ * 幂等：重复调用只装一次，避免 `/reload` 后层层包裹。
+ */
+export function installErrorEnvelopeRewrite(): void {
+  if (errorEnvelopeInstalled) return;
+  errorEnvelopeInstalled = true;
+  const original = globalThis.fetch;
+  globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const response = await original(input, init);
+    if (response.ok) return response;
+    const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+    // 只看我们自己的推理端点，避免影响其它 provider 与积分接口。
+    if (!url.startsWith(`${GLOBAL_BASE}/v2/`)) return response;
+    const text = await response.text().catch(() => "");
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(text) as unknown;
+    } catch {
+      return new Response(text, { status: response.status, statusText: response.statusText, headers: response.headers });
+    }
+    const rewritten = toOpenAIErrorEnvelope(response.status, parsed);
+    if (rewritten === undefined) {
+      return new Response(text, { status: response.status, statusText: response.statusText, headers: response.headers });
+    }
+    const headers = new Headers(response.headers);
+    headers.set("content-type", "application/json");
+    return new Response(JSON.stringify(rewritten), { status: response.status, statusText: response.statusText, headers });
+  }) as typeof fetch;
+}
+
 type Pack = { name: string; remain: number; size: number };
 
 function unwrap(value: unknown): Record<string, unknown> {
@@ -815,6 +879,7 @@ async function refreshWorkBuddyOAuth(credentials: OAuthCredentials): Promise<OAu
 }
 
 export default async function (pi: ExtensionAPI) {
+  installErrorEnvelopeRewrite();
   let settings = loadSettings();
   let models = buildPiModels(loadProductConfig(), settings.scope);
   let ids = new Set(models.map((model) => model.id));
@@ -1048,5 +1113,16 @@ if (process.argv.includes("--self-check")) {
   );
   if (fromTok.uid !== "u9" || fromTok.nickname !== "a@b.c" || fromTok.expiresAtMs !== 11_000) throw new Error("plugin token");
   if (fromTok.enterpriseId !== "e1") throw new Error("enterprise");
+  const quota = toOpenAIErrorEnvelope(400, { code: 14001, msg: "UsageLimitExceeded", requestId: "r" });
+  const err = (quota as { error: { message: string; type: string; code: string } }).error;
+  if (err.message !== "UsageLimitExceeded" || err.code !== "14001") throw new Error("envelope code");
+  if (err.type !== "invalid_request_error") throw new Error("envelope type");
+  const rate = toOpenAIErrorEnvelope(429, { msg: "too many" }) as { error: { type: string } };
+  if (rate.error.type !== "rate_limit_error") throw new Error("envelope 429 type");
+  if (toOpenAIErrorEnvelope(400, { error: { message: "already" } }) !== undefined) throw new Error("envelope no rewrap");
+  if (toOpenAIErrorEnvelope(400, { other: 1 }) !== undefined) throw new Error("envelope no message");
+  if (toOpenAIErrorEnvelope(400, "plain text") !== undefined) throw new Error("envelope non-object");
+  const fromMessage = toOpenAIErrorEnvelope(400, { message: "plain" }) as { error: { message: string } };
+  if (fromMessage.error.message !== "plain") throw new Error("envelope message field");
   console.log("ok");
 }
