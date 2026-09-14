@@ -10,6 +10,7 @@ import { opencodeGoHandler } from "../providers/opencode-go";
 import { opencodeHandler } from "../providers/opencode";
 import { modelscopeHandler } from "../providers/modelscope";
 import { commandCodeHandler } from "../providers/command-code";
+import { workbuddyHandler } from "../providers/workbuddy";
 import { supportedProviders } from "../providers/registry";
 
 interface TestResult {
@@ -1030,10 +1031,127 @@ async function runRegressionTests(): Promise<TestResult[]> {
     );
   }));
 
-  results.push(await runTest("registry contains all five providers", () => {
+  results.push(await runTest("workbuddy balance-exhausted codes are cross-provider terminals", () => {
+    // 这些 code 来自腾讯官方 CodeBuddy CLI 的业务错误码枚举。
+    const codes = ["14001", "14002", "14012", "14013", "14014", "14018", "14019", "6003", "6004"];
+    for (const code of codes) {
+      const verdict = workbuddyHandler.inspect(
+        assistantFailure(
+          "workbuddy",
+          "deepseek-v4.1-flash",
+          `400: {"message":"UsageLimitExceeded","type":"invalid_request_error","code":"${code}"}`,
+        ),
+      );
+      expect(verdict, `workbuddy code ${code} was not detected`);
+      expect(verdict.reason === "quota_exhausted", `unexpected reason for ${code}: ${verdict.reason}`);
+      expect(verdict.scope === "cross-provider", `unexpected scope for ${code}: ${verdict.scope}`);
+    }
+  }));
+
+  results.push(await runTest("workbuddy non-terminal codes never trigger a failback", () => {
+    // 瞬时限流/鉴权/未开通/模型错误/上下文超长/会话数/联网搜索额度。
+    const codes = [
+      "14003", "6005", "6006", "6007", "6008",
+      "14015", "14016", "14017", "11140", "11142", "11141", "11115", "10105", "15001",
+    ];
+    for (const code of codes) {
+      const verdict = workbuddyHandler.inspect(
+        assistantFailure(
+          "workbuddy",
+          "deepseek-v4.1-flash",
+          `429: {"message":"RateLimitError","type":"invalid_request_error","code":"${code}"}`,
+        ),
+      );
+      expect(verdict === null, `workbuddy code ${code} should not trigger a failback`);
+    }
+  }));
+
+  results.push(await runTest("workbuddy unknown code is left alone", () => {
+    // 未知 code 不做猜测,避免误 ban 整个 provider。
+    const verdict = workbuddyHandler.inspect(
+      assistantFailure(
+        "workbuddy",
+        "deepseek-v4.1-flash",
+        '400: {"message":"something new","type":"invalid_request_error","code":"99999"}',
+      ),
+    );
+    expect(verdict === null, "an unknown workbuddy code must not be guessed as terminal");
+  }));
+
+  results.push(await runTest("workbuddy 429 fallback requires quota wording", () => {
+    const quota = workbuddyHandler.inspect(
+      assistantFailure("workbuddy", "m", "429: usage limit reached"),
+    );
+    expect(quota, "429 with quota wording was not detected");
+    expect(quota.reason === "quota_exhausted", `unexpected reason: ${quota.reason}`);
+    expect(quota.scope === "cross-provider", `unexpected scope: ${quota.scope}`);
+
+    // 没有业务码也没有额度文案的 429 属瞬时限流,交给 pi 退避重试。
+    const transient = workbuddyHandler.inspect(
+      assistantFailure("workbuddy", "m", "429: Too many requests"),
+    );
+    expect(transient === null, "a bare 429 must stay transient");
+  }));
+
+  results.push(await runTest("workbuddy ignores other providers and non-error messages", () => {
+    const otherProvider = workbuddyHandler.inspect(
+      assistantFailure("command-code", "m", '400: {"code":"14001"}'),
+    );
+    const wrongStopReason = workbuddyHandler.inspect({
+      role: "assistant",
+      stopReason: "stop",
+      provider: "workbuddy",
+      model: "m",
+      errorMessage: '400: {"code":"14001"}',
+    });
+    // 未经过 workbuddy 扩展信封补全时,errorMessage 会退化成这句:不能误判。
+    const noBody = workbuddyHandler.inspect(
+      assistantFailure("workbuddy", "m", "400 status code (no body)"),
+    );
+    expect(otherProvider === null, "another provider was incorrectly detected");
+    expect(wrongStopReason === null, "a non-error message was incorrectly detected");
+    expect(noBody === null, "a body-less error must not be guessed as terminal");
+  }));
+
+  results.push(await runTest("engine fails back from workbuddy to the next chain node", async () => {
+    const harness = engineHarness(
+      {
+        chains: [["workbuddy/deepseek-v4.1-flash", "modelscope/Qwen/Qwen3.8-Flash-Next", "deepseek/deepseek-flash"]],
+        fallbacks: {},
+      },
+      [
+        { provider: "workbuddy", id: "deepseek-v4.1-flash" },
+        { provider: "modelscope", id: "Qwen/Qwen3.8-Flash-Next" },
+        { provider: "deepseek", id: "deepseek-flash" },
+      ],
+      { provider: "workbuddy", id: "deepseek-v4.1-flash" },
+    );
+
+    await harness.emit(
+      assistantFailure(
+        "workbuddy",
+        "deepseek-v4.1-flash",
+        '400: {"message":"UsageLimitExceeded","type":"invalid_request_error","code":"14001"}',
+      ),
+    );
+
+    const called = harness.pi.setModelCalls as Array<{ provider: string; id: string }>;
+    expect(called.length === 1, `expected 1 switch, got ${called.length}`);
+    expect(called[0].provider === "modelscope", `wrong fallback target: ${called[0].provider}`);
+    expect(harness.pi.userMessages.length === 1, "workbuddy failback did not send steering");
+  }));
+
+  results.push(await runTest("registry contains all six providers", () => {
     const providers = supportedProviders();
-    expect(providers.length === 5, `expected 5 providers, got ${providers.length}`);
-    for (const provider of ["openai-codex", "opencode", "opencode-go", "modelscope", "command-code"]) {
+    expect(providers.length === 6, `expected 6 providers, got ${providers.length}`);
+    for (const provider of [
+      "openai-codex",
+      "opencode",
+      "opencode-go",
+      "modelscope",
+      "command-code",
+      "workbuddy",
+    ]) {
       expect(providers.includes(provider), `missing provider ${provider}`);
     }
   }));

@@ -14,7 +14,7 @@
 
 ## 为什么按 provider 判定
 
-ChatGPT 订阅 backend 与其他 provider 的终态错误形状完全不同(错误码、文案、作用域),因此判定做成了**按 provider 分派**的插拔层。当前已实现并注册 `openai-codex`、`opencode`、`opencode-go`、`modelscope` 与 `command-code`;接入新 provider 只需新增一个文件并注册一行,见下文"扩展新 provider"。
+ChatGPT 订阅 backend 与其他 provider 的终态错误形状完全不同(错误码、文案、作用域),因此判定做成了**按 provider 分派**的插拔层。当前已实现并注册 `openai-codex`、`opencode`、`opencode-go`、`modelscope`、`command-code` 与 `workbuddy`;接入新 provider 只需新增一个文件并注册一行,见下文"扩展新 provider"。
 
 ## 工作原理(openai-codex)
 
@@ -73,6 +73,26 @@ message_end(assistant, error)
 
 - **窗口证据必须有限流门禁**。复刻官方 CLI 的语义:只有在 `status === 429`、`code === "RATE_LIMITED"` 或 `type === "rate_limit_error"` 时,错误正文里的 `window` 字段才算额度终态。否则上游透传的 5xx/401/403 响应只要带上 `rateLimit` 元数据就会被误判为额度耗尽。唯一的例外是**具名窗口文案**(`You've reached your 5-hour usage limit` 这类),它本身已经足够明确。
 - **只解析错误正文,且终态 code 优先**。`inspect()` 先取第一个**括号配平**的 JSON 对象,所有字段(`code` / `type` / `rateLimit`)都从该对象读取,绝不做跨文档的正则子串匹配 —— pi 的 `formatProviderError` 会把 `error.error.metadata.raw` 追加在换行之后,元数据里的同名 token 不得把非终态错误升级为整 provider 级 ban。同时,终态 code 优先于同层/嵌套的非终态 `type`,且与字段顺序无关,避免真终态被漏判。
+
+## 工作原理(workbuddy)
+
+`workbuddy`(WorkBuddy AI 国际版)与腾讯官方 CodeBuddy CLI 共用同一后端,因此判定依据是官方 CLI 里的**业务错误码枚举**与归类表。
+
+这个 provider 有个前提:WorkBuddy 原生错误是 `{code, msg}`,而 pi 的 openai-completions 路径只保留 OpenAI 形状 `{error:{message,...}}`,不改写时 `errorMessage` 会退化成 `"400 status code (no body)"`——业务码与文案全部丢失,TUI 和本扩展都看不见原因。`pi-workbuddy-connect` 扩展在 fetch 层把 `{code,msg}` 补成 `{error:{message,type,code}}`(`code` 保留为字符串,因为 pi 只透传 `error.error.code`),本 handler 才能读到 `"400: {\"message\":\"…\",\"code\":\"14001\"}"`。
+
+`quota_exhausted` / `cross-provider`,覆盖账户/计划额度耗尽:
+
+| code | 含义 |
+|---|---|
+| `14001` | UsageLimitExceeded |
+| `14002` | ConversationChatTooMany(同一额度的并发表现) |
+| `14012` / `14013` / `14014` | 企业/腾讯侧额度耗尽 |
+| `14018` / `14019` | 用户额度 / token 预算耗尽 |
+| `6003` / `6004` | 每小时 / 每日 token 配额 |
+
+无业务码时按官方兜底把 `429` 视为额度耗尽,但要求文案里出现额度语义(`usage limit` / `quota` / `balance` / `insufficient credits`),避免把上游透传的瞬时限流当终态。
+
+**不触发**:`14003` 与 `6005`-`6008`(瞬时限流,交给 pi 退避重试)、`14015`/`11140`/`11142`(鉴权)、`14016`/`14017`(未开通)、`11141`(模型行为错误)、`11115`(上下文超长,应触发压缩)、`10105`(会话数超限)、`15001`(联网搜索额度)。**未知 code 一律不猜测**,避免误 ban 整个 provider。
 
 ## 配置
 
@@ -154,7 +174,7 @@ E2E 会真实调用 provider，前提是 `opencode` 账户当前无余额，并�
 
 当前实现已经完成并启用:
 
-- 支持 `openai-codex`、`opencode`、`opencode-go`、`modelscope`、`command-code` 五个 provider;
+- 支持 `openai-codex`、`opencode`、`opencode-go`、`modelscope`、`command-code`、`workbuddy` 六个 provider;
 - 使用 `chains` 表达多层 failback，精确节点优先于通配节点;
 - 终态发生后只 ban 精确的 `provider/model`，不 ban 整个 provider;
 - ban 在同一主 session 的 worker/reviewer 子进程之间共享，不跨 session;
@@ -192,13 +212,15 @@ export const myProviderHandler: ProviderFailbackHandler = {
 ## 已验证
 
 - 扩展被 pi 正常加载,不干扰正常任务
-- 五个 provider 的终态判定、provider 隔离和无关错误过滤
+- 六个 provider 的终态判定、provider 隔离和无关错误过滤
 - Codex 流式原文 `Codex error: The usage limit has been reached`
 - compaction summarization 期间的 Codex 额度终态，以及切换后重新压缩上下文
 - OpenCode `CreditsError / Insufficient balance`、OpenCode Go `GoUsageLimitError` 与 `503 / Endpoint is unavailable`
 - ModelScope `insufficient_quota` 与 `429 {"message":"insufficient balance"}`
 - Command Code 四类终态(`model_not_in_plan` / `quota_exhausted` / `usage_limit` / `spend_limit`)判定与 `scope` 语义,以及瞬时限流、5xx、`401`、`403 upgrade_required`、`unsupported_model`、`cmd_zdr_no_providers` 的离线排除用例
 - Command Code 解析纪律:换行后追加的 `metadata.raw` 与嵌套字段里的同名 token 不得把非终态错误升级为终态;终态 code 不被同层非终态 `type` 覆盖;`MODEL_NOT_IN_PLAN` 走 `scope:"any"` 时不会跳过同 provider 的可用模型
+- WorkBuddy 账户额度码(`14001` 等 9 个)判为终态、非终态码(限流/鉴权/未开通/模型错误/上下文超长/会话数/联网搜索)全部排除、未知 code 不猜测、无 code 的 `429` 需额度文案佐证;以及 workbuddy 链路的引擎级接续
+- `pi-workbuddy-connect` 的错误信封补全:`{code,msg}` → `{error:{message,type,code}}`,`code` 以字符串保留(实测真实 API 的 `11101` 与 mock 的 `14001` 均能活到 `errorMessage`)
 - ModelScope Qwen 的 `insufficient balance` 真实 lite subagent 接续
 - 两层 failback、链内已 ban 节点跳过、环检测、连跳上限和 cross-provider 守卫
 - worker/reviewer 子进程启动前跳过已 ban 模型

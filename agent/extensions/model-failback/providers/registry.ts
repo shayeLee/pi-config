@@ -9,6 +9,7 @@ import { opencodeHandler } from "./opencode";
 import { opencodeGoHandler } from "./opencode-go";
 import { modelscopeHandler } from "./modelscope";
 import { commandCodeHandler } from "./command-code";
+import { workbuddyHandler } from "./workbuddy";
 
 const HANDLERS: readonly ProviderFailbackHandler[] = [
   openaiCodexHandler,
@@ -16,6 +17,7 @@ const HANDLERS: readonly ProviderFailbackHandler[] = [
   opencodeGoHandler,
   modelscopeHandler,
   commandCodeHandler,
+  workbuddyHandler,
 ];
 
 export function getProviderHandler(provider: unknown): ProviderFailbackHandler | undefined {
