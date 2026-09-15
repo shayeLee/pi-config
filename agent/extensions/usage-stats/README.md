@@ -19,7 +19,7 @@ Pi usage 统计扩展，按 `provider/model` 汇总 Token 与费用。
 provider/model | tokens(M) | cost | hit% | input(M) | output(M) | cacheR(M) | cacheW(M)
 ```
 
-若当前已配置 `openai-codex`（ChatGPT OAuth）登录，面板顶部会额外显示对应的订阅额度；`workbuddy` 积分默认显示，`command-code`、`opencode-go` 额度与 DeepSeek API 余额默认隐藏，可通过配置开启或关闭。未配置或请求失败时不显示。
+若当前已配置 `openai-codex`（ChatGPT OAuth）登录，面板顶部会额外显示对应的订阅额度；`workbuddy` 积分默认显示，`command-code`、`opencode-go` 额度与 DeepSeek API 余额默认隐藏，可通过配置开启或关闭。未配置凭据时不显示；已配置但额度请求失败时，Codex 行会显示不可用原因。
 
 `hit%` 是当前选定时间范围的累计缓存命中率：
 
@@ -75,24 +75,34 @@ Authorization: Bearer <access token>
 ChatGPT-Account-Id: <account id>   # 从 access token 的 JWT claim 中仅内存解析，不落盘、不显示
 ```
 
-响应为 `rate_limit.primary_window`（5 小时窗口）与 `rate_limit.secondary_window`（周窗口），面板显示每个窗口的剩余百分比（100 - 已用百分比）与重置时间，例如：
+响应中的 `rate_limit.primary_window` 与 `rate_limit.secondary_window` 为账号级滚窗口，面板显示每个窗口的剩余百分比（100 - 已用百分比）与重置时间。窗口的实际时长由服务端按 plan 决定，例如：
 
 ```text
 Codex quota (plus): 5h 58% left · resets 14:32  │  weekly 93% left · resets 09-08 00:00
+Codex quota (prolite): weekly 96% left · resets 09-25 10:30
 ```
+
+Pro 系列 plan（服务端 `plan_type` 为 `prolite`）不再返回 5 小时窗口，只返回一个周窗口，面板也只显示该窗口——这是服务端口径，不是扩展少画了一栏。
 
 字段解析做兼容性处理，任一字段缺失、类型不符或为 null 都不会报错：
 
 - 百分比：`used_percent`（0-100）；缺失时退回 `used / max × 100`，超界钳制到 0-100
 - 重置时间：`reset_at`（Unix 秒）→ `resets_at`（ISO 字符串）→ `reset_after_seconds` / `resets_in_secs`（相对秒）
 - 窗口时长：`limit_window_seconds` / `window_minutes`；300 分钟显示为 `5h`，10080 分钟显示为 `weekly`，其余按小时/分钟格式化
+- 账号级窗口全部缺失时，回退到 `additional_rate_limits[]` 的模型级窗口（按 `limit_name` + 时长命名，如 `Codex-Spark 5h`，最多 3 条）
 - 兼容旧版 `/backend-api/usage` 的 `limits["5h"]` / `limits["1week"]` 数组结构
 
 安全与降级：
 
-- 绝不输出或持久化 access token、响应原文；面板仅显示窗口标签、百分比、重置时间与 plan type
-- 未登录、网络失败、超时（8s）、非 2xx 或解析失败时静默跳过该行，不影响现有统计与面板
-- 请求与扫描并行，不拖慢 `/usage` 打开速度；结果在内存中缓存 90 秒
+- 绝不输出或持久化 access token、响应原文；面板仅显示窗口标签、百分比、重置时间、plan type 与错误类别
+- **未登录（无 `openai-codex` 凭据）时整行静默隐藏**；已配置凭据但请求失败时，改为显示一行原因面而不影响其他统计：
+
+  ```text
+  Codex quota (prolite): unavailable (HTTP 401) · Codex 登录可能已失效，运行 /login openai-codex 重新登录
+  ```
+
+  `HTTP <status>` / `timeout after 8s` / `request failed` / `non-JSON response` / `unexpected response shape` / `no usable windows` 均为错误类别，不包含任何凭据或响应内容
+- 请求与扫描并行，不拖慢 `/usage` 打开速度；结果（含失败原因）在内存中缓存 90 秒
 
 ## Command Code 订阅额度
 

@@ -399,6 +399,11 @@ export interface SubscriptionQuotaWindow {
 export interface SubscriptionQuotaInfo {
 	planType?: string;
 	windows: SubscriptionQuotaWindow[];
+	/**
+	 * 额度取不到时的简短原因（仅错误类别，如 `HTTP 401`、`timeout`，
+	 * 绝不含 access token 或响应原文）。凭据未配置时不设置，整行静默隐藏。
+	 */
+	unavailable?: string;
 }
 
 let codexQuotaInFlight: Promise<SubscriptionQuotaInfo | undefined> | undefined;
@@ -456,6 +461,13 @@ function minutesLabel(minutes: number): string {
 	return `${Math.floor(minutes / 60)}h ${Math.round(minutes % 60)}m`;
 }
 
+/** 只保留可读字符的短标签，避免把响应原文带进面板。 */
+function safeLabel(value: unknown, maxLength = 24): string | undefined {
+	if (typeof value !== "string") return undefined;
+	const trimmed = value.trim();
+	return trimmed.length > 0 && /^[A-Za-z0-9_. -]+$/.test(trimmed) ? trimmed.slice(0, maxLength) : undefined;
+}
+
 function parseCodexWindow(value: unknown, fallbackLabel: string, fallbackMinutes: number | undefined): SubscriptionQuotaWindow | undefined {
 	if (!value || typeof value !== "object") return undefined;
 	const record = value as Record<string, unknown>;
@@ -484,6 +496,29 @@ function parseCodexQuota(json: unknown): SubscriptionQuotaInfo | undefined {
 		if (secondary) windows.push(secondary);
 	}
 
+	// Pro / prolite shape: the account-wide limit may collapse to a single window,
+	// with per-model limits published separately under additional_rate_limits.
+	// Used only as a fallback so the row never disappears entirely.
+	if (windows.length === 0 && Array.isArray(root.additional_rate_limits)) {
+		for (const entry of root.additional_rate_limits as unknown[]) {
+			if (!entry || typeof entry !== "object") continue;
+			const record = entry as Record<string, unknown>;
+			const details = record.rate_limit;
+			if (!details || typeof details !== "object") continue;
+			const nested = details as Record<string, unknown>;
+			const name = safeLabel(record.limit_name) ?? "limit";
+			for (const candidate of [nested.primary_window, nested.secondary_window]) {
+				const parsed = parseCodexWindow(candidate, name, undefined);
+				if (!parsed) continue;
+				const label = parsed.label === name ? name : `${name} ${parsed.label}`;
+				if (windows.some((window) => window.label === label && window.percent === parsed.percent)) continue;
+				if (windows.length >= 3) break;
+				windows.push({ ...parsed, label });
+			}
+			if (windows.length >= 3) break;
+		}
+	}
+
 	// Legacy shape (older /backend-api/usage): limits["5h"] / limits["1week"] entries.
 	if (windows.length === 0 && root.limits && typeof root.limits === "object") {
 		for (const [key, value] of Object.entries(root.limits as Record<string, unknown>)) {
@@ -498,9 +533,8 @@ function parseCodexQuota(json: unknown): SubscriptionQuotaInfo | undefined {
 		}
 	}
 
-	if (windows.length === 0) return undefined;
-	const rawPlan = root.plan_type ?? root.planType;
-	const planType = typeof rawPlan === "string" && /^[A-Za-z0-9_. -]+$/.test(rawPlan) ? rawPlan : undefined;
+	const planType = safeLabel(root.plan_type ?? root.planType, 32);
+	if (windows.length === 0) return { planType, windows: [], unavailable: "no usable windows" };
 	return { planType, windows };
 }
 
@@ -542,15 +576,24 @@ async function fetchOpenAICodexQuota(resolver: SubscriptionQuotaAuthResolver, si
 			const accountId = chatgptAccountIdFromAccessToken(accessToken);
 			if (accountId) headers["ChatGPT-Account-Id"] = accountId;
 			const response = await fetch(`${baseUrl}${OPENAI_CODEX_USAGE_PATH}`, { headers, signal: controller.signal });
-			if (!response.ok) return undefined;
-			return parseCodexQuota((await response.json()) as unknown);
+			if (!response.ok) return { windows: [], unavailable: `HTTP ${response.status}` };
+			let json: unknown;
+			try {
+				json = await response.json();
+			} catch {
+				return { windows: [], planType: undefined, unavailable: "non-JSON response" };
+			}
+			return parseCodexQuota(json) ?? { windows: [], unavailable: "unexpected response shape" };
 		} finally {
 			clearTimeout(timer);
 			signal?.removeEventListener("abort", onAbort);
 		}
-	} catch {
-		// Quota display is best-effort; any failure leaves /usage unchanged.
-		return undefined;
+	} catch (error: unknown) {
+		// 面板要求「取不到就不影响统计」。用户中途关闭面板时保持静默；
+		// 其余失败给出最短原因，让 /usage 说明为什么这一行没数据，而不是整行消失。
+		if (signal?.aborted) return undefined;
+		const aborted = error instanceof Error && error.name === "AbortError";
+		return { windows: [], unavailable: aborted ? "timeout after 8s" : "request failed" };
 	}
 }
 
@@ -591,6 +634,11 @@ function formatResetTime(date: Date): string {
 function renderCodexQuotaLines(quota: SubscriptionQuotaInfo, width: number, theme: any): string[] {
 	const innerWidth = Math.max(1, width - 2);
 	const planType = quota.planType ? ` (${quota.planType})` : "";
+	if (quota.windows.length === 0) {
+		const reason = quota.unavailable ?? "no data";
+		const hint = /^HTTP 4(01|03)$/.test(reason) ? " · Codex 登录可能已失效，运行 /login openai-codex 重新登录" : "";
+		return [truncateToWidth(theme.fg("warning", `Codex quota${planType}: unavailable (${reason})${hint}`), innerWidth, "")];
+	}
 	const parts = quota.windows.map((window) => {
 		const reset = window.resetsAt ? ` · resets ${formatResetTime(window.resetsAt)}` : "";
 		return `${window.label} ${Math.round(100 - window.percent)}% left${reset}`;
