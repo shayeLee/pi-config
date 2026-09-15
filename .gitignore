@@ -20,6 +20,10 @@ agent/sessions
 agent/subagent-usage
 agent/usage-cache.json
 
+# thinking-breaker 探针日志（含思考原文，仅本机留存）
+agent/thinking-breaker/
+agent/thinking-breaker.json
+
 # 旧 git 包克隆（含嵌套 .git，体积大，不入库）
 agent/git/
 
