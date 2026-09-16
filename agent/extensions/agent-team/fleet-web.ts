@@ -392,9 +392,8 @@ let displayedDetail = "";
 let refreshScheduled = false;
 let refreshInFlight = false;
 let refreshPending = false;
-let autoScrollPausedUntil = 0;
-let autoScrollPauseTimer;
 let autoScrolling = false;
+let userScrolledAway = false;
 let shouldAutoScroll = false;
 let knownToolBlockIds = new Set();
 let previousToolUpdatesFingerprint;
@@ -542,26 +541,32 @@ function clearToolStreamBlocks() {
 	}
 }
 
+const BOTTOM_EPSILON = 8;
+let lastScrollTop = 0;
+
 function scrollToBottom() {
 	autoScrolling = true;
 	detail.scrollTo({ top: detail.scrollHeight });
 	requestAnimationFrame(() => { autoScrolling = false; });
 }
 
-function pauseAutoScroll() {
+// 用户手动滚动离开底部后就停止自动滚动；只有用户自己滚回底部附近才恢复。
+function trackUserScroll() {
+	const top = detail.scrollTop;
+	const scrollingDown = top > lastScrollTop;
+	lastScrollTop = top;
 	if (autoScrolling) return;
-	autoScrollPausedUntil = Date.now() + 5000;
-	if (autoScrollPauseTimer) clearTimeout(autoScrollPauseTimer);
-	autoScrollPauseTimer = setTimeout(() => {
-		autoScrollPauseTimer = undefined;
-		if (shouldAutoScroll && Date.now() >= autoScrollPausedUntil) scrollToBottom();
-	}, 5000);
+	const distance = detail.scrollHeight - top - detail.clientHeight;
+	// 流式内容会让底部持续变高，用户滚到底时距离可能已经大于一个像素级阈值，
+	// 因此向下滚动且已接近底部时也视为回到底部。
+	if (distance <= BOTTOM_EPSILON || (scrollingDown && distance <= Math.max(64, detail.clientHeight * 0.25))) {
+		userScrolledAway = false;
+		return;
+	}
+	userScrolledAway = true;
 }
 
-detail.addEventListener("wheel", pauseAutoScroll, { passive: true });
-detail.addEventListener("pointerdown", pauseAutoScroll, { passive: true });
-detail.addEventListener("touchstart", pauseAutoScroll, { passive: true });
-document.addEventListener("keydown", pauseAutoScroll);
+detail.addEventListener("scroll", trackUserScroll, { passive: true });
 
 function duration(run) {
 	const end = run.endedAt || Date.now();
@@ -1214,7 +1219,7 @@ async function refresh() {
 		const hasStreamingAssistant = Boolean(data.run && data.run.streaming && data.run.streaming.length > 0);
 		shouldAutoScroll = Boolean(data.run && (initialLoad || hasNewToolBlock || hasToolBlockUpdate || (data.run.status === "running" && (hasStreamingToolUpdate || hasStreamingAssistant))));
 		const detailChanged = renderDetail(data.run, data.revision);
-		if (detailChanged && shouldAutoScroll && Date.now() >= autoScrollPausedUntil) requestAnimationFrame(scrollToBottom);
+		if (detailChanged && shouldAutoScroll && !userScrolledAway) requestAnimationFrame(scrollToBottom);
 		updated.textContent = "实时连接";
 		updated.classList.remove("off", "reconnecting");
 	} catch (error) {
@@ -1287,7 +1292,7 @@ events.addEventListener("update", (event) => {
 	}
 	if (Array.isArray(data.deltas)) {
 		for (const delta of data.deltas) applyStreamingDelta(delta);
-		if (shouldAutoScroll && Date.now() >= autoScrollPausedUntil) requestAnimationFrame(scrollToBottom);
+		if (shouldAutoScroll && !userScrolledAway) requestAnimationFrame(scrollToBottom);
 	}
 });
 events.addEventListener("shutdown", closeFleetPage);
