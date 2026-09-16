@@ -28,3 +28,8 @@ export function getProviderHandler(provider: unknown): ProviderFailbackHandler |
 export function supportedProviders(): string[] {
   return HANDLERS.map((h) => h.providerId);
 }
+
+/** 新任务开始时清空所有 provider 的瞬时状态计数。 */
+export function resetProviderTransientState(): void {
+  for (const handler of HANDLERS) handler.resetTransientState?.();
+}

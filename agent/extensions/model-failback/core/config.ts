@@ -23,6 +23,11 @@ export interface FailbackConfig {
   banFileTtlMs?: number;
   /** 配额恢复后自动切回原模型(agent_start 时机检查)。默认 false。 */
   autoRestore?: boolean;
+  /**
+   * workbuddy:同一模型在 2 分钟内连续几次上游网关故障(502/504 页)后允许
+   * 一次跨 provider 逃逸。默认 3;<=0 关闭逃逸(全部交给 pi 重试)。
+   */
+  workbuddyTransientOutageStreak?: number;
 }
 
 export const DEFAULT_COOLDOWN_MS = 60_000;
@@ -59,6 +64,10 @@ export function loadConfig(path?: string): FailbackConfig {
           ? raw.banFileTtlMs
           : DEFAULT_BAN_FILE_TTL_MS,
       autoRestore: raw.autoRestore === true,
+      ...(typeof raw.workbuddyTransientOutageStreak === "number" &&
+      Number.isFinite(raw.workbuddyTransientOutageStreak)
+        ? { workbuddyTransientOutageStreak: raw.workbuddyTransientOutageStreak }
+        : {}),
     };
   } catch {
     return { fallbacks: {} };

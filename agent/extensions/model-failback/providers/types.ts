@@ -37,6 +37,11 @@ export interface ProviderFailbackHandler {
   /** 返回 null = 与该 handler 无关或非终态;返回 verdict = 需要 failback */
   inspect(message: unknown): TerminalVerdict | null;
   /**
+   * 新一轮任务开始时清空该 provider 的会话内易变状态(如瞬时故障连续计数)。
+   * 与终态判定无关,只是避免长任务里偶发 5xx 累加成一次有界逃逸。
+   */
+  resetTransientState?(): void;
+  /**
    * 当错误文本没有恢复时间时，best-effort 查询账户额度窗口。
    * 仅在已确认终态后由引擎调用；失败返回 undefined，绝不阻断 failback。
    */

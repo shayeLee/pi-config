@@ -94,6 +94,22 @@ message_end(assistant, error)
 
 **不触发**:`14003` 与 `6005`-`6008`(瞬时限流,交给 pi 退避重试)、`14015`/`11140`/`11142`(鉴权)、`14016`/`14017`(未开通)、`11141`(模型行为错误)、`11115`(上下文超长,应触发压缩)、`10105`(会话数超限)、`15001`(联网搜索额度)。**未知 code 一律不猜测**,避免误 ban 整个 provider。
 
+### 上游网关故障的有界逃逸
+
+WorkBuddy 的推理端点(apisix/openresty 网关)会以**纯 HTML 页面**返回 500/502/503/504/524,`errorMessage` 里既没有业务码也没有 JSON 体。pi 把它归为可重试错误(`RETRYABLE_PROVIDER_ERROR_PATTERN` 命中这些状态码),但 WorkBuddy 的 Flash 单请求就要数分钟,退避重试只会在数十秒内再次撞上同一个网关页,最终把整轮任务交还给用户。
+
+因此加了**有界逃逸**:同一模型在 `TRANSIENT_OUTAGE_WINDOW_MS`(2 分钟)内连续 `workbuddyTransientOutageStreak` 次(默认 3)命中网关故障时,判为 `endpoint_unavailable` + `scope: cross-provider`,并带 `TRANSIENT_OUTAGE_COOLDOWN_MS`(5 分钟)的 `resetsAt` —— 换到链上其它 provider 继续任务,冷却期过后 ban 自动过期、模型重新可用。
+
+计数不区分具体状态码:真实会话里 500/502/504/`Provider finish_reason: error` 是**交替**出现的(同一个上游不稳定),因此它们共享同一个连续计数。
+
+解析纪律:
+
+- **必须没有结构化错误体**。只要 `errorMessage` 里有括号配平的 JSON,就一律走业务码判定 —— 上游透传的 JSON 哪怕带 500/502 字段也不能当成网关页。
+- **网关页特征而不是单纯状态码**。`500 Internal Server Error` 这种没有 HTML 体的裸状态行不触发;必须同时命中 HTML 标记或 `Bad Gateway` / `Gateway Time-out` / `openresty` / `apisix` 这类只有网关才会用的短语。
+- **计数按 `provider/model` 隔离**,并且每个新任务开始时清零(`agent_start` 非 steering 分支),长任务里跨小时的偶发 5xx 不会累加。
+- **阈值 <=0 完全关闭**该逃逸,回到"全部交给 pi 重试"的旧行为。
+- 逃逸成功后计数复位,后续单次故障又回到瞬时错误语义。
+
 ## 配置
 
 `~/.pi/agent/model-failback.json`:链式表达 `A → B → C`,首节点可为 `provider/*` 通配:
@@ -120,6 +136,7 @@ message_end(assistant, error)
 | `maxConsecutive` | `3` | 单次 failback 链允许的最大连续切换次数 |
 | `banFileTtlMs` | `604800000` | 孤儿 session ban 文件的惰性清理 TTL(7 天);设为 `0` 或负数关闭 |
 | `autoRestore` | `false` | 配额恢复后自动切回原模型(每次 agent 启动时检查,不打断进行中的任务) |
+| `workbuddyTransientOutageStreak` | `3` | workbuddy:2 分钟内同一模型连续几次上游 5xx 网关页后允许一次跨 provider 逃逸;`<=0` 关闭 |
 
 ### 链式语义
 
@@ -229,6 +246,7 @@ export const myProviderHandler: ProviderFailbackHandler = {
 - Command Code 四类终态(`model_not_in_plan` / `quota_exhausted` / `usage_limit` / `spend_limit`)判定与 `scope` 语义,以及瞬时限流、5xx、`401`、`403 upgrade_required`、`unsupported_model`、`cmd_zdr_no_providers` 的离线排除用例
 - Command Code 解析纪律:换行后追加的 `metadata.raw` 与嵌套字段里的同名 token 不得把非终态错误升级为终态;终态 code 不被同层非终态 `type` 覆盖;`MODEL_NOT_IN_PLAN` 走 `scope:"any"` 时不会跳过同 provider 的可用模型
 - WorkBuddy 账户额度码(`14001` 等 9 个)判为终态、非终态码(限流/鉴权/未开通/模型错误/上下文超长/会话数/联网搜索)全部排除、未知 code 不猜测、无 code 的 `429` 需额度文案佐证;以及 workbuddy 链路的引擎级接续
+- WorkBuddy 上游网关故障的有界逃逸:单次 502/504 页保持瞬时、连续到阈值才逃逸、逃逸后计数复位、阈值 `<=0` 关闭、计数按模型隔离;带 JSON 体的响应与裸 5xx 状态行都不误判为网关页;以及引擎级的连续故障切换与 steering
 - `pi-workbuddy-connect` 的错误信封补全:`{code,msg}` → `{error:{message,type,code}}`,`code` 以字符串保留(实测真实 API 的 `11101` 与 mock 的 `14001` 均能活到 `errorMessage`)
 - ModelScope Qwen 的 `insufficient balance` 真实 lite subagent 接续
 - 两层 failback、链内已 ban 节点跳过、环检测、连跳上限和 cross-provider 守卫
