@@ -28,6 +28,9 @@ const resultPath = join(tempDir, "result.json");
 const probePath = fileURLToPath(new URL("./regression-probe.ts", import.meta.url));
 const extensionPath = fileURLToPath(new URL("../index.ts", import.meta.url));
 
+// 可选用例名子串过滤：`node tests/run-regression.mjs ttl` 或 MODEL_FAILBACK_TEST_FILTER=ttl
+const filter = process.argv[2]?.trim() || process.env.MODEL_FAILBACK_TEST_FILTER?.trim() || undefined;
+
 try {
   const child = await runPi(
     ["--no-extensions", "-e", extensionPath, "-e", probePath, "--list-models", "opencode-go"],
@@ -35,6 +38,7 @@ try {
       ...process.env,
       PI_OFFLINE: "1",
       MODEL_FAILBACK_TEST_RESULT: resultPath,
+      ...(filter ? { MODEL_FAILBACK_TEST_FILTER: filter } : {}),
     },
   );
 
@@ -52,6 +56,10 @@ try {
   for (const test of result.results ?? []) {
     console.log(`${test.passed ? "PASS" : "FAIL"} ${test.name}${test.detail ? ` — ${test.detail}` : ""}`);
   }
+  const skipped = typeof result.total === "number" && typeof result.matched === "number"
+    ? result.total - result.matched
+    : 0;
+  if (filter) console.log(`\n过滤器 "${filter}"：命中 ${result.matched ?? 0} 个用例，跳过 ${skipped} 个`);
   console.log(`\n${result.passed ? "回归测试通过" : "回归测试失败"}`);
 
   if (child.code !== 0 || child.signal || result.passed !== true) {

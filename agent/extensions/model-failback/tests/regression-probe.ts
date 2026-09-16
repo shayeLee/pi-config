@@ -17,7 +17,12 @@ interface TestResult {
   name: string;
   passed: boolean;
   detail?: string;
+  /** 被 MODEL_FAILBACK_TEST_FILTER 过滤掉、未实际执行的用例。 */
+  skipped?: boolean;
 }
+
+/** 用例名子串过滤（大小写不敏感）；未设置时跑全量。 */
+const TEST_FILTER = process.env.MODEL_FAILBACK_TEST_FILTER?.trim() || undefined;
 
 type Handler = (...args: any[]) => unknown;
 
@@ -173,6 +178,9 @@ function engineHarness(
 }
 
 async function runTest(name: string, test: () => void | Promise<void>): Promise<TestResult> {
+  if (TEST_FILTER && !name.toLowerCase().includes(TEST_FILTER.toLowerCase())) {
+    return { name, passed: true, skipped: true };
+  }
   try {
     await test();
     return { name, passed: true };
@@ -1407,19 +1415,31 @@ export default async function regressionProbe(_pi: ExtensionAPI): Promise<void> 
   const resultPath = process.env.MODEL_FAILBACK_TEST_RESULT;
   if (!resultPath) throw new Error("MODEL_FAILBACK_TEST_RESULT is required");
 
-  let results: TestResult[];
+  let all: TestResult[];
   try {
-    results = await runRegressionTests();
+    all = await runRegressionTests();
   } catch (error) {
-    results = [{
+    all = [{
       name: "regression probe",
       passed: false,
       detail: error instanceof Error ? error.message : String(error),
     }];
   }
 
+  const matched = all.filter((result) => !result.skipped);
+  const results = matched.length > 0
+    ? matched
+    : [{
+        name: "regression probe",
+        passed: false,
+        detail: `没有用例匹配 MODEL_FAILBACK_TEST_FILTER="${TEST_FILTER}"`,
+      }];
+
   const output = {
     passed: results.every((result) => result.passed),
+    filter: TEST_FILTER ?? null,
+    total: all.length,
+    matched: matched.length,
     results,
   };
   mkdirSync(dirname(resultPath), { recursive: true });

@@ -162,6 +162,15 @@ message_end(assistant, error)
 volta run node tests/run-regression.mjs
 ```
 
+只跑名字匹配某个子串的用例（大小写不敏感）：
+
+```bash
+volta run node tests/run-regression.mjs ttl
+MODEL_FAILBACK_TEST_FILTER=ban volta run node tests/run-regression.mjs
+```
+
+过滤只影响执行范围：未命中的用例标记为 skipped，不参与 `passed` 判定；过滤器没有命中任何用例时按失败处理。
+
 显式运行真实 OpenCode → RightCode failback E2E：
 
 ```bash
