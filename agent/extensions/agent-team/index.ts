@@ -651,6 +651,7 @@ async function runSingleAgent(
 	modelRegistry: ModelRegistry | undefined,
 	projectTrusted: boolean | undefined,
 	usageRootSessionId: string | undefined,
+	failbackParentSessionId: string | undefined,
 ): Promise<SingleResult> {
 	const configuredAgent = agents.find((a) => a.name === agentName);
 
@@ -910,7 +911,9 @@ async function runSingleAgent(
 
 		const exitCode = await new Promise<number>((resolve) => {
 			const invocation = getPiInvocation(args);
-			const failbackSessionId = process.env.MODEL_FAILBACK_SESSION_ID ?? process.env.PI_SESSION_ID;
+			// Child Pi has no hosted SessionManager. Propagate the invoking extension
+			// context's session ID explicitly; process env is process-global and can
+			// belong to another hosted session (or to a standalone CLI parent).
 			const proc = spawn(invocation.command, invocation.args, {
 				cwd: cwd ?? defaultCwd,
 				detached: process.platform !== "win32",
@@ -918,8 +921,8 @@ async function runSingleAgent(
 				stdio: ["ignore", "pipe", "pipe"],
 				env: {
 					...process.env,
-					...(failbackSessionId
-						? { MODEL_FAILBACK_SESSION_ID: failbackSessionId }
+					...(failbackParentSessionId
+						? { MODEL_FAILBACK_SESSION_ID: failbackParentSessionId }
 						: {}),
 					...(usageRootSessionId ? { PI_USAGE_ROOT_SESSION_ID: usageRootSessionId } : {}),
 					MODEL_FAILBACK_CHILD: "1",
@@ -1193,6 +1196,12 @@ export default function (pi: ExtensionAPI) {
 			const agentScope: AgentScope = params.agentScope ?? "both";
 			// Retain the persisted root session across nested --no-session subagents.
 			const usageRootSessionId = process.env.PI_USAGE_ROOT_SESSION_ID ?? ctx.sessionManager.getSessionId();
+			// A host must use its own context (process.env is shared by hosted sessions).
+			// A --no-session child has no root SessionManager, so nested children retain
+			// the root ID explicitly injected by their parent.
+			const failbackParentSessionId = process.env.MODEL_FAILBACK_CHILD === "1"
+				? process.env.MODEL_FAILBACK_SESSION_ID
+				: ctx.sessionManager.getSessionId();
 			const discovery = discoverAgents(ctx.cwd, agentScope);
 			const agents = discovery.agents;
 
@@ -1261,6 +1270,7 @@ export default function (pi: ExtensionAPI) {
 						ctx.modelRegistry,
 						ctx.isProjectTrusted?.(),
 						usageRootSessionId,
+						failbackParentSessionId,
 					);
 					results.push(result);
 
@@ -1344,6 +1354,7 @@ export default function (pi: ExtensionAPI) {
 						ctx.modelRegistry,
 						ctx.isProjectTrusted?.(),
 						usageRootSessionId,
+						failbackParentSessionId,
 					);
 					allResults[index] = result;
 					emitParallelUpdate();
@@ -1387,6 +1398,7 @@ export default function (pi: ExtensionAPI) {
 					ctx.modelRegistry,
 					ctx.isProjectTrusted?.(),
 					usageRootSessionId,
+					failbackParentSessionId,
 				);
 				const isError = isFailedResult(result);
 				if (isError) {

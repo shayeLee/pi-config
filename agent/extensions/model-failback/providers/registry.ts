@@ -9,27 +9,34 @@ import { opencodeHandler } from "./opencode";
 import { opencodeGoHandler } from "./opencode-go";
 import { modelscopeHandler } from "./modelscope";
 import { commandCodeHandler } from "./command-code";
-import { workbuddyHandler } from "./workbuddy";
+import { createWorkbuddyHandler } from "./workbuddy";
 
-const HANDLERS: readonly ProviderFailbackHandler[] = [
+const STATIC_HANDLERS: readonly ProviderFailbackHandler[] = [
   openaiCodexHandler,
   opencodeHandler,
   opencodeGoHandler,
   modelscopeHandler,
   commandCodeHandler,
-  workbuddyHandler,
 ];
 
-export function getProviderHandler(provider: unknown): ProviderFailbackHandler | undefined {
-  if (typeof provider !== "string") return undefined;
-  return HANDLERS.find((h) => h.providerId === provider);
+export interface ProviderRegistry {
+  get(provider: unknown): ProviderFailbackHandler | undefined;
+  resetTransientState(): void;
+}
+
+/** Each engine receives its own transient provider state. */
+export function createProviderRegistry(getWorkbuddyTransientOutageStreak?: () => number): ProviderRegistry {
+  const handlers = [...STATIC_HANDLERS, createWorkbuddyHandler(getWorkbuddyTransientOutageStreak)];
+  return {
+    get(provider) {
+      return typeof provider === "string" ? handlers.find((handler) => handler.providerId === provider) : undefined;
+    },
+    resetTransientState() {
+      for (const handler of handlers) handler.resetTransientState?.();
+    },
+  };
 }
 
 export function supportedProviders(): string[] {
-  return HANDLERS.map((h) => h.providerId);
-}
-
-/** 新任务开始时清空所有 provider 的瞬时状态计数。 */
-export function resetProviderTransientState(): void {
-  for (const handler of HANDLERS) handler.resetTransientState?.();
+  return [...STATIC_HANDLERS.map((handler) => handler.providerId), "workbuddy"];
 }

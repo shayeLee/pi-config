@@ -11,6 +11,13 @@ import { opencodeHandler } from "../providers/opencode";
 import { modelscopeHandler } from "../providers/modelscope";
 import { commandCodeHandler } from "../providers/command-code";
 import { workbuddyHandler } from "../providers/workbuddy";
+import {
+  classifyTransientOutage,
+  DEFAULT_TRANSIENT_OUTAGE_STREAK,
+  resetWorkbuddyOutages,
+  setWorkbuddyTransientOutageStreak,
+  TRANSIENT_OUTAGE_COOLDOWN_MS,
+} from "../providers/workbuddy";
 import { supportedProviders } from "../providers/registry";
 
 interface TestResult {
@@ -49,6 +56,7 @@ class FakePi {
   readonly setModelCalls: unknown[] = [];
   readonly entries: Array<{ type: string; data: unknown }> = [];
   readonly userMessages: Array<{ content: unknown; options: unknown }> = [];
+  appendEntryError: Error | undefined;
 
   on(event: string, handler: Handler): void {
     const current = this.handlers.get(event) ?? [];
@@ -62,6 +70,7 @@ class FakePi {
   }
 
   appendEntry(type: string, data: unknown): void {
+    if (this.appendEntryError && type === "model-failback") throw this.appendEntryError;
     this.entries.push({ type, data });
   }
 
@@ -121,6 +130,7 @@ function engineHarness(
     cooldownMs?: number;
     maxConsecutive?: number;
     autoRestore?: boolean;
+    workbuddyTransientOutageStreak?: number;
   },
   models: Array<{ provider: string; id: string }> = [],
   currentModel: { provider: string; id: string } = { provider: "openai-codex", id: "gpt-5.6-sol" },
@@ -137,13 +147,13 @@ function engineHarness(
   const compactFailed = pi.handlers.get("session_compact_failed")?.[0];
   const beforeSwitch = pi.handlers.get("session_before_switch")?.[0];
   const shutdown = pi.handlers.get("session_shutdown")?.[0];
-  const agentStarts = pi.handlers.get("agent_start") ?? [];
+  const beforeAgentStarts = pi.handlers.get("before_agent_start") ?? [];
   expect(messageEnd, "createEngine did not register message_end");
   expect(sessionStart, "createEngine did not register session_start");
   expect(compactFailed, "createEngine did not register session_compact_failed");
   expect(beforeSwitch, "createEngine did not register session_before_switch");
   expect(shutdown, "createEngine did not register session_shutdown");
-  expect(agentStarts.length > 0, "createEngine did not register agent_start");
+  expect(beforeAgentStarts.length > 0, "createEngine did not register before_agent_start");
 
   return {
     pi,
@@ -171,8 +181,8 @@ function engineHarness(
     async emitShutdown() {
       await shutdown({ reason: "reload" }, ctx);
     },
-    async emitAgentStart() {
-      for (const handler of agentStarts) await handler({}, ctx);
+    async emitBeforeAgentStart() {
+      for (const handler of beforeAgentStarts) await handler({}, ctx);
     },
   };
 }
@@ -798,6 +808,17 @@ async function runRegressionTests(): Promise<TestResult[]> {
       utimesSync(stalePath, old, old);
       expect((await store.pruneOrphans(0)).length === 0, "TTL=0 should disable pruning");
       expect(existsSync(stalePath), "TTL-disabled prune removed stale file");
+      // Parent GC is above; an explicitly marked agent-team child must never GC.
+      const previousChild = process.env.MODEL_FAILBACK_CHILD;
+      process.env.MODEL_FAILBACK_CHILD = "1";
+      try {
+        expect((await new PersistentBanStore(currentPath).pruneOrphans(DEFAULT_BAN_FILE_TTL_MS)).length === 0,
+          "child process unexpectedly pruned parent ban files");
+        expect(existsSync(stalePath), "child process removed a stale ban file");
+      } finally {
+        if (previousChild === undefined) delete process.env.MODEL_FAILBACK_CHILD;
+        else process.env.MODEL_FAILBACK_CHILD = previousChild;
+      }
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
@@ -830,7 +851,7 @@ async function runRegressionTests(): Promise<TestResult[]> {
     }
   }));
 
-  results.push(await runTest("engine resets a completed chain before a new agent run", async () => {
+  results.push(await runTest("engine resets a completed chain only at a new user task boundary", async () => {
     const harness = engineHarness(
       {
         fallbacks: {
@@ -843,11 +864,14 @@ async function runRegressionTests(): Promise<TestResult[]> {
     );
     await harness.emit(creditsFailure("opencode", "gpt-5.6-sol"));
     expect(harness.state.chain.length === 2, "first failback chain was not recorded");
-    await harness.emitAgentStart();
-    expect(harness.state.chain.length === 2, "steering continuation unexpectedly reset chain");
-    await harness.emitAgentStart();
-    expect(harness.state.chain.length === 0, "new agent run did not reset chain");
-    expect(harness.state.consecutive === 0, "new agent run did not reset consecutive count");
+    // Pi auto-retry starts another low-level agent run without before_agent_start;
+    // deliberately do not synthesize it here, because it must not reset this chain.
+    expect(harness.state.chain.length === 2, "auto-retry must retain the failback chain");
+    // A successful steer uses agent.continue(), so there is no before_agent_start to consume.
+    // This is the next real prompt and must reset immediately.
+    await harness.emitBeforeAgentStart();
+    expect(harness.state.chain.length === 0, "new user task did not reset chain");
+    expect(harness.state.consecutive === 0, "new user task did not reset consecutive count");
     expect(harness.state.original === null, "autoRestore=false must discard the old restore target on a new task");
     expect(harness.state.resetsAt === undefined, "autoRestore=false must discard the old reset estimate on a new task");
   }));
@@ -864,16 +888,15 @@ async function runRegressionTests(): Promise<TestResult[]> {
     harness.state.resetsAt = Date.now() + 60_000;
     expect(harness.state.original?.provider === source.provider, "initial restore target was not retained");
 
-    await harness.emitAgentStart();
-    expect(harness.state.chain.length === 2, "steering continuation unexpectedly reset the failback chain");
-    await harness.emitAgentStart();
+    // The first before_agent_start after steering is already the next real task.
+    await harness.emitBeforeAgentStart();
     expect(harness.state.chain.length === 0, "new task did not clear the completed failback chain");
     expect(harness.state.original?.provider === source.provider, "autoRestore lost the original model before its deadline");
     expect(harness.pi.setModelCalls.length === 1, "autoRestore ran before the original deadline");
 
     harness.state.resetsAt = Date.now() - 1;
     (harness.ctx as { model: { provider: string; id: string } }).model = fallback;
-    await harness.emitAgentStart();
+    await harness.emitBeforeAgentStart();
     expect(harness.pi.setModelCalls.length === 2, "autoRestore did not switch back after the deadline");
     expect((harness.pi.setModelCalls[1] as { provider: string }).provider === source.provider, "autoRestore selected the wrong model");
     expect(harness.state.original === null && harness.state.resetsAt === undefined, "successful autoRestore did not clear its snapshot");
@@ -900,7 +923,7 @@ async function runRegressionTests(): Promise<TestResult[]> {
     const originalDeadline = harness.state.resetsAt;
     expect(originalDeadline !== undefined, "first model did not establish a restore deadline");
     (harness.ctx as { model: { provider: string; id: string } }).model = middle;
-    await harness.emitAgentStart(); // Consume the steering continuation.
+    // agent.continue() retains the chain without before_agent_start.
     await harness.emit(assistantFailure(
       middle.provider,
       middle.id,
@@ -1021,6 +1044,25 @@ async function runRegressionTests(): Promise<TestResult[]> {
     expect(harness.compactCalls.length === 0, "shutdown did not cancel pending compaction timer");
   }));
 
+  results.push(await runTest("engine clears a cancelled compaction retry so a later manual compact can run", async () => {
+    const harness = engineHarness({
+      fallbacks: { "openai-codex/gpt-5.6-sol": "rightcode-codex/gpt-5.6-sol" },
+    });
+    await harness.emitCompactionFailed("Codex error: The usage limit has been reached");
+    // Cancellation can happen after the retry timer was queued without Pi emitting a
+    // second aborted session_compact_failed event.
+    const cancelled = new AbortController();
+    cancelled.abort();
+    (harness.ctx as { signal?: AbortSignal }).signal = cancelled.signal;
+    await waitForTimers();
+    expect(harness.compactCalls.length === 0, "cancelled compaction left its pending retry timer active");
+    (harness.ctx as { signal?: AbortSignal }).signal = new AbortController().signal;
+    await harness.emitBeforeAgentStart();
+    await harness.emitCompactionFailed("Codex error: The usage limit has been reached");
+    await waitForTimers();
+    expect(harness.compactCalls.length === 1, "manual compaction could not retry after cancellation cleanup");
+  }));
+
   results.push(await runTest("engine ignores old compaction callback after shutdown", async () => {
     const harness = engineHarness(
       { fallbacks: { "openai-codex/gpt-5.6-sol": "rightcode-codex/gpt-5.6-sol" } },
@@ -1121,6 +1163,185 @@ async function runRegressionTests(): Promise<TestResult[]> {
     expect(noBody === null, "a body-less error must not be guessed as terminal");
   }));
 
+  results.push(await runTest("workbuddy gateway outages are transient until a bounded escape", () => {
+    // 真实样本:apisix/openresty 的 502/504 HTML 页,无业务码、无 JSON 体。
+    const gatewayPage =
+      '504 <html>\r\n<head><title>504 Gateway Time-out</title></head>\r\n<body>\r\n<center><h1>504 Gateway Time-out</h1></center>\r\n<hr><center>openresty</center>\r\n<p><em>Powered by <a href="https://apisix.apache.org/">APISIX</a>.</em></p></body>\r\n</html>\r\n';
+    expect(
+      classifyTransientOutage(gatewayPage) === "gateway",
+      "a 502/504 gateway page must classify as a gateway outage",
+    );
+    expect(
+      classifyTransientOutage("500 <html>\n <head><title>500 Internal Server Error</title></head>\n <body>\n <center><h1>500 Internal Server Error</h1></center>\n <hr><center>openresty</center>\n <p><em>Powered by <a href=\"https://apisix.apache.org/\">APISIX</a>.</em></p></body>\n </html>") === "gateway",
+      "a 500 openresty/APISIX page must classify as a gateway outage",
+    );
+    expect(
+      classifyTransientOutage("503 <html><head><title>503 Service Temporarily Unavailable</title></head><body>openresty</body></html>") === "gateway",
+      "a 503 openresty page must classify as a gateway outage",
+    );
+    expect(
+      classifyTransientOutage("502 <!DOCTYPE html>\n<html lang=\"en\">\n<head>") === "gateway",
+      "a 502 DOCTYPE page must classify as a gateway outage",
+    );
+    expect(
+      classifyTransientOutage("Provider finish_reason: error") === "provider_error",
+      "a provider finish_reason error must classify as an upstream failure",
+    );
+    // 有结构化错误体的一律走 code 判定,免得把上游透传的 JSON 当成网关页。
+    expect(
+      classifyTransientOutage('502: {"code":14001,"msg":"UsageLimitExceeded"}') === undefined,
+      "a JSON error body must never be classified as a gateway page",
+    );
+    expect(
+      classifyTransientOutage("500 Internal Server Error") === undefined,
+      "a bare status line without an HTML body is not a gateway page",
+    );
+
+    // 单次故障仍是瞬时错误:交给 pi 退避重试。
+    setWorkbuddyTransientOutageStreak(DEFAULT_TRANSIENT_OUTAGE_STREAK);
+    resetWorkbuddyOutages();
+    const once = workbuddyHandler.inspect(
+      assistantFailure("workbuddy", "deepseek-v4.1-flash", gatewayPage),
+    );
+    expect(once === null, "a single gateway failure must stay transient");
+
+    // 连续到阈值才允许一次跨 provider 逃逸,并带冷却期让 ban 自动过期。
+    for (let i = 2; i < DEFAULT_TRANSIENT_OUTAGE_STREAK; i++) {
+      expect(
+        workbuddyHandler.inspect(assistantFailure("workbuddy", "deepseek-v4.1-flash", gatewayPage)) === null,
+        `gateway failure ${i} must stay transient`,
+      );
+    }
+    const escaped = workbuddyHandler.inspect(
+      assistantFailure("workbuddy", "deepseek-v4.1-flash", gatewayPage),
+    );
+    expect(escaped, "the configured streak must allow one escape");
+    expect(escaped.reason === "endpoint_unavailable", `unexpected reason: ${escaped.reason}`);
+    expect(escaped.scope === "cross-provider", `unexpected scope: ${escaped.scope}`);
+    expect(typeof escaped.resetsAt === "number", "an escape must carry a cooldown");
+    expect(
+      escaped.resetsAt! > Date.now() &&
+        escaped.resetsAt! <= Date.now() + TRANSIENT_OUTAGE_COOLDOWN_MS + 1_000,
+      "the escape cooldown must be bounded",
+    );
+
+    // 逃逸后计数复位,下一个单次故障又回到瞬时错误。
+    expect(
+      workbuddyHandler.inspect(assistantFailure("workbuddy", "deepseek-v4.1-flash", gatewayPage)) === null,
+      "the streak must reset after an escape",
+    );
+
+    // 阈值 <=0 完全关闭逃逸。
+    setWorkbuddyTransientOutageStreak(0);
+    for (let i = 0; i < DEFAULT_TRANSIENT_OUTAGE_STREAK + 2; i++) {
+      expect(
+        workbuddyHandler.inspect(assistantFailure("workbuddy", "deepseek-v4.1-flash", gatewayPage)) === null,
+        "a disabled streak must never escape",
+      );
+    }
+
+    // 混合状态码共享同一个连续计数:真实会话里 500/502/504 是交替出现的。
+    setWorkbuddyTransientOutageStreak(DEFAULT_TRANSIENT_OUTAGE_STREAK);
+    resetWorkbuddyOutages();
+    const mixed = [
+      "504 <html><head><title>504 Gateway Time-out</title></head><body><center><h1>504 Gateway Time-out</h1></center><hr><center>openresty</center></body></html>",
+      "502 <html><head><title>502 Bad Gateway</title></head><body><center><h1>502 Bad Gateway</h1></center><hr><center>openresty</center></body></html>",
+      "500 <html><head><title>500 Internal Server Error</title></head><body><center><h1>500 Internal Server Error</h1></center><hr><center>openresty</center></body></html>",
+    ];
+    for (const page of mixed.slice(0, -1)) {
+      expect(
+        workbuddyHandler.inspect(assistantFailure("workbuddy", "deepseek-v4.1-flash", page)) === null,
+        "mixed gateway statuses must share one streak",
+      );
+    }
+    expect(
+      workbuddyHandler.inspect(assistantFailure("workbuddy", "deepseek-v4.1-flash", mixed[mixed.length - 1])),
+      "a mixed 500/502/504 streak must still escape at the threshold",
+    );
+
+    // 上游恢复后计数不再累加:两连击后成功请求不该被上一轮计数拖成逃逸。
+    resetWorkbuddyOutages();
+    workbuddyHandler.inspect(assistantFailure("workbuddy", "deepseek-v4.1-flash", gatewayPage));
+    expect(
+      workbuddyHandler.inspect(assistantFailure("workbuddy", "deepseek-v4.1-flash", gatewayPage)) === null,
+      "two consecutive gateway failures must stay transient",
+    );
+
+    // 计数按模型隔离:另一个模型不会共享同一轮故障计数。
+    setWorkbuddyTransientOutageStreak(DEFAULT_TRANSIENT_OUTAGE_STREAK);
+    resetWorkbuddyOutages();
+    workbuddyHandler.inspect(assistantFailure("workbuddy", "hy3", gatewayPage));
+    workbuddyHandler.inspect(assistantFailure("workbuddy", "deepseek-v4.1-flash", gatewayPage));
+    workbuddyHandler.inspect(assistantFailure("workbuddy", "hy3", gatewayPage));
+    expect(
+      workbuddyHandler.inspect(assistantFailure("workbuddy", "deepseek-v4.1-flash", gatewayPage)) === null,
+      "gateway outage streaks must be counted per model",
+    );
+    resetWorkbuddyOutages();
+    setWorkbuddyTransientOutageStreak(DEFAULT_TRANSIENT_OUTAGE_STREAK);
+  }));
+
+  results.push(await runTest("engine escapes a sustained workbuddy gateway outage", async () => {
+    const config = {
+      chains: [["workbuddy/deepseek-v4.1-flash", "modelscope/Qwen/Qwen3.8-Flash-Next"]],
+      fallbacks: {},
+      workbuddyTransientOutageStreak: 2,
+    };
+    const harness = engineHarness(
+      config,
+      [
+        { provider: "workbuddy", id: "deepseek-v4.1-flash" },
+        { provider: "modelscope", id: "Qwen/Qwen3.8-Flash-Next" },
+      ],
+      { provider: "workbuddy", id: "deepseek-v4.1-flash" },
+    );
+    const gatewayPage = "502 <html><head><title>502 Bad Gateway</title></head><body>openresty</body></html>";
+
+    const otherEngine = engineHarness(
+      config,
+      [
+        { provider: "workbuddy", id: "deepseek-v4.1-flash" },
+        { provider: "modelscope", id: "Qwen/Qwen3.8-Flash-Next" },
+      ],
+      { provider: "workbuddy", id: "deepseek-v4.1-flash" },
+    );
+    await harness.emit(assistantFailure("workbuddy", "deepseek-v4.1-flash", gatewayPage));
+    await otherEngine.emit(assistantFailure("workbuddy", "deepseek-v4.1-flash", gatewayPage));
+    // A true prompt on one engine clears only that engine's transient state.
+    await harness.emitBeforeAgentStart();
+    await otherEngine.emit(assistantFailure("workbuddy", "deepseek-v4.1-flash", gatewayPage));
+    expect(harness.pi.setModelCalls.length === 0, "one engine's prompt must not advance another engine's streak");
+    const called = otherEngine.pi.setModelCalls as Array<{ provider: string; id: string }>;
+    expect(called.length === 1, `expected other engine to escape after its own streak, got ${called.length}`);
+    expect(called[0].provider === "modelscope", `wrong escape target: ${called[0].provider}`);
+    expect(otherEngine.pi.userMessages.length === 1, "the escape did not steer the continuation");
+  }));
+
+  results.push(await runTest("engine keeps workbuddy gateway escape disabled for zero and negative thresholds", async () => {
+    const gatewayPage = "502 <html><head><title>502 Bad Gateway</title></head><body>openresty</body></html>";
+    for (const threshold of [0, -1]) {
+      const harness = engineHarness(
+        {
+          chains: [["workbuddy/deepseek-v4.1-flash", "modelscope/Qwen/Qwen3.8-Flash-Next"]],
+          fallbacks: {},
+          workbuddyTransientOutageStreak: threshold,
+        },
+        [
+          { provider: "workbuddy", id: "deepseek-v4.1-flash" },
+          { provider: "modelscope", id: "Qwen/Qwen3.8-Flash-Next" },
+        ],
+        { provider: "workbuddy", id: "deepseek-v4.1-flash" },
+      );
+      for (let i = 0; i < DEFAULT_TRANSIENT_OUTAGE_STREAK + 2; i++) {
+        await harness.emit(assistantFailure("workbuddy", "deepseek-v4.1-flash", gatewayPage));
+      }
+      expect(harness.pi.setModelCalls.length === 0, `threshold ${threshold} switched models`);
+      expect(!harness.pi.entries.some((entry) => entry.type === "model-failback-ban"), `threshold ${threshold} wrote a ban entry`);
+      expect(harness.bans.list().length === 0, `threshold ${threshold} persisted a ban`);
+      expect(harness.pi.userMessages.length === 0, `threshold ${threshold} queued a continuation`);
+    }
+  }));
+
   results.push(await runTest("engine fails back from workbuddy to the next chain node", async () => {
     const harness = engineHarness(
       {
@@ -1188,6 +1409,26 @@ async function runRegressionTests(): Promise<TestResult[]> {
       "steering message does not name the fallback model",
     );
     expect(harness.state.resetsAt !== undefined, "engine did not retain resetsAt");
+  }));
+
+  results.push(await runTest("engine fails closed when its continuation marker cannot persist", async () => {
+    const harness = engineHarness({
+      fallbacks: { "openai-codex/gpt-5.6-sol": "rightcode-codex/gpt-5.6-sol" },
+    });
+    harness.pi.appendEntryError = new Error("disk full");
+    await harness.emit(assistantFailure(
+      "openai-codex", "gpt-5.6-sol", "You have hit your ChatGPT usage limit.",
+    ));
+    expect(harness.pi.setModelCalls.length === 1, "model switch must remain durable after marker failure");
+    expect(harness.pi.userMessages.length === 0, "marker failure must not queue an unrecognizable continuation");
+    expect(harness.notifications.some(({ message }) => message.includes("不会自动续跑")), "marker failure was not reported clearly");
+    // A later user task is independent and must not be left behind a pending continuation lock.
+    await harness.emitBeforeAgentStart();
+    harness.pi.appendEntryError = undefined;
+    await harness.emit(assistantFailure(
+      "openai-codex", "gpt-5.6-sol", "You have hit your ChatGPT usage limit.",
+    ));
+    expect(harness.pi.userMessages.length === 1, "next task did not recover after marker failure");
   }));
 
   results.push(await runTest("engine advances through a two-hop chain", async () => {

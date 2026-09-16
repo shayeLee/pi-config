@@ -6,10 +6,33 @@
  */
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { getProviderHandler } from "../providers/registry";
+import { createProviderRegistry } from "../providers/registry";
+import { DEFAULT_TRANSIENT_OUTAGE_STREAK } from "../providers/workbuddy";
 import type { BanStore } from "./ban-store";
 import type { FailbackConfig } from "./config";
 import { DEFAULT_MAX_CONSECUTIVE, resolveFallback, splitModelKey } from "./config";
+
+export interface FailbackLifecycleEvent {
+  readonly version: 1;
+  readonly phase: "start" | "end";
+  readonly attemptId: string;
+  readonly sessionId: string | null;
+  readonly outcome?: "switched" | "no-target" | "failed" | "cancelled";
+  /** Present on terminal events after a target has been selected. */
+  readonly from?: string;
+  readonly to?: string;
+  readonly reason?: string;
+}
+
+export const FAILBACK_LIFECYCLE_EVENT = "model-failback:lifecycle";
+const FAILBACK_HOST_TRANSPORT_EVENT = "model-failback:host-transport";
+
+type HostTransport = {
+  begin(attemptId: string): boolean;
+  cancelled(): boolean;
+  enqueue(text: string): Promise<boolean>;
+  end(attemptId: string): void;
+};
 
 export interface EngineState {
   consecutive: number;
@@ -101,18 +124,41 @@ export function createEngine(
     chain: [],
     restoreInProgress: false,
   };
+  const providers = createProviderRegistry(() => {
+    const value = getConfig().workbuddyTransientOutageStreak;
+    // Config loading omits missing/invalid values; preserve valid <=0 as the handler's
+    // explicit disabled setting instead of replacing it with the default threshold.
+    return Number.isFinite(value) ? Math.floor(value!) : DEFAULT_TRANSIENT_OUTAGE_STREAK;
+  });
   let redirectingBlockedSelection = false;
   let extensionActive = true;
   let compactionRetryActive = false;
   let compactionRetryEpoch = 0;
   let compactionRetryTimer: ReturnType<typeof setTimeout> | undefined;
+  let lifecycleSequence = 0;
+  // Standalone Pi has no host and keeps the legacy continuation path. The server handshake is
+  // synchronous and session-local: a hosted extension must not silently fall back to terminal IO.
+  let hostTransport: HostTransport | undefined;
+  const requestHostTransport = () => {
+    pi.events?.emit(FAILBACK_HOST_TRANSPORT_EVENT, {
+      version: 1,
+      accept(transport: HostTransport) { hostTransport = transport; },
+    });
+  };
+  const cancelled = (ctx: ExtensionContext) => ctx.signal?.aborted === true || hostTransport?.cancelled() === true;
+  const emitLifecycle = (event: FailbackLifecycleEvent) => {
+    // Optional chaining keeps standalone terminal use and older test doubles compatible.
+    pi.events?.emit(FAILBACK_LIFECYCLE_EVENT, event);
+  };
   let pendingCompactionFailure:
     | { errorMessage: string; ctx: ExtensionContext; provider: string; model: string; retryCompact: boolean }
     | undefined;
 
   // 使 timer、进行中的 ctx.compact 回调和缓存失败全部失效。ctx.compact 本身
   // 不可取消；epoch 让旧 session/reload 的回调不再触碰已经失效的 context。
-  const cancelCompactionRetry = () => {
+  const cancelCompactionRetry = (expectedEpoch?: number) => {
+    // A stale timer/callback must never clear a newer retry's state.
+    if (expectedEpoch !== undefined && expectedEpoch !== compactionRetryEpoch) return;
     compactionRetryEpoch += 1;
     if (compactionRetryTimer) clearTimeout(compactionRetryTimer);
     compactionRetryTimer = undefined;
@@ -147,27 +193,20 @@ export function createEngine(
     }
   };
 
-  // 每个 agent-team child 都先在这里读取共享 ban，避免首个请求再次撞已耗尽模型。
-  // 新用户请求开始时结束上一条连续 failback 链；steering continuation 保留链状态。
-  // autoRestore 的恢复快照必须跨新任务保留到真正到期，不能先被链清理抹掉。
-  let continuationPending = false;
-  pi.on("agent_start", async (_event, ctx: ExtensionContext) => {
-    const isSteeringContinuation = continuationPending;
-    continuationPending = false;
+  // Pi emits `before_agent_start` only for a real accepted prompt; auto-retry and a
+  // `sendUserMessage(..., {deliverAs: "steer"})` continuation use agent.continue() and do
+  // not emit it. Therefore it is the task boundary, with no speculative pending flag.
+  pi.on("before_agent_start", async (_event, ctx: ExtensionContext) => {
     const autoRestoreEnabled = getConfig().autoRestore === true;
-
-    if (!isSteeringContinuation) {
-      state.chain = [];
-      state.consecutive = 0;
-      // 未开启 autoRestore 时保持既有语义：新任务不携带旧 failback 的恢复意图。
-      if (!autoRestoreEnabled) {
-        state.original = null;
-        state.resetsAt = undefined;
-      }
+    state.chain = [];
+    state.consecutive = 0;
+    providers.resetTransientState();
+    if (!autoRestoreEnabled) {
+      state.original = null;
+      state.resetsAt = undefined;
     }
 
-    // 不在 failback 后的 steering continuation 中途切回，避免打断正在续跑的任务。
-    if (isSteeringContinuation || !autoRestoreEnabled || !state.original || !state.resetsAt) return;
+    if (!autoRestoreEnabled || !state.original || !state.resetsAt) return;
     if (Date.now() < state.resetsAt) return;
 
     const current = ctx.model;
@@ -196,12 +235,14 @@ export function createEngine(
   });
 
   pi.on("session_start", async (_event, ctx: ExtensionContext) => {
+    // bindExtensions happens after the host bridge is installed; handshake here rather than
+    // extension factory time so each session obtains only its own EventBus transport.
+    requestHostTransport();
     // 主 Pi 使用真实 session id；agent-team 子进程保留父进程注入的 id。
     if (process.env.MODEL_FAILBACK_CHILD !== "1") {
       const sessionId = ctx.sessionManager?.getSessionId?.();
       if (sessionId) {
         bans.setSessionId(sessionId);
-        process.env.MODEL_FAILBACK_SESSION_ID = sessionId;
       }
     }
     await bans.refresh();
@@ -247,20 +288,55 @@ export function createEngine(
     if (!fail) return false;
 
     const provider = fail.provider ?? ctx.model?.provider;
-    const handler = getProviderHandler(provider);
+    const handler = providers.get(provider);
     if (!handler) return false; // 未注册的 provider:保持现状,不外扩行为
 
     const verdict = handler.inspect(message);
     if (!verdict) return false;
 
+    const attemptId = `${Date.now()}-${++lifecycleSequence}`;
+    const sessionId = ctx.sessionManager?.getSessionId?.() ?? null;
+    // A hosted session without an active request is a hard refusal, not a terminal fallback.
+    if (hostTransport && !hostTransport.begin(attemptId)) return false;
+    emitLifecycle({ version: 1, phase: "start", attemptId, sessionId });
+    let lifecycleDetails: Pick<FailbackLifecycleEvent, "from" | "to" | "reason"> | undefined;
+    let lifecycleFinished = false;
+    const finishLifecycle = (outcome: FailbackLifecycleEvent["outcome"]) => {
+      if (lifecycleFinished) return;
+      lifecycleFinished = true;
+      try {
+        emitLifecycle({ version: 1, phase: "end", attemptId, sessionId, outcome, ...lifecycleDetails });
+      } finally {
+        hostTransport?.end(attemptId);
+      }
+    };
+    try {
+    if (cancelled(ctx)) {
+      finishLifecycle("cancelled");
+      return false;
+    }
+
     // 错误文案通常不带倒计时；只对已确认的终态 best-effort 查询 provider
     // 的额度窗口。查询最多等待共享获取器的 8 秒超时；失败保持未知但仍继续 failback。
-    const resetsAt = verdict.resetsAt
-      ?? await handler.resolveResetsAt?.(verdict, ctx.modelRegistry, ctx.signal);
+    let resetsAt = verdict.resetsAt;
+    if (resetsAt === undefined) {
+      try {
+        resetsAt = await handler.resolveResetsAt?.(verdict, ctx.modelRegistry, ctx.signal);
+      } catch {
+        // Resolution is best-effort; still close the lifecycle through the normal path.
+      }
+    }
+    if (cancelled(ctx)) {
+      finishLifecycle("cancelled");
+      return false;
+    }
 
     const sourceProvider = typeof provider === "string" ? provider : "unknown";
     const currentModel = (fail.model as string) ?? ctx.model?.id;
-    if (typeof currentModel !== "string") return false;
+    if (typeof currentModel !== "string") {
+      finishLifecycle("failed");
+      return false;
+    }
     const prevKey = modelKey(sourceProvider, currentModel);
 
     // 先持久化精确模型 ban；即使后续没有可用 fallback，下一个 subagent 也不会再撞它。
@@ -285,6 +361,12 @@ export function createEngine(
       // 持久化失败不能阻断当前会话 failback；仅失去跨 subagent 的预跳过能力。
       ctx.ui.notify(`[model-failback] 无法持久化 ${prevKey} 的 ban,本次仍继续 failback`, "warning");
     }
+    // `message_end` handlers are async: an abort can happen while ban persistence waits.
+    // Never change model or queue a continuation after that boundary.
+    if (cancelled(ctx)) {
+      finishLifecycle("cancelled");
+      return false;
+    }
 
     const target = resolveAvailableTarget(getConfig(), bans, sourceProvider, currentModel, verdict.scope);
     if (!target) {
@@ -292,8 +374,11 @@ export function createEngine(
         `[model-failback] ${prevKey} 终态,但链上没有未 ban 的 fallback,任务将中断`,
         "error",
       );
+      finishLifecycle("no-target");
       return false;
     }
+
+    lifecycleDetails = { from: prevKey, to: target.target, reason: verdict.reason };
 
     // ---- 环检测:目标已在当前 failback 链中出现过,拒绝成环切换 ----
     if (state.chain.includes(target.target)) {
@@ -301,6 +386,7 @@ export function createEngine(
         `[model-failback] 检测到切换环: ${target.target} 已在此链失败过,停止 failback,任务将中断`,
         "error",
       );
+      finishLifecycle("no-target");
       return false;
     }
 
@@ -311,11 +397,23 @@ export function createEngine(
         `[model-failback] 已达连跳上限(${maxConsecutive}),停止 failback,任务将中断`,
         "error",
       );
+      finishLifecycle("no-target");
       return false;
     }
 
     // ---- 切换 ----
-    if (!(await setTargetModel(pi, ctx, target))) return false;
+    if (cancelled(ctx)) {
+      finishLifecycle("cancelled");
+      return false;
+    }
+    if (!(await setTargetModel(pi, ctx, target))) {
+      finishLifecycle(cancelled(ctx) ? "cancelled" : "failed");
+      return false;
+    }
+    if (cancelled(ctx)) {
+      finishLifecycle("cancelled");
+      return false;
+    }
 
     // ---- 台账 ----------------
     if (state.chain.length === 0) state.chain.push(prevKey);
@@ -332,16 +430,30 @@ export function createEngine(
       state.resetsAt = resetsAt;
     }
 
-    pi.appendEntry("model-failback", {
-      from: prevKey,
-      to: target.target,
-      reason: verdict.reason,
-      banRecorded,
-      resetsAt,
-      at: Date.now(),
-    });
-
     const failureReason = verdict.note ?? verdict.reason;
+    // Persist the exact internal continuation alongside its extension marker. This gives hosts a
+    // durable custom-entry association instead of guessing from a user-message prefix.
+    const continuation = `[model-failback] 之前的模型(${prevKey})发生终态错误(${failureReason})。` +
+      `已切换到备用模型(${target.target}),请继续完成之前的任务,不要重复已完成的步骤。`;
+    // The marker is the durable association that makes this internal steering message
+    // recognizable to history consumers. If it cannot be written, fail closed: keep the
+    // already-persisted Pi model projection, but never queue an unrecognizable continuation.
+    try {
+      pi.appendEntry("model-failback", {
+        from: prevKey,
+        to: target.target,
+        reason: verdict.reason,
+        continuation,
+        banRecorded,
+        resetsAt,
+        at: Date.now(),
+      });
+    } catch {
+      ctx.ui.notify("[model-failback] 无法持久化 failback 标记；已切换模型，但不会自动续跑", "error");
+      finishLifecycle("failed");
+      return false;
+    }
+
     const restoreHint = resetsAt
       ? `预计 ${new Date(resetsAt).toLocaleTimeString()} 恢复(/failback status 查看)`
       : "";
@@ -351,14 +463,31 @@ export function createEngine(
     );
 
     if (options.steer) {
-      continuationPending = true;
-      pi.sendUserMessage(
-        `[model-failback] 之前的模型(${prevKey})发生终态错误(${failureReason})。` +
-          `已切换到备用模型(${target.target}),请继续完成之前的任务,不要重复已完成的步骤。`,
-        { deliverAs: "steer" },
-      );
+      if (cancelled(ctx)) {
+        finishLifecycle("cancelled");
+        return false;
+      }
+      try {
+        // ExtensionAPI.sendUserMessage is void. Hosted mode awaits the public SDK steer API
+        // through the bridge so queue_update/abort races are acknowledged before lifecycle end.
+        const accepted = hostTransport
+          ? await hostTransport.enqueue(continuation)
+          : (pi.sendUserMessage(continuation, { deliverAs: "steer" }), true);
+        if (!accepted || cancelled(ctx)) {
+          finishLifecycle("cancelled");
+          return false;
+        }
+      } catch {
+        finishLifecycle(cancelled(ctx) ? "cancelled" : "failed");
+        return false;
+      }
     }
+    finishLifecycle("switched");
     return true;
+    } finally {
+      // No extension failure (including appendEntry) may leave the host abort lock open.
+      finishLifecycle("failed");
+    }
   };
 
   pi.on("message_end", async (event, ctx: ExtensionContext) => {
@@ -387,6 +516,10 @@ export function createEngine(
     epoch: number,
   ) => {
     if (!extensionActive || epoch !== compactionRetryEpoch) return;
+    if (cancelled(failure.ctx)) {
+      cancelCompactionRetry(epoch);
+      return;
+    }
     let switched = false;
     try {
       switched = await handleTerminalFailure(
@@ -416,6 +549,10 @@ export function createEngine(
     compactionRetryTimer = setTimeout(() => {
       compactionRetryTimer = undefined;
       if (!extensionActive || epoch !== compactionRetryEpoch) return;
+      if (cancelled(failure.ctx)) {
+        cancelCompactionRetry(epoch);
+        return;
+      }
       // threshold/overflow 压缩失败后 Pi 可能已开始下一次 agent 请求；manual
       // /compact 也可能在用户立即发消息后走到这里。绝不 abort 正在进行的请求。
       if (!failure.ctx.isIdle()) {
@@ -438,8 +575,20 @@ export function createEngine(
     }, 0);
   };
 
+  // A cancelled hosted request must not use compaction as a back door into another provider call.
+  pi.on("session_before_compact", (event, ctx: ExtensionContext) => {
+    if (cancelled(ctx) || event.signal.aborted) {
+      cancelCompactionRetry();
+      return { cancel: true };
+    }
+  });
+
   pi.on("session_compact_failed", async (event, ctx: ExtensionContext) => {
-    if (event.aborted || !event.errorMessage || !extensionActive) return;
+    if (event.aborted) {
+      cancelCompactionRetry();
+      return;
+    }
+    if (!event.errorMessage || !extensionActive) return;
     const current = ctx.model;
     if (!current) return;
     const failure = {

@@ -24,6 +24,8 @@ function runPi(args, env) {
 }
 
 const tempDir = await mkdtemp(join(tmpdir(), "model-failback-regression-"));
+const agentDir = join(tempDir, "agent");
+const sessionDir = join(tempDir, "sessions");
 const resultPath = join(tempDir, "result.json");
 const probePath = fileURLToPath(new URL("./regression-probe.ts", import.meta.url));
 const extensionPath = fileURLToPath(new URL("../index.ts", import.meta.url));
@@ -32,11 +34,25 @@ const extensionPath = fileURLToPath(new URL("../index.ts", import.meta.url));
 const filter = process.argv[2]?.trim() || process.env.MODEL_FAILBACK_TEST_FILTER?.trim() || undefined;
 
 try {
+  // The regression runner is often launched by an agent-team worker. Its child/root
+  // markers describe that worker, not this fresh test parent: remove them so the
+  // extension exercises parent GC rather than silently skipping it.
+  const {
+    MODEL_FAILBACK_CHILD: _child,
+    MODEL_FAILBACK_SESSION_ID: _failbackSession,
+    PI_SESSION_ID: _piSession,
+    PI_USAGE_ROOT_SESSION_ID: _usageRoot,
+    PI_ROOT_SESSION_ID: _piRoot,
+    ...cleanEnv
+  } = process.env;
   const child = await runPi(
     ["--no-extensions", "-e", extensionPath, "-e", probePath, "--list-models", "opencode-go"],
     {
-      ...process.env,
+      ...cleanEnv,
       PI_OFFLINE: "1",
+      // Keep config, credentials, bans, and session output outside the user's Pi state.
+      PI_CODING_AGENT_DIR: agentDir,
+      PI_SESSION_DIR: sessionDir,
       MODEL_FAILBACK_TEST_RESULT: resultPath,
       ...(filter ? { MODEL_FAILBACK_TEST_FILTER: filter } : {}),
     },

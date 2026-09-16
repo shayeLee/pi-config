@@ -168,22 +168,23 @@ export function setWorkbuddyTransientOutageStreak(value: number): void {
   transientOutageStreak = Number.isFinite(value) && value > 0 ? Math.floor(value) : 0;
 }
 
-const outages = new Map<string, { count: number; lastAt: number }>();
-
-/** 新任务开始时清空计数;测试也用它复位。 */
-export function resetWorkbuddyOutages(): void {
-  outages.clear();
-}
-
-function noteOutage(key: string, now: number): number {
-  const previous = outages.get(key);
-  const count =
-    previous && now - previous.lastAt <= TRANSIENT_OUTAGE_WINDOW_MS ? previous.count + 1 : 1;
-  outages.set(key, { count, lastAt: now });
-  return count;
-}
-
-export const workbuddyHandler: ProviderFailbackHandler = {
+/**
+ * Handler state belongs to one engine/session.  Do not move this map to module scope:
+ * hosted Pi engines share the extension module, and one session's new prompt must not
+ * erase another session's outage streak.
+ */
+export function createWorkbuddyHandler(
+  getTransientOutageStreak: () => number = () => transientOutageStreak,
+): ProviderFailbackHandler {
+  const outages = new Map<string, { count: number; lastAt: number }>();
+  const resetWorkbuddyOutages = () => outages.clear();
+  const noteOutage = (key: string, now: number): number => {
+    const previous = outages.get(key);
+    const count = previous && now - previous.lastAt <= TRANSIENT_OUTAGE_WINDOW_MS ? previous.count + 1 : 1;
+    outages.set(key, { count, lastAt: now });
+    return count;
+  };
+  return {
   providerId: "workbuddy",
   resetTransientState: resetWorkbuddyOutages,
 
@@ -215,6 +216,7 @@ export const workbuddyHandler: ProviderFailbackHandler = {
     // 上游网关连续故障:单次仍按瞬时错误交给 pi 重试,连续多次才允许一次跨 provider 逃逸。
     const outage = classifyTransientOutage(text);
     if (outage !== undefined) {
+      const transientOutageStreak = getTransientOutageStreak();
       if (transientOutageStreak <= 0) return null;
       const model = typeof msg.model === "string" ? msg.model : "";
       const outageKey = `${msg.provider}/${model}`;
@@ -243,4 +245,12 @@ export const workbuddyHandler: ProviderFailbackHandler = {
 
     return null;
   },
-};
+  };
+}
+
+// Backward-compatible standalone handler for direct provider tests. Engines use a fresh
+// instance from the registry above.
+export const workbuddyHandler = createWorkbuddyHandler();
+export function resetWorkbuddyOutages(): void {
+  workbuddyHandler.resetTransientState?.();
+}

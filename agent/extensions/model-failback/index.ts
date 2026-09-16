@@ -26,10 +26,6 @@ import { PersistentBanStore } from "./core/ban-store";
 import { createEngine } from "./core/engine";
 import { loadConfig } from "./core/config";
 import { supportedProviders } from "./providers/registry";
-import {
-  DEFAULT_TRANSIENT_OUTAGE_STREAK,
-  setWorkbuddyTransientOutageStreak,
-} from "./providers/workbuddy";
 
 /**
  * 为已存在但未写入 resetsAt 的 ban 补查当前订阅窗口，方便升级后直接通过
@@ -67,17 +63,11 @@ async function estimateExistingBanRecovery(
 
 export default function modelFailback(pi: ExtensionAPI) {
   let config = loadConfig();
-  setWorkbuddyTransientOutageStreak(
-    config.workbuddyTransientOutageStreak ?? DEFAULT_TRANSIENT_OUTAGE_STREAK,
-  );
   const bans = new PersistentBanStore();
 
   // 必须早于 engine 注册:session_start 的 preflight 要读取本次刚更新的 chains。
   pi.on("session_start", () => {
     config = loadConfig();
-    setWorkbuddyTransientOutageStreak(
-      config.workbuddyTransientOutageStreak ?? DEFAULT_TRANSIENT_OUTAGE_STREAK,
-    );
   });
   const state = createEngine(pi, () => config, bans);
 
