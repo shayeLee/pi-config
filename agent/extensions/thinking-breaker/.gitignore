@@ -1,0 +1,2 @@
+# 测试用的 node_modules 软链（指向本机 pi 安装位置，不应提交）
+node_modules
