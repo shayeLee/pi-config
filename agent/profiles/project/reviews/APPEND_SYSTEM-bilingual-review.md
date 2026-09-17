@@ -23,9 +23,9 @@
 - > `lite`: a clear, local, reversible, low-risk change with a known target and a clear acceptance method.
 
   `lite`：目标明确、验收方式清晰，且改动局部、可逆、低风险。
-- > `worker`: investigative, complex, cross-area, high-risk, or tradeoff-heavy execution. Use it when the cause, affected scope, or safe approach is not already clear.
+- > `worker`: complex, cross-area, high-risk, or tradeoff-heavy execution. Use it when the cause, affected scope, or safe approach is not already clear.
 
-  `worker`：调查型、复杂、跨领域、高风险或涉及较多权衡的执行。当原因、受影响范围或安全方案尚不明确时使用它。
+  `worker`：复杂、跨领域、高风险或涉及较多权衡的执行。当原因、受影响范围或安全方案尚不明确时使用它。
 - > `reviewer`: requested reviews and validation that is substantial, risky, security-sensitive, or consequential to external parties. It is read-only and does not perform or apply changes.
 
   `reviewer`：用于被请求的审查，以及重要、高风险、安全敏感或会对外部相关方产生影响的验证。它是只读角色，不执行或应用变更。
