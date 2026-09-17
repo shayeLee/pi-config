@@ -167,19 +167,34 @@ async function secureDir(): Promise<void> {
 	dirSecured = true;
 }
 
-/** 串行化写入，避免并发 append 交错；任何失败都被吞掉，绝不打断 agent。 */
+/**
+ * 子进程归属字段。
+ *
+ * agent-team 用 `--no-session` 启动 subagent 子进程，子进程的 sessionId 是临时
+ * uuid、磁盘上没有对应 session 文件，事后无法判断它属于哪个父会话。只有
+ * `PI_USAGE_ROOT_SESSION_ID`（由 agent-team 注入）能把它归属回去，与 usage-stats
+ * 的账本口径一致。主进程没有这个变量，字段自然省略（JSON.stringify 丢弃 undefined）。
+ */
+function ownershipFields(): { rootSessionId?: string; child: boolean } {
+	const rootSessionId = process.env.PI_USAGE_ROOT_SESSION_ID?.trim();
+	return {
+		rootSessionId: rootSessionId || undefined,
+		child: process.env.MODEL_FAILBACK_CHILD === "1",
+	};
+}
+
+/** 串行化写入，避免同进程内并发 append 交错；任何失败都被吞掉，绝不打断 agent。 */
 let writeQueue: Promise<void> = Promise.resolve();
-const fileSizes = new Map<string, number>();
 const capWarned = new Set<string>();
 let writeErrorCount = 0;
 
 function appendJsonl(path: string, record: unknown, maxBytes: number): Promise<void> {
 	writeQueue = writeQueue
 		.then(async () => {
-			let size = fileSizes.get(path);
-			if (size === undefined) {
-				size = await stat(path).then((s) => s.size).catch(() => 0);
-			}
+			// 每次写入前重新 stat 真实大小。主 Pi 与若干 subagent 子进程共写同一个
+			// 按日期命名的文件，若靠进程内累加值判断，每个进程都会各自写满一份
+			// maxFileBytes，实际上限变成「进程数 × maxFileBytes」。读真实大小才封得住。
+			const size = await stat(path).then((s) => s.size).catch(() => 0);
 			if (size >= maxBytes) {
 				// 静默停止；/breaker status 会显示已达上限的文件。
 				capWarned.add(path);
@@ -188,7 +203,6 @@ function appendJsonl(path: string, record: unknown, maxBytes: number): Promise<v
 			const line = `${JSON.stringify(record)}\n`;
 			await secureDir();
 			await appendFile(path, line, { encoding: "utf8", mode: 0o600 });
-			fileSizes.set(path, size + Buffer.byteLength(line, "utf8"));
 		})
 		.catch(() => {
 			// 观测失败绝不打断 agent，只记数供 /breaker 展示。
@@ -747,6 +761,7 @@ export default function thinkingBreaker(pi: ExtensionAPI) {
 							v: 1,
 							ts: new Date().toISOString(),
 							sessionId,
+							...ownershipFields(),
 							provider: current.provider,
 							model: current.model,
 							turnIndex: current.turnIndex,
@@ -854,6 +869,7 @@ export default function thinkingBreaker(pi: ExtensionAPI) {
 				v: 1,
 				ts: new Date().toISOString(),
 				sessionId,
+				...ownershipFields(),
 				provider: stats.provider,
 				model: stats.model,
 				turnIndex: stats.turnIndex,
@@ -914,6 +930,7 @@ export default function thinkingBreaker(pi: ExtensionAPI) {
 						v: 1,
 						ts: new Date().toISOString(),
 						sessionId,
+						...ownershipFields(),
 						provider: stats.provider,
 						model: stats.model,
 						turnIndex: stats.turnIndex,
