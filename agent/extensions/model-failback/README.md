@@ -90,9 +90,13 @@ message_end(assistant, error)
 | `14018` / `14019` | 用户额度 / token 预算耗尽 |
 | `6003` / `6004` | 每小时 / 每日 token 配额 |
 
-无业务码时按官方兜底把 `429` 视为额度耗尽,但要求文案里出现额度语义(`usage limit` / `quota` / `balance` / `insufficient credits`),避免把上游透传的瞬时限流当终态。
+无业务码时按官方兜底把 `429` 视为额度耗尽,但要求文案里出现额度语义(`usage limit` / `quota` / `balance` / `insufficient credits`)。
 
-**不触发**:`14003` 与 `6005`-`6008`(瞬时限流,交给 pi 退避重试)、`14015`/`11140`/`11142`(鉴权)、`14016`/`14017`(未开通)、`11141`(模型行为错误)、`11115`(上下文超长,应触发压缩)、`10105`(会话数超限)、`15001`(联网搜索额度)。**未知 code 一律不猜测**,避免误 ban 整个 provider。
+**瞬时限流(直接切链)**:`14003` 与 `6005`-`6008`、以及无 code 的裸 `429`。这些错误 pi 会退避重试(默认 3 次,1s/2s/4s,共约 7 秒),但 WorkBuddy 单请求就要数分钟,7 秒总退避远小于限流窗口 —— 重试耗尽后 pi 只会把错误交还用户、任务中断。因此**按配置直接切备用链**,不再等重试耗尽:判为 `rate_limited` + `scope: any`(逐跳按你配的链走 —— 限流常是 per-model/endpoint 的,同 provider 的另一部署也可能有独立配额),并带 `workbuddyRateLimitCooldownMs`(默认 60s)的 `resetsAt`,到期自动解 ban、模型重新可用。把该值配成 `<=0` 即关闭此逃逸,回到"全部交给 pi 退避重试"的旧行为。
+
+> 与 pi auto_retry 不会双重续跑:failback 排入的 steer 消息会被 auto_retry 的 `agent.continue()` 在 `runLoop` 开头 drain 掉,且此时模型已是切换后的目标模型 —— 恰好一次续跑。
+
+**不触发**:`14015`/`11140`/`11142`(鉴权)、`14016`/`14017`(未开通)、`11141`(模型行为错误)、`11115`(上下文超长,应触发压缩)、`10105`(会话数超限)、`15001`(联网搜索额度)。**未知 code 一律不猜测**,避免误 ban 整个 provider。
 
 ### 上游网关故障的有界逃逸
 
@@ -137,6 +141,7 @@ WorkBuddy 的推理端点(apisix/openresty 网关)会以**纯 HTML 页面**返�
 | `banFileTtlMs` | `604800000` | 孤儿 session ban 文件的惰性清理 TTL(7 天);设为 `0` 或负数关闭 |
 | `autoRestore` | `false` | 配额恢复后自动切回原模型(每次 agent 启动时检查,不打断进行中的任务) |
 | `workbuddyTransientOutageStreak` | `3` | workbuddy:2 分钟内同一模型连续几次上游 5xx 网关页后允许一次跨 provider 逃逸;`<=0` 关闭 |
+| `workbuddyRateLimitCooldownMs` | `60000` | workbuddy:命中瞬时限流(`14003`/`6005`-`6008`/裸 `429`)时直接切备用链,并对源模型设这么久的冷却 ban;`<=0` 关闭(交给 pi 退避重试) |
 
 ### 链式语义
 

@@ -7,7 +7,7 @@
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { createProviderRegistry } from "../providers/registry";
-import { DEFAULT_TRANSIENT_OUTAGE_STREAK } from "../providers/workbuddy";
+import { DEFAULT_RATE_LIMIT_COOLDOWN_MS, DEFAULT_TRANSIENT_OUTAGE_STREAK } from "../providers/workbuddy";
 import type { BanStore } from "./ban-store";
 import type { FailbackConfig } from "./config";
 import { DEFAULT_MAX_CONSECUTIVE, resolveFallback, splitModelKey } from "./config";
@@ -157,12 +157,19 @@ export function createEngine(
     chain: [],
     restoreInProgress: false,
   };
-  const providers = createProviderRegistry(() => {
-    const value = getConfig().workbuddyTransientOutageStreak;
-    // Config loading omits missing/invalid values; preserve valid <=0 as the handler's
-    // explicit disabled setting instead of replacing it with the default threshold.
-    return Number.isFinite(value) ? Math.floor(value!) : DEFAULT_TRANSIENT_OUTAGE_STREAK;
-  });
+  const providers = createProviderRegistry(
+    () => {
+      const value = getConfig().workbuddyTransientOutageStreak;
+      // Config loading omits missing/invalid values; preserve valid <=0 as the handler's
+      // explicit disabled setting instead of replacing it with the default threshold.
+      return Number.isFinite(value) ? Math.floor(value!) : DEFAULT_TRANSIENT_OUTAGE_STREAK;
+    },
+    () => {
+      const value = getConfig().workbuddyRateLimitCooldownMs;
+      // Same contract as above: a valid <=0 disables the escape entirely.
+      return Number.isFinite(value) ? Math.floor(value!) : DEFAULT_RATE_LIMIT_COOLDOWN_MS;
+    },
+  );
   let redirectingBlockedSelection = false;
   let extensionActive = true;
   // 行为升级（复读）需要“最近一次收到事件的上下文”，因为 escalate 事件是异步的，

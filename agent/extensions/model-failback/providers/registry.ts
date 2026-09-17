@@ -25,8 +25,14 @@ export interface ProviderRegistry {
 }
 
 /** Each engine receives its own transient provider state. */
-export function createProviderRegistry(getWorkbuddyTransientOutageStreak?: () => number): ProviderRegistry {
-  const handlers = [...STATIC_HANDLERS, createWorkbuddyHandler(getWorkbuddyTransientOutageStreak)];
+export function createProviderRegistry(
+  getWorkbuddyTransientOutageStreak?: () => number,
+  getWorkbuddyRateLimitCooldownMs?: () => number,
+): ProviderRegistry {
+  const handlers = [
+    ...STATIC_HANDLERS,
+    createWorkbuddyHandler(getWorkbuddyTransientOutageStreak, getWorkbuddyRateLimitCooldownMs),
+  ];
   return {
     get(provider) {
       return typeof provider === "string" ? handlers.find((handler) => handler.providerId === provider) : undefined;

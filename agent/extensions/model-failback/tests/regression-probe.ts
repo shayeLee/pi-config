@@ -13,8 +13,10 @@ import { commandCodeHandler } from "../providers/command-code";
 import { workbuddyHandler } from "../providers/workbuddy";
 import {
   classifyTransientOutage,
+  DEFAULT_RATE_LIMIT_COOLDOWN_MS,
   DEFAULT_TRANSIENT_OUTAGE_STREAK,
   resetWorkbuddyOutages,
+  setWorkbuddyRateLimitCooldownMs,
   setWorkbuddyTransientOutageStreak,
   TRANSIENT_OUTAGE_COOLDOWN_MS,
 } from "../providers/workbuddy";
@@ -144,6 +146,7 @@ function engineHarness(
     maxConsecutive?: number;
     autoRestore?: boolean;
     workbuddyTransientOutageStreak?: number;
+    workbuddyRateLimitCooldownMs?: number;
   },
   models: Array<{ provider: string; id: string }> = [],
   currentModel: { provider: string; id: string } = { provider: "openai-codex", id: "gpt-5.6-sol" },
@@ -1111,10 +1114,51 @@ async function runRegressionTests(): Promise<TestResult[]> {
     }
   }));
 
+  results.push(await runTest("workbuddy rate-limit codes switch the chain with a cooldown", () => {
+    // 瞬时限流:pi 的退避(1s/2s/4s)远短于 WorkBuddy 的限流窗口,重试耗尽后任务会中断,
+    // 因此按配置直接切备用链,并带一个到期自动解 ban 的冷却期。
+    setWorkbuddyRateLimitCooldownMs(DEFAULT_RATE_LIMIT_COOLDOWN_MS);
+    const codes = ["14003", "6005", "6006", "6007", "6008"];
+    for (const code of codes) {
+      const verdict = workbuddyHandler.inspect(
+        assistantFailure(
+          "workbuddy",
+          "deepseek-v4.1-flash",
+          `429: {"message":"RateLimitError","type":"invalid_request_error","code":"${code}"}`,
+        ),
+      );
+      expect(verdict, `workbuddy code ${code} was not detected`);
+      expect(verdict.reason === "rate_limited", `unexpected reason for ${code}: ${verdict.reason}`);
+      // 限流用 "any":按用户配的链逐跳尝试(同 provider 的另一部署也可能有独立配额)。
+      expect(verdict.scope === "any", `unexpected scope for ${code}: ${verdict.scope}`);
+      expect(typeof verdict.resetsAt === "number", `code ${code} must carry a cooldown`);
+      expect(
+        verdict.resetsAt! > Date.now() &&
+          verdict.resetsAt! <= Date.now() + DEFAULT_RATE_LIMIT_COOLDOWN_MS + 1_000,
+        `code ${code} cooldown must be bounded`,
+      );
+    }
+
+    // 冷却配成 <=0 完全关闭该逃逸,回到"全部交给 pi 重试"的旧行为。
+    setWorkbuddyRateLimitCooldownMs(0);
+    for (const code of codes) {
+      expect(
+        workbuddyHandler.inspect(
+          assistantFailure(
+            "workbuddy",
+            "deepseek-v4.1-flash",
+            `429: {"message":"RateLimitError","type":"invalid_request_error","code":"${code}"}`,
+          ),
+        ) === null,
+        `code ${code} must stay transient when the escape is disabled`,
+      );
+    }
+    setWorkbuddyRateLimitCooldownMs(DEFAULT_RATE_LIMIT_COOLDOWN_MS);
+  }));
+
   results.push(await runTest("workbuddy non-terminal codes never trigger a failback", () => {
-    // 瞬时限流/鉴权/未开通/模型错误/上下文超长/会话数/联网搜索额度。
+    // 鉴权/未开通/模型错误/上下文超长/会话数/联网搜索额度 —— 换模型都无效。
     const codes = [
-      "14003", "6005", "6006", "6007", "6008",
       "14015", "14016", "14017", "11140", "11142", "11141", "11115", "10105", "15001",
     ];
     for (const code of codes) {
@@ -1149,11 +1193,22 @@ async function runRegressionTests(): Promise<TestResult[]> {
     expect(quota.reason === "quota_exhausted", `unexpected reason: ${quota.reason}`);
     expect(quota.scope === "cross-provider", `unexpected scope: ${quota.scope}`);
 
-    // 没有业务码也没有额度文案的 429 属瞬时限流,交给 pi 退避重试。
+    // 没有业务码也没有额度文案的 429 属瞬时限流:同样直接切备用链,带冷却期。
     const transient = workbuddyHandler.inspect(
       assistantFailure("workbuddy", "m", "429: Too many requests"),
     );
-    expect(transient === null, "a bare 429 must stay transient");
+    expect(transient, "a bare 429 must switch the chain");
+    expect(transient.reason === "rate_limited", `unexpected reason: ${transient.reason}`);
+    expect(transient.scope === "any", `unexpected scope: ${transient.scope}`);
+    expect(typeof transient.resetsAt === "number", "a bare 429 must carry a cooldown");
+
+    // 冷却配成 <=0 时回到交给 pi 退避重试的旧行为。
+    setWorkbuddyRateLimitCooldownMs(0);
+    expect(
+      workbuddyHandler.inspect(assistantFailure("workbuddy", "m", "429: Too many requests")) === null,
+      "a bare 429 must stay transient when the escape is disabled",
+    );
+    setWorkbuddyRateLimitCooldownMs(DEFAULT_RATE_LIMIT_COOLDOWN_MS);
   }));
 
   results.push(await runTest("workbuddy ignores other providers and non-error messages", () => {
@@ -1381,6 +1436,145 @@ async function runRegressionTests(): Promise<TestResult[]> {
     expect(called.length === 1, `expected 1 switch, got ${called.length}`);
     expect(called[0].provider === "modelscope", `wrong fallback target: ${called[0].provider}`);
     expect(harness.pi.userMessages.length === 1, "workbuddy failback did not send steering");
+  }));
+
+  results.push(await runTest("engine switches the chain on a workbuddy 14003 rate limit", async () => {
+    // 瞬时限流不再等 pi 退避重试耗尽,而是直接切备用链,并写一个带冷却期的 ban,
+    // 到期自动解 ban(而非永久禁用)。
+    setWorkbuddyRateLimitCooldownMs(DEFAULT_RATE_LIMIT_COOLDOWN_MS);
+    const harness = engineHarness(
+      {
+        chains: [["workbuddy/hy4-preview-f", "modelscope/Qwen/Qwen3.8-Flash-Next", "deepseek/deepseek-flash"]],
+        fallbacks: {},
+      },
+      [
+        { provider: "workbuddy", id: "hy4-preview-f" },
+        { provider: "modelscope", id: "Qwen/Qwen3.8-Flash-Next" },
+        { provider: "deepseek", id: "deepseek-flash" },
+      ],
+      { provider: "workbuddy", id: "hy4-preview-f" },
+    );
+
+    const before = Date.now();
+    await harness.emit(
+      assistantFailure(
+        "workbuddy",
+        "hy4-preview-f",
+        '429: {"message":"too many requests","type":"invalid_request_error","code":"14003"}',
+      ),
+    );
+
+    const called = harness.pi.setModelCalls as Array<{ provider: string; id: string }>;
+    expect(called.length === 1, `expected 1 switch, got ${called.length}`);
+    expect(called[0].provider === "modelscope", `wrong fallback target: ${called[0].provider}`);
+    expect(harness.pi.userMessages.length === 1, "a rate limit must steer a continuation");
+
+    const ban = harness.bans.get("workbuddy/hy4-preview-f");
+    expect(ban, "a rate limit must ban the source model");
+    expect(ban!.reason === "rate_limited", `unexpected ban reason: ${ban!.reason}`);
+    expect(ban!.scope === "any", `unexpected ban scope: ${ban!.scope}`);
+    expect(typeof ban!.resetsAt === "number", "a rate-limit ban must carry a cooldown");
+    expect(
+      ban!.resetsAt! > before && ban!.resetsAt! <= Date.now() + DEFAULT_RATE_LIMIT_COOLDOWN_MS + 1_000,
+      "the rate-limit cooldown must be bounded",
+    );
+  }));
+
+  results.push(await runTest("engine hops to the same-provider next node on a workbuddy rate limit", async () => {
+    // 用户实际配置里存在同 provider 的逐跳链:限流时应当走到下一跳,而不是被
+    // cross-provider 守卫拦下。
+    setWorkbuddyRateLimitCooldownMs(DEFAULT_RATE_LIMIT_COOLDOWN_MS);
+    const harness = engineHarness(
+      {
+        chains: [[
+          "workbuddy/deepseek-v4.1-flash",
+          "workbuddy/deepseek-v4.1-flash-sg",
+          "command-code/deepseek/deepseek-v4.1-flash",
+        ]],
+        fallbacks: {},
+      },
+      [
+        { provider: "workbuddy", id: "deepseek-v4.1-flash" },
+        { provider: "workbuddy", id: "deepseek-v4.1-flash-sg" },
+        { provider: "command-code", id: "deepseek/deepseek-v4.1-flash" },
+      ],
+      { provider: "workbuddy", id: "deepseek-v4.1-flash" },
+    );
+
+    await harness.emit(
+      assistantFailure(
+        "workbuddy",
+        "deepseek-v4.1-flash",
+        '429: {"message":"too many requests","type":"invalid_request_error","code":"14003"}',
+      ),
+    );
+
+    const called = harness.pi.setModelCalls as Array<{ provider: string; id: string }>;
+    expect(called.length === 1, `expected 1 switch, got ${called.length}`);
+    expect(
+      called[0].provider === "workbuddy" && called[0].id === "deepseek-v4.1-flash-sg",
+      `wrong fallback target: ${called[0].provider}/${called[0].id}`,
+    );
+  }));
+
+  results.push(await runTest("engine keeps a workbuddy 14003 on pi retry when the escape is disabled", async () => {
+    // 关闭开关走 config(engine 总是注入 getter,模块级默认值不参与)。
+    const harness = engineHarness(
+      {
+        chains: [["workbuddy/hy4-preview-f", "modelscope/Qwen/Qwen3.8-Flash-Next"]],
+        fallbacks: {},
+        workbuddyRateLimitCooldownMs: 0,
+      },
+      [
+        { provider: "workbuddy", id: "hy4-preview-f" },
+        { provider: "modelscope", id: "Qwen/Qwen3.8-Flash-Next" },
+      ],
+      { provider: "workbuddy", id: "hy4-preview-f" },
+    );
+
+    await harness.emit(
+      assistantFailure(
+        "workbuddy",
+        "hy4-preview-f",
+        '429: {"message":"too many requests","type":"invalid_request_error","code":"14003"}',
+      ),
+    );
+
+    const called = harness.pi.setModelCalls as Array<{ provider: string; id: string }>;
+    expect(called.length === 0, "a disabled rate-limit escape must not switch models");
+    expect(harness.bans.get("workbuddy/hy4-preview-f") === undefined, "a disabled escape must not ban");
+  }));
+
+  results.push(await runTest("engine honors a custom workbuddy rate-limit cooldown", async () => {
+    const cooldownMs = 7_000;
+    const harness = engineHarness(
+      {
+        chains: [["workbuddy/hy4-preview-f", "modelscope/Qwen/Qwen3.8-Flash-Next"]],
+        fallbacks: {},
+        workbuddyRateLimitCooldownMs: cooldownMs,
+      },
+      [
+        { provider: "workbuddy", id: "hy4-preview-f" },
+        { provider: "modelscope", id: "Qwen/Qwen3.8-Flash-Next" },
+      ],
+      { provider: "workbuddy", id: "hy4-preview-f" },
+    );
+
+    const before = Date.now();
+    await harness.emit(
+      assistantFailure(
+        "workbuddy",
+        "hy4-preview-f",
+        '429: {"message":"too many requests","type":"invalid_request_error","code":"14003"}',
+      ),
+    );
+
+    const ban = harness.bans.get("workbuddy/hy4-preview-f");
+    expect(ban, "a rate limit must ban the source model");
+    expect(
+      ban!.resetsAt! > before && ban!.resetsAt! <= Date.now() + cooldownMs + 1_000,
+      "the configured cooldown must be honored",
+    );
   }));
 
   results.push(await runTest("registry contains all six providers", () => {

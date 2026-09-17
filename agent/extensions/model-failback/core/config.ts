@@ -28,6 +28,11 @@ export interface FailbackConfig {
    * 一次跨 provider 逃逸。默认 3;<=0 关闭逃逸(全部交给 pi 重试)。
    */
   workbuddyTransientOutageStreak?: number;
+  /**
+   * workbuddy:命中瞬时限流(14003 / 6005-6008 / 无 code 的 429)时直接切备用链,
+   * 并对该模型设这么久的冷却 ban。默认 60s;<=0 关闭(回到全部交给 pi 重试)。
+   */
+  workbuddyRateLimitCooldownMs?: number;
 }
 
 export const DEFAULT_COOLDOWN_MS = 60_000;
@@ -67,6 +72,10 @@ export function loadConfig(path?: string): FailbackConfig {
       ...(typeof raw.workbuddyTransientOutageStreak === "number" &&
       Number.isFinite(raw.workbuddyTransientOutageStreak)
         ? { workbuddyTransientOutageStreak: raw.workbuddyTransientOutageStreak }
+        : {}),
+      ...(typeof raw.workbuddyRateLimitCooldownMs === "number" &&
+      Number.isFinite(raw.workbuddyRateLimitCooldownMs)
+        ? { workbuddyRateLimitCooldownMs: raw.workbuddyRateLimitCooldownMs }
         : {}),
     };
   } catch {

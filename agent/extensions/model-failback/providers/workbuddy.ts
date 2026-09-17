@@ -12,7 +12,7 @@
  * `UsageLimitExceeded=14001` 等)与它的归类表:
  *
  *   quota / quota_balance_exhausted  ← 14001 14002 14012 14013 14014 14018 14019
- *   quota / quota_request_limit      ← 14003,以及 6005-6008
+ *   quota / quota_request_limit      ← 14003,以及 6005-6008(本 handler 直接切备用链)
  *   quota / quota_token_limit        ← 6003 6004
  *   quota / quota_active_session     ← 10105
  *   quota / quota_web_search         ← 15001
@@ -22,12 +22,19 @@
  *   model_service / model_behavior   ← 11141
  *   429 兜底                          → quota_balance_exhausted
  *
- * 本 handler 只覆盖**账户/计划额度耗尽**这一终态:余额耗尽、用户/企业额度耗尽、
- * token 预算耗尽,以及无 code 时的 429 兜底。这些是账户级终态,scope 为
- * "cross-provider"(同 provider 换模型无效)。
+ * 本 handler 覆盖两类需要换模型的终态:
+ *  1. **额度耗尽** —— 余额耗尽、用户/企业额度耗尽、token 预算耗尽,
+ *     以及无 code 时带额度语义的 429 兜底。账户级,`scope: "cross-provider"`
+ *     (同 provider 换模型无效);
+ *  2. **瞬时限流** —— 14003 / 6005-6008 与无 code 的裸 429。这类错误 pi 会退避
+ *     重试(默认 3 次,1s/2s/4s),但 WorkBuddy 单请求就要数分钟,7 秒总退避远
+ *     小于限流窗口,重试耗尽后 pi 只会把错误交还用户、任务中断。因此按配置
+ *     **直接切备用链**(`scope: "any"`,逐跳按用户配的链走,同 provider 的另一
+ *     部署也可能有独立配额):带一个 `workbuddyRateLimitCooldownMs`(默认 60s)的
+ *     resetsAt,到期自动解 ban,模型重新可用。把该值配成 <=0 即关闭此逃逸,
+ *     回到"全部交给 pi 重试"的旧行为。
  *
  * **不触发**的情形:
- *  - 14003 / 6005-6008 等**瞬时限流**(交给 pi 退避重试);
  *  - 14015 / 11140 / 11142 **鉴权**、14016/14017 **未开通**、11141 **模型行为错误**;
  *  - 10105 **会话数超限**、15001 **联网搜索额度** —— 都与模型推理额度无关;
  *  - 11115 **上下文超长**(应触发压缩而非换模型);
@@ -116,10 +123,17 @@ const BALANCE_EXHAUSTED_CODES = new Set([
   "6004", // CraftRateTPDLimit(每日 token 配额)
 ]);
 
-/** 明确不是账户额度终态的 code:鉴权/未开通/瞬时限流/模型错误/上下文超长。 */
+/**
+ * 瞬时限流:直接切备用链(见文件头说明),带冷却期,到期自动解 ban。
+ * 由 `workbuddyRateLimitCooldownMs` 控制;<=0 关闭逃逸。
+ */
+const RATE_LIMIT_CODES = new Set([
+  "14003", // RateLimitError
+  "6005", "6006", "6007", "6008", // CraftRate RPS/RPM/RPH/RPD
+]);
+
+/** 明确不是账户/限流终态的 code:鉴权/未开通/模型错误/上下文超长。 */
 const NON_TERMINAL_CODES = new Set([
-  "14003", // RateLimitError(瞬时,交给 pi 退避重试)
-  "6005", "6006", "6007", "6008", // CraftRate RPS/RPM/RPH/RPD(瞬时)
   "14015", // UsageLimitLicenseExpired(鉴权)
   "14016", "14017", // UsageLimitEnterpriseNotActivated / UserNotActivated
   "11140", "11142", // auth_forbidden
@@ -161,11 +175,20 @@ export const TRANSIENT_OUTAGE_WINDOW_MS = 120_000;
 export const TRANSIENT_OUTAGE_COOLDOWN_MS = 300_000;
 export const DEFAULT_TRANSIENT_OUTAGE_STREAK = 3;
 
+/** 限流逃逸后对该模型的冷却期:ban 在此期间生效,到期自动解除,模型重新可用。 */
+export const DEFAULT_RATE_LIMIT_COOLDOWN_MS = 60_000;
+
 let transientOutageStreak = DEFAULT_TRANSIENT_OUTAGE_STREAK;
+let rateLimitCooldownMs = DEFAULT_RATE_LIMIT_COOLDOWN_MS;
 
 /** 由扩展入口按配置注入;<=0 或非有限值表示关闭逃逸。 */
 export function setWorkbuddyTransientOutageStreak(value: number): void {
   transientOutageStreak = Number.isFinite(value) && value > 0 ? Math.floor(value) : 0;
+}
+
+/** 由扩展入口按配置注入;<=0 或非有限值表示关闭限流逃逸。 */
+export function setWorkbuddyRateLimitCooldownMs(value: number): void {
+  rateLimitCooldownMs = Number.isFinite(value) && value > 0 ? Math.floor(value) : 0;
 }
 
 /**
@@ -175,6 +198,7 @@ export function setWorkbuddyTransientOutageStreak(value: number): void {
  */
 export function createWorkbuddyHandler(
   getTransientOutageStreak: () => number = () => transientOutageStreak,
+  getRateLimitCooldownMs: () => number = () => rateLimitCooldownMs,
 ): ProviderFailbackHandler {
   const outages = new Map<string, { count: number; lastAt: number }>();
   const resetWorkbuddyOutages = () => outages.clear();
@@ -200,13 +224,26 @@ export function createWorkbuddyHandler(
     const status = readStatus(text);
 
     if (code !== undefined) {
-      // 非终态 code 优先排除:即使 HTTP 状态是 429,限流/鉴权也不该换模型。
+      // 鉴权/未开通等非终态 code 优先排除:即使 HTTP 状态是 429 也不该换模型。
       if (NON_TERMINAL_CODES.has(code)) return null;
       if (BALANCE_EXHAUSTED_CODES.has(code)) {
         return {
           reason: "quota_exhausted",
           scope: "cross-provider",
           note: `WorkBuddy 账户额度耗尽(${code})`,
+        };
+      }
+      // 瞬时限流:按配置直接切备用链,不再等 pi 退避重试耗尽。
+      // scope 用 "any" —— 限流常是 per-model/endpoint 的,应按用户配的链逐跳尝试
+      // (同 provider 的另一部署也可能有独立配额),而不是一律跳过同 provider。
+      if (RATE_LIMIT_CODES.has(code)) {
+        const cooldownMs = getRateLimitCooldownMs();
+        if (cooldownMs <= 0) return null;
+        return {
+          reason: "rate_limited",
+          scope: "any",
+          resetsAt: Date.now() + cooldownMs,
+          note: `WorkBuddy 瞬时限流(${code}),已切换备用链`,
         };
       }
       // 未知 code 不做猜测:留给人工确认,避免误 ban 整个 provider。
@@ -233,13 +270,24 @@ export function createWorkbuddyHandler(
       };
     }
 
-    // 无 code 时按官方兜底:429 视为余额耗尽。但没有业务码佐证,要求
-    // 文案里出现额度语义,避免把上游透传的瞬时限流当成终态。
+    // 无 code 时按官方兜底:429 且文案带额度语义 → 余额耗尽(无冷却,等账户恢复)。
     if (status === 429 && /usage\s*limit|quota|balance|exhausted|insufficient\s+credits?/i.test(text)) {
       return {
         reason: "quota_exhausted",
         scope: "cross-provider",
         note: "WorkBuddy 账户额度耗尽(429 兜底)",
+      };
+    }
+
+    // 无 code 的裸 429:按限流处理,直接切备用链(带冷却期)。
+    if (status === 429) {
+      const cooldownMs = getRateLimitCooldownMs();
+      if (cooldownMs <= 0) return null;
+      return {
+        reason: "rate_limited",
+        scope: "any",
+        resetsAt: Date.now() + cooldownMs,
+        note: "WorkBuddy 瞬时限流(429)",
       };
     }
 
