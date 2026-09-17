@@ -12,6 +12,39 @@ import type { BanStore } from "./ban-store";
 import type { FailbackConfig } from "./config";
 import { DEFAULT_MAX_CONSECUTIVE, resolveFallback, splitModelKey } from "./config";
 
+/**
+ * thinking-breaker 的升级请求契约。
+ *
+ * 刻意在两侧各声明一份结构（而不是 import）：两个扩展各自独立加载，互相 import
+ * 会让其中一个无法单独启用。字段名由回归测试固定，漂移会立刻失败。
+ */
+export const THINKING_BREAKER_ESCALATE_EVENT = "thinking-breaker:escalate";
+
+/** 复读 ban 的冷却期：到期自动解除，给模型一次重新证明自己的机会。 */
+export const BEHAVIOR_BAN_COOLDOWN_MS = 30 * 60_000;
+export const BEHAVIOR_BAN_REASON = "thinking_loop";
+
+interface ThinkingBreakerEscalateRequest {
+  readonly version: 1;
+  readonly sessionId: string;
+  readonly key: string;
+  readonly reason: string;
+  readonly note: string;
+  readonly evidence: {
+    readonly period: number;
+    readonly repeats: number;
+    readonly chars: number;
+    readonly strikes: number;
+  };
+  readonly accept: (reply: ThinkingBreakerEscalateReply) => void;
+}
+
+interface ThinkingBreakerEscalateReply {
+  readonly ok: boolean;
+  readonly switchedTo?: string;
+  readonly message?: string;
+}
+
 export interface FailbackLifecycleEvent {
   readonly version: 1;
   readonly phase: "start" | "end";
@@ -132,6 +165,9 @@ export function createEngine(
   });
   let redirectingBlockedSelection = false;
   let extensionActive = true;
+  // 行为升级（复读）需要“最近一次收到事件的上下文”，因为 escalate 事件是异步的，
+  // 而 events.on() 回调本身拿不到 ctx。每次事件顺手刷新即可，不需要额外订阅。
+  let currentContext: ExtensionContext | undefined;
   let compactionRetryActive = false;
   let compactionRetryEpoch = 0;
   let compactionRetryTimer: ReturnType<typeof setTimeout> | undefined;
@@ -197,6 +233,7 @@ export function createEngine(
   // `sendUserMessage(..., {deliverAs: "steer"})` continuation use agent.continue() and do
   // not emit it. Therefore it is the task boundary, with no speculative pending flag.
   pi.on("before_agent_start", async (_event, ctx: ExtensionContext) => {
+    currentContext = ctx;
     const autoRestoreEnabled = getConfig().autoRestore === true;
     state.chain = [];
     state.consecutive = 0;
@@ -235,6 +272,7 @@ export function createEngine(
   });
 
   pi.on("session_start", async (_event, ctx: ExtensionContext) => {
+    currentContext = ctx;
     // bindExtensions happens after the host bridge is installed; handshake here rather than
     // extension factory time so each session obtains only its own EventBus transport.
     requestHostTransport();
@@ -272,6 +310,7 @@ export function createEngine(
   // Pi 没有可取消的 model_select 事件；仅能在用户选择后立即纠正，并用守卫防递归。
   pi.on("model_select", async (event, ctx: ExtensionContext) => {
     if (state.restoreInProgress || redirectingBlockedSelection || event.source === "restore") return;
+    currentContext = ctx;
     await bans.refresh();
     const selected = event.model;
     if (bans.isBlocked(modelKey(selected.provider, selected.id))) {
@@ -491,6 +530,7 @@ export function createEngine(
   };
 
   pi.on("message_end", async (event, ctx: ExtensionContext) => {
+    currentContext = ctx;
     await handleTerminalFailure(event.message, ctx, { steer: true });
   });
 
@@ -609,6 +649,150 @@ export function createEngine(
     compactionRetryActive = true;
     const epoch = ++compactionRetryEpoch;
     await retryCompaction(failure, epoch);
+  });
+
+  /**
+   * 模型侧行为故障（非 provider 终态）的接管入口。
+   *
+   * thinking-breaker 发现某模型反复复读后发出 `thinking-breaker:escalate`；
+   * 这里负责把它变成一次真正的模型切换。之所以放在 failback 里而不是让
+   * thinking-breaker 自己切：ban 持久化、链解析、环检测、连跳上限都属于本
+   * 扩展的职责，复制一份必然与 quota 路径分叉。
+   *
+   * 与终态失败的区别：
+   *   - 只标记精确模型（scope 用 "cross-provider"，与额度耗尽同样的路由语义）
+   *   - 不依赖 `stopReason === "error"`，因为复读是以 abort 收尾的
+   *   - 成功后必须**自己**发续跑指令：abort 已经结束了原 agent run
+   *   - 写入 `resetsAt` 冷却期，避免同会话内无限连跳
+   */
+  const handleBehaviorEscalation = async (
+    req: ThinkingBreakerEscalateRequest,
+    ctx: ExtensionContext,
+  ): Promise<ThinkingBreakerEscalateReply> => {
+    if (!extensionActive) return { ok: false, message: "extension 已停用" };
+    const current = ctx.model;
+    if (!current) return { ok: false, message: "当前没有模型" };
+
+    const currentKey = modelKey(current.provider, current.id);
+    // 请求方看到的模型与当前模型不一致（用户已手动切换）：交给新模型重试即可。
+    if (currentKey !== req.key) {
+      return { ok: false, message: `当前模型已是 ${currentKey}，无需切换` };
+    }
+
+    const resetsAt = Date.now() + BEHAVIOR_BAN_COOLDOWN_MS;
+    try {
+      await bans.mark(currentKey, {
+        scope: "cross-provider",
+        reason: BEHAVIOR_BAN_REASON,
+        note: req.note,
+        markedAt: Date.now(),
+        resetsAt,
+      });
+      pi.appendEntry("model-failback-ban", {
+        key: currentKey,
+        reason: BEHAVIOR_BAN_REASON,
+        scope: "cross-provider",
+        resetsAt,
+        at: Date.now(),
+      });
+    } catch {
+      ctx.ui.notify(`[model-failback] 无法持久化 ${currentKey} 的行为 ban，仍继续切换`, "warning");
+    }
+
+    const target = resolveAvailableTarget(getConfig(), bans, current.provider, current.id, "cross-provider");
+    if (!target) {
+      ctx.ui.notify(
+        `[model-failback] ${currentKey} 反复复读，但链上没有未 ban 的 fallback，任务将中断`,
+        "error",
+      );
+      return { ok: false, message: "链上没有可用 fallback" };
+    }
+
+    // 环检测与连跳上限：复读升级属于同一类“换模型继续”，必须共享同一套护栏。
+    if (state.chain.includes(target.target)) {
+      ctx.ui.notify(
+        `[model-failback] 复读升级成环：${target.target} 已在此链失败过，停止切换`,
+        "error",
+      );
+      return { ok: false, message: "检测到切换环" };
+    }
+    const maxConsecutive = getConfig().maxConsecutive ?? DEFAULT_MAX_CONSECUTIVE;
+    if (state.consecutive >= maxConsecutive) {
+      ctx.ui.notify(
+        `[model-failback] 已达连跳上限(${maxConsecutive})，停止复读升级`,
+        "error",
+      );
+      return { ok: false, message: "已达连跳上限" };
+    }
+
+    if (!(await setTargetModel(pi, ctx, target))) {
+      return { ok: false, message: `切换到 ${target.target} 失败` };
+    }
+
+    if (state.chain.length === 0) state.chain.push(currentKey);
+    state.chain.push(target.target);
+    state.consecutive += 1;
+    state.lastFallbackAt = Date.now();
+    if (state.original === null) {
+      state.original = { provider: current.provider, model: current.id };
+    }
+
+    const continuation =
+      `[model-failback] 之前的模型(${currentKey})反复复读同一段思考、无法产出结果。` +
+      `已切换到备用模型(${target.target})，请继续完成之前的任务，不要重复已完成的步骤。`;
+    try {
+      pi.appendEntry("model-failback", {
+        from: currentKey,
+        to: target.target,
+        reason: BEHAVIOR_BAN_REASON,
+        continuation,
+        resetsAt,
+        at: Date.now(),
+      });
+    } catch {
+      ctx.ui.notify(
+        "[model-failback] 无法持久化复读升级标记；已切换模型，但不会自动续跑",
+        "error",
+      );
+      return { ok: false, message: "无法持久化标记" };
+    }
+
+    ctx.ui.notify(
+      `🔁 [model-failback] ${currentKey} 反复复读思考 → 已切换 ${target.target}。` +
+      `该模型冷却 ${Math.round(BEHAVIOR_BAN_COOLDOWN_MS / 60000)} 分钟`,
+      "warning",
+    );
+
+    try {
+      const accepted = hostTransport
+        ? await hostTransport.enqueue(continuation)
+        : (pi.sendUserMessage(continuation, { deliverAs: "steer" }), true);
+      if (!accepted) return { ok: false, message: "续跑消息未被接受" };
+    } catch {
+      return { ok: false, message: "续跑消息发送失败" };
+    }
+
+    return { ok: true, switchedTo: target.target };
+  };
+
+  pi.events?.on(THINKING_BREAKER_ESCALATE_EVENT, (payload: unknown) => {
+    const req = payload as ThinkingBreakerEscalateRequest | undefined;
+    if (!req || req.version !== 1 || typeof req.accept !== "function") return;
+    const ctx = currentContext;
+    if (!ctx) {
+      req.accept({ ok: false, message: "当前没有可用上下文" });
+      return;
+    }
+    void (async () => {
+      try {
+        req.accept(await handleBehaviorEscalation(req, ctx));
+      } catch (error) {
+        req.accept({
+          ok: false,
+          message: error instanceof Error ? error.message : String(error),
+        });
+      }
+    })();
   });
 
   return state;

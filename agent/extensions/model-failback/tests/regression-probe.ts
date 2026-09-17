@@ -56,7 +56,20 @@ class FakePi {
   readonly setModelCalls: unknown[] = [];
   readonly entries: Array<{ type: string; data: unknown }> = [];
   readonly userMessages: Array<{ content: unknown; options: unknown }> = [];
+  readonly listeners = new Map<string, Array<(payload: unknown) => void>>();
   appendEntryError: Error | undefined;
+
+  /** 与真实 ExtensionAPI.events 同形：同步 emit，订阅方自行桥接异步回复。 */
+  readonly events = {
+    on: (channel: string, listener: (payload: unknown) => void): void => {
+      const current = this.listeners.get(channel) ?? [];
+      current.push(listener);
+      this.listeners.set(channel, current);
+    },
+    emit: (channel: string, payload: unknown): void => {
+      for (const listener of this.listeners.get(channel) ?? []) listener(payload);
+    },
+  };
 
   on(event: string, handler: Handler): void {
     const current = this.handlers.get(event) ?? [];
@@ -1649,9 +1662,134 @@ async function runRegressionTests(): Promise<TestResult[]> {
     );
   }));
 
+  // ---------------------------------------------------------------- 行为升级（复读）
+  // thinking-breaker 发现模型反复复读时发 `thinking-breaker:escalate`；本扩展
+  // 负责把它变成一次真正的换模型 + 续跑。这一组用例锁住那套契约。
+  const emitEscalate = async (
+    harness: ReturnType<typeof engineHarness>,
+    overrides: Partial<{
+      key: string;
+      version: number;
+      reason: string;
+      note: string;
+      evidence: { period: number; repeats: number; chars: number; strikes: number };
+    }> = {},
+  ): Promise<{ ok: boolean; switchedTo?: string; message?: string } | undefined> => {
+    let reply: { ok: boolean; switchedTo?: string; message?: string } | undefined;
+    const request = {
+      version: 1,
+      sessionId: "test-session",
+      key: "workbuddy/deepseek-v4.1-flash",
+      reason: "thinking_loop",
+      note: "思考尾部连续重复 29 次",
+      evidence: { period: 68, repeats: 29, chars: 42_500, strikes: 2 },
+      accept(value: { ok: boolean; switchedTo?: string; message?: string }) {
+        reply = value;
+      },
+      ...overrides,
+    };
+    harness.pi.events.emit("thinking-breaker:escalate", request);
+    // 接手方是异步的（要 await 持久化 ban + setModel），让出几个宏任务。
+    for (let i = 0; i < 20 && reply === undefined; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    }
+    return reply;
+  };
+
+  results.push(await runTest("engine escalates a thinking loop to the next chain node", async () => {
+    const harness = engineHarness(
+      { chains: [["workbuddy/deepseek-v4.1-flash", "modelscope/Qwen/Qwen3.8-Flash-Next"]], fallbacks: {} },
+      [
+        { provider: "workbuddy", id: "deepseek-v4.1-flash" },
+        { provider: "modelscope", id: "Qwen/Qwen3.8-Flash-Next" },
+      ],
+      { provider: "workbuddy", id: "deepseek-v4.1-flash" },
+    );
+    // 行为升级依赖“最近一次事件的上下文”，真实流程里 session_start 已提供。
+    await harness.emitSessionStart();
+    const reply = await emitEscalate(harness);
+    expect(reply?.ok === true, `escalation was refused: ${reply?.message ?? "no reply"}`);
+    expect(reply?.switchedTo === "modelscope/Qwen/Qwen3.8-Flash-Next", `wrong target: ${reply?.switchedTo}`);
+    const called = harness.pi.setModelCalls as Array<{ provider: string; id: string }>;
+    expect(called.length === 1, `expected one setModel call, got ${called.length}`);
+    expect(called[0].provider === "modelscope", `wrong provider: ${called[0].provider}`);
+    // ban 必须落盘且带冷却期，否则同会话会无限连跳。
+    const record = harness.bans.get("workbuddy/deepseek-v4.1-flash");
+    expect(record?.reason === "thinking_loop", `wrong ban reason: ${record?.reason}`);
+    expect(typeof record?.resetsAt === "number", "behavior ban has no cooldown");
+    expect(
+      harness.pi.entries.some((entry) => entry.type === "model-failback-ban"),
+      "ban entry was not appended",
+    );
+    // 接手方必须自己发续跑：abort 已经结束了原 agent run。
+    expect(harness.pi.userMessages.length === 1, `continuation was not steered (${harness.pi.userMessages.length})`);
+    expect(
+      String(harness.pi.userMessages[0].content).includes("反复复读"),
+      "continuation does not explain the loop",
+    );
+    expect(
+      harness.notifications.some(({ message }) => message.includes("反复复读思考")),
+      "escalation notification was not emitted",
+    );
+  }));
+
+  results.push(await runTest("engine refuses a thinking-loop escalation for a stale model", async () => {
+    // 用户已经手动换了模型，thinking-breaker 的请求描述的是旧模型：
+    // 不能把新模型 ban 掉，直接让它重试即可。
+    const harness = engineHarness(
+      { chains: [["workbuddy/deepseek-v4.1-flash", "modelscope/Qwen/Qwen3.8-Flash-Next"]], fallbacks: {} },
+      [
+        { provider: "workbuddy", id: "deepseek-v4.1-flash" },
+        { provider: "modelscope", id: "Qwen/Qwen3.8-Flash-Next" },
+      ],
+      { provider: "modelscope", id: "Qwen/Qwen3.8-Flash-Next" },
+    );
+    await harness.emitSessionStart();
+    const reply = await emitEscalate(harness);
+    expect(reply?.ok === false, "stale escalation was accepted");
+    expect(harness.pi.setModelCalls.length === 0, "stale escalation switched models");
+    expect(harness.bans.list().length === 0, "stale escalation banned the new model");
+    expect(harness.pi.userMessages.length === 0, "stale escalation queued a continuation");
+  }));
+
+  results.push(await runTest("engine refuses a thinking-loop escalation without a fallback", async () => {
+    const harness = engineHarness(
+      { fallbacks: {} },
+      [{ provider: "workbuddy", id: "deepseek-v4.1-flash" }],
+      { provider: "workbuddy", id: "deepseek-v4.1-flash" },
+    );
+    await harness.emitSessionStart();
+    const reply = await emitEscalate(harness);
+    expect(reply?.ok === false, "escalation without a target was accepted");
+    expect(harness.pi.setModelCalls.length === 0, "escalation without a target switched models");
+    expect(harness.pi.userMessages.length === 0, "escalation without a target queued a continuation");
+    expect(
+      harness.notifications.some(({ message }) => message.includes("链上没有未 ban")),
+      "missing-target notification was not emitted",
+    );
+  }));
+
+  results.push(await runTest("engine ignores malformed thinking-loop escalations", async () => {
+    const harness = engineHarness(
+      { chains: [["workbuddy/deepseek-v4.1-flash", "modelscope/Qwen/Qwen3.8-Flash-Next"]], fallbacks: {} },
+      [
+        { provider: "workbuddy", id: "deepseek-v4.1-flash" },
+        { provider: "modelscope", id: "Qwen/Qwen3.8-Flash-Next" },
+      ],
+      { provider: "workbuddy", id: "deepseek-v4.1-flash" },
+    );
+    await harness.emitSessionStart();
+    // 版本不符 / 没有 accept 回调的载荷必须被静默丢弃，不得抛异常。
+    harness.pi.events.emit("thinking-breaker:escalate", { version: 2, key: "workbuddy/deepseek-v4.1-flash" });
+    harness.pi.events.emit("thinking-breaker:escalate", { version: 1, key: "workbuddy/deepseek-v4.1-flash" });
+    harness.pi.events.emit("thinking-breaker:escalate", undefined);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(harness.pi.setModelCalls.length === 0, "malformed escalation switched models");
+    expect(harness.bans.list().length === 0, "malformed escalation banned a model");
+  }));
+
   return results;
 }
-
 export default async function regressionProbe(_pi: ExtensionAPI): Promise<void> {
   const resultPath = process.env.MODEL_FAILBACK_TEST_RESULT;
   if (!resultPath) throw new Error("MODEL_FAILBACK_TEST_RESULT is required");
