@@ -2010,9 +2010,10 @@ export default function (pi: ExtensionAPI) {
 	// ---------------------------------------------------------------------
 	// Background run control tools
 	//
-	// These let the main agent inspect and stop subagents it started with
-	// `background: true`. Stop goes through the same FleetStore control port and
-	// SIGTERM/SIGKILL escalation as the user-facing overlay, so semantics match.
+	// These let the main agent inspect, redirect and stop subagents it started
+	// with `subagent`, and collect their results. Stop goes through the same
+	// FleetStore control port and SIGTERM/SIGKILL escalation as the user-facing
+	// overlay, so semantics match.
 	// ---------------------------------------------------------------------
 
 	const describeRun = (record: ReturnType<typeof backgroundRuns.list>[number]): string => {
@@ -2039,8 +2040,9 @@ export default function (pi: ExtensionAPI) {
 		name: "subagent_status",
 		label: "Subagent Status",
 		description:
-			"Report background subagent runs started with subagent({ background: true }). " +
-			"Omit runId to list every tracked run; pass a runId for a single run's status.",
+			"Report background subagent runs started with subagent. " +
+			"Omit runId to list every tracked run; pass a runId for a single run's status. " +
+			"Returns immediately — use this to check progress, not subagent_wait.",
 		parameters: StatusParams,
 
 		async execute(_toolCallId, params) {
@@ -2226,6 +2228,9 @@ export default function (pi: ExtensionAPI) {
 			"This is the reliable way to collect results: the follow-up notification is best-effort and is",
 			"lost when the session ends first, whereas subagent_wait reads the result directly.",
 			"Waits for the given runIds, or for every running background subagent when omitted.",
+			"This blocks until the run settles (up to timeoutMs), so use subagent_status or subagent_logs",
+			"to check progress without waiting. Aborting it (or pressing Esc) ends the wait without",
+			"stopping the subagents.",
 		].join(" "),
 		parameters: WaitParams,
 		renderShell: "self",
@@ -2235,7 +2240,7 @@ export default function (pi: ExtensionAPI) {
 		renderResult: (result, options, theme, context) =>
 			renderSubagentResult(result, options, context.isError, theme, fleetStore),
 
-		async execute(_toolCallId, params) {
+		async execute(_toolCallId, params, signal, onUpdate) {
 			// Explicitly requested ids are resolved even when the run already settled
 			// (that is the common case: wait is how the caller collects a result).
 			// Without ids, act on everything still outstanding so a finished-but-
@@ -2259,24 +2264,63 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			const timeoutMs = params.timeoutMs && params.timeoutMs > 0 ? params.timeoutMs : 600_000;
+			// Waiting must stay interruptible: it can block for the whole timeout, and the
+			// caller (or Esc) has to be able to end it early. Aborting the wait does not
+			// touch the subagents; they keep running in the background.
 			let timedOut = false;
-			await Promise.race([
-				Promise.allSettled(requested.map((record) => record.settled)),
-				new Promise<void>((resolve) => {
-					const timer = setTimeout(() => {
-						timedOut = true;
+			let aborted = false;
+			const total = requested.length;
+			const settledCount = () =>
+				requested.filter((r) => backgroundRuns.get(r.runId)?.status !== "running").length;
+			const abortPromise = new Promise<void>((resolve) => {
+				if (!signal) return;
+				if (signal.aborted) {
+					aborted = true;
+					resolve();
+					return;
+				}
+				signal.addEventListener(
+					"abort",
+					() => {
+						aborted = true;
 						resolve();
-					}, timeoutMs);
-					// Do not keep the process alive purely for the timeout.
-					timer.unref?.();
-				}),
-			]);
+					},
+					{ once: true },
+				);
+			});
+			// Report progress while waiting, otherwise the row sits on "Working" with no
+			// sign of which runs are still outstanding.
+			const progressTimer = setInterval(() => {
+				onUpdate?.({
+					content: [{ type: "text", text: `${settledCount()}/${total} settled, waiting on ${total - settledCount()}…` }],
+				});
+			}, 1000);
+			progressTimer.unref?.();
+			try {
+				await Promise.race([
+					Promise.allSettled(requested.map((record) => record.settled)),
+					new Promise<void>((resolve) => {
+						const timer = setTimeout(() => {
+							timedOut = true;
+							resolve();
+						}, timeoutMs);
+						// Do not keep the process alive purely for the timeout.
+						timer.unref?.();
+					}),
+					abortPromise,
+				]);
+			} finally {
+				clearInterval(progressTimer);
+			}
 
 			const sections = requested.map((record) => {
 				const settled = backgroundRuns.get(record.runId) ?? record;
 				const status = settled.status;
 				if (status === "running") {
-					return `### [${settled.agent}] run ${settled.runId} — still running after ${Math.round(timeoutMs / 1000)}s\n\nNo result yet. Use subagent_status or subagent_logs to inspect progress.`;
+					const why = aborted
+						? "still running when the wait was aborted"
+						: `still running after ${Math.round(timeoutMs / 1000)}s`;
+					return `### [${settled.agent}] run ${settled.runId} — ${why}\n\nNo result yet. Use subagent_status or subagent_logs to inspect progress.`;
 				}
 				const output = settled.result ? getResultOutput(settled.result) : "(no result captured)";
 				return `### [${settled.agent}] run ${settled.runId} — ${status}\n\n${output}`;
@@ -2287,9 +2331,11 @@ export default function (pi: ExtensionAPI) {
 			for (const record of requested) {
 				if (backgroundRuns.get(record.runId)?.status !== "running") backgroundRuns.markCollected(record.runId);
 			}
-			const header = timedOut
-				? `Waited ${Math.round(timeoutMs / 1000)}s: ${finished}/${requested.length} finished, ${requested.length - finished} still running.`
-				: `${finished}/${requested.length} background subagent(s) finished.`;
+			const header = aborted
+				? `Wait aborted: ${finished}/${requested.length} finished, ${requested.length - finished} still running.`
+				: timedOut
+					? `Waited ${Math.round(timeoutMs / 1000)}s: ${finished}/${requested.length} finished, ${requested.length - finished} still running.`
+					: `${finished}/${requested.length} background subagent(s) finished.`;
 			// Carry the settled results in `details` so the TUI transcript and Fleet
 			// history restore can render the full record (tool calls, usage, diffs).
 			// Only settled runs have a result object to contribute. Scope metadata is

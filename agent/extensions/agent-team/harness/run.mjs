@@ -783,6 +783,41 @@ async function main() {
 		const timedOutText = timedOutWait.content[0]?.text ?? "";
 		check("subagent_wait honours its timeout", timedOutText.includes("still running"), timedOutText.split("\n")[0]);
 		check("subagent_wait reports 0 finished on timeout", /0\/1 finished/.test(timedOutText));
+
+		// (9j-2) Waiting can block for the whole timeout, so it must stay
+		// interruptible and must not look hung while it waits.
+		const ac = new AbortController();
+		const progressUpdates = [];
+		const abortWait = waitTool.execute(
+			"harness-call",
+			{ runIds: [slowRunId], timeoutMs: 60_000 },
+			ac.signal,
+			(update) => progressUpdates.push(update),
+			ctx,
+		);
+		await new Promise((resolve) => setTimeout(resolve, 1200));
+		check(
+			"subagent_wait reports progress while waiting",
+			progressUpdates.length > 0 && String(progressUpdates[0]?.content?.[0]?.text ?? "").includes("settled"),
+			JSON.stringify(progressUpdates[0]?.content?.[0]?.text),
+		);
+		ac.abort();
+		// Race the wait against a short deadline so a wait that ignores the signal
+		// fails the assertion instead of hanging the suite.
+		const abortedResult = await Promise.race([
+			abortWait,
+			new Promise((resolve) => setTimeout(() => resolve(undefined), 3000)),
+		]);
+		const abortedText = abortedResult?.content?.[0]?.text ?? "";
+		check(
+			"aborting subagent_wait ends the wait early",
+			abortedText.includes("aborted"),
+			abortedText.split("\n")[0] || "(still waiting after 3s)",
+		);
+		check(
+			"aborting the wait leaves the subagent running",
+			(await callTool(statusTool, { runId: slowRunId })).content[0]?.text?.includes("status: running"),
+		);
 		if (slowRunId) await callTool(stopTool, { runId: slowRunId });
 
 		// (9k) Waiting on an unknown id is reported, not silently ignored.
