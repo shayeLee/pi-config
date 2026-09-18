@@ -14,8 +14,9 @@
  *
  * 熔断的三条纪律：
  *   - **只信尾部周期**。全篇词频会被模板化枚举污染（"第 1 项…第 2 项…"）。
- *   - **delta 必须校验为增量**。累计模式下拼接 delta 会凭空造出复读。
- *   - **只在能验证时动手**。拿不到思考原文、或 delta 校验不过，一律只观测。
+ *   - **窗口只取 provider 的 partial 全文**。不去拼接 `delta`，也就不必猜增量/累计
+ *     —— 猜错的代价是把真实复读判成"不可信"而放行（详见 detect.ts 的 TailWindow）。
+ *   - **只在能验证时动手**。拿不到思考原文、或已产出工具调用/文本，一律只观测。
  *
  * 落盘（`~/.pi/agent/thinking-breaker/`）：
  *   YYYY-MM-DD.jsonl            每条 assistant 消息一行指标摘要
@@ -41,7 +42,6 @@ import {
  */
 type AgentMessageLike = MessageEndEvent["message"];
 import {
-	DeltaGuard,
 	TailWindow,
 	capKeptPrefix,
 	detectTailPeriod,
@@ -63,7 +63,7 @@ interface ProbeConfig {
 	maxFileBytes: number;
 	/** 是否把思考原文写入 .thinking.jsonl（用户选择 full 模式）。 */
 	captureThinkingText: boolean;
-	/** 是否写流式明细（用于判定 delta 增量/累计）。 */
+	/** 是否写流式明细（诊断用：观察 delta 与 partial 的计数差异）。 */
 	captureStreamDetail: boolean;
 	/** 单条消息思考原文的最大留存字符数，防止单行过大。 */
 	maxThinkingCharsPerMessage: number;
@@ -297,18 +297,19 @@ function shorten(value: string, max = 4000): string {
  * dry-run 判定：只依靠“思考原文的尾部周期复读”，不看思考时长/ token 量。
  * 返回 null 表示无异常。
  *
- * 保守纪律：
+ * 判定纪律：
  *   - 必须真的拿到思考原文（否则无从判断，宁可不动）；
- *   - deltaMode 必须是 incremental（cumulative 说明 delta 是累计值，拼接会凭空造出复读）；
  *   - 只接受尾部连续重复，不靠全篇词频（全篇词频对模板化枚举有误报）。
+ *
+ * 这里不再看 deltaMode：传入的是 message_end 里 provider 给出的**权威全文**，
+ * 不是拼接 delta 得到的，增量/累计与它无关。旧代码沿用 delta 时代的门槛，
+ * 会把非 incremental 的消息一并略过，属于同一类误杀。
  */
 function evaluateRepetition(
 	thinkingText: string,
-	deltaMode: string,
 	minRepeats: number,
 ): { kind: "tail"; period: number; repeats: number; tailChars: number } | null {
 	if (thinkingText.length === 0) return null;
-	if (deltaMode !== "incremental") return null;
 	const tail = detectTailPeriod(thinkingText);
 	if (!tail || tail.repeats < minRepeats) return null;
 	return { kind: "tail", ...tail };
@@ -324,7 +325,7 @@ interface StreamStats {
 	thinkingDelta: number;
 	thinkingEnd: number;
 	thinkingDeltaChars: number;
-	/** 各 contentIndex 上最后一个 delta 的字符数，用于判定增量/累计。 */
+	/** 各 contentIndex 上最后一个 delta 的字符数（诊断用）。 */
 	lastDeltaLen: Map<number, number>;
 	/** 各 contentIndex 上 partial thinking 的最大长度。 */
 	maxPartialLen: Map<number, number>;
@@ -337,10 +338,8 @@ interface StreamStats {
 	lastThinkingDeltaAt: number | undefined;
 	streamDetailWritten: number;
 	/** —— 以下为熔断（enforce）相关状态 —— */
-	/** 当前 thinking 块的流式累加器（只保留尾部窗口）。 */
+	/** 当前 thinking 块的尾部窗口（内容取自 partial，不拼接 delta）。 */
 	window: TailWindow;
-	/** delta 增量校验器；校验不过则本条消息永不熔断。 */
-	guard: DeltaGuard;
 	/** 上次检测的时间戳，用于节流。 */
 	lastCheckAt: number;
 	/** 命中后打上标记，供 message_end 识别“这次 abort 是我们自己干的”。 */
@@ -374,7 +373,6 @@ function newStreamStats(provider: string, model: string, windowChars: number): S
 		lastThinkingDeltaAt: undefined,
 		streamDetailWritten: 0,
 		window: new TailWindow(windowChars),
-		guard: new DeltaGuard(),
 		lastCheckAt: 0,
 		abortHit: null,
 		abortChars: 0,
@@ -385,17 +383,27 @@ function newStreamStats(provider: string, model: string, windowChars: number): S
 
 /** 从 partial 的 thinking 块取当前累计长度。 */
 function partialThinkingLen(partial: unknown): number {
-	if (typeof partial !== "object" || partial === null) return 0;
+	return partialThinkingText(partial).length;
+}
+
+/**
+ * 从 partial 取当前累计的思考原文。
+ *
+ * 这是 provider 给出的**权威全文**，也是熔断窗口的唯一数据源。多个 thinking
+ * 块按顺序拼接：复读只会发生在最后一块，但窗口需要跨块连续才不漏判。
+ */
+function partialThinkingText(partial: unknown): string {
+	if (typeof partial !== "object" || partial === null) return "";
 	const content = (partial as { content?: unknown }).content;
-	if (!Array.isArray(content)) return 0;
-	let total = 0;
+	if (!Array.isArray(content)) return "";
+	const parts: string[] = [];
 	for (const block of content) {
 		if (typeof block !== "object" || block === null) continue;
-		const b = block as { type?: unknown; thinking?: unknown; redacted?: unknown };
+		const b = block as { type?: unknown; thinking?: unknown };
 		if (b.type !== "thinking") continue;
-		if (typeof b.thinking === "string") total += b.thinking.length;
+		if (typeof b.thinking === "string") parts.push(b.thinking);
 	}
-	return total;
+	return parts.join("\n");
 }
 
 function partialRedacted(partial: unknown): boolean {
@@ -518,7 +526,7 @@ export default function thinkingBreaker(pi: ExtensionAPI) {
 	 *   - 已经打过标记就不重复 abort
 	 *   - 节流：每 `enforceCheckIntervalMs` 才跑一次周期性检测
 	 *     （一次事故有 10 万个 delta，逐个检测是 O(n²)）
-	 *   - delta 增量校验不过则彻底放弃本条消息
+	 *   - 窗口内容取自 partial 权威全文，不存在增量/累计的歧义
 	 */
 	const maybeBreak = (ctx: ExtensionContext): void => {
 		if (!enforceEnabled) return;
@@ -530,7 +538,7 @@ export default function thinkingBreaker(pi: ExtensionAPI) {
 		if (now - stats.lastCheckAt < config.enforceCheckIntervalMs) return;
 		stats.lastCheckAt = now;
 
-		const decision = shouldBreak(stats.window.tail, stats.window.totalChars, stats.guard.isTrusted, {
+		const decision = shouldBreak(stats.window.tail, stats.window.totalChars, {
 			minRepeats: config.enforceMinRepeats,
 			minChars: config.enforceMinChars,
 			maxPeriod: config.enforceMaxPeriod,
@@ -732,7 +740,8 @@ export default function thinkingBreaker(pi: ExtensionAPI) {
 				if (current.firstThinkingDeltaAt === undefined) current.firstThinkingDeltaAt = Date.now();
 				current.lastThinkingDeltaAt = Date.now();
 				current.lastDeltaLen.set(contentIndex, delta.length);
-				const partialLen = partialThinkingLen(ev.partial);
+				const partialText = partialThinkingText(ev.partial);
+				const partialLen = partialText.length;
 				current.maxPartialLen.set(
 					contentIndex,
 					Math.max(current.maxPartialLen.get(contentIndex) ?? 0, partialLen),
@@ -746,13 +755,12 @@ export default function thinkingBreaker(pi: ExtensionAPI) {
 				seen.redacted = seen.redacted || current.redactedSeen;
 				deltaSeen.set(key, seen);
 
-				// 熔断路径：累加尾部窗口 + 在线校验 delta 为增量，再节流检测。
-				// 顺序很重要 —— 先累加再检测，否则检测的是上一轮的尾部。
-				current.window.append(delta);
-				current.guard.observe(delta.length, partialLen);
+				// 熔断路径：用 partial 的权威全文刷新尾部窗口，再节流检测。
+				// 不拼接 delta —— 那需要先猜增量/累计，而猜错会凭空造出复读。
+				current.window.update(partialText);
 				maybeBreak(ctx);
 
-				// 流式明细：只写前 N 条，够判定增量/累计即可，避免文件膨胀。
+				// 流式明细：只写前 N 条，够看 delta/partial 计数差异即可，避免文件膨胀。
 				if (config.captureStreamDetail && current.streamDetailWritten < 40) {
 					current.streamDetailWritten += 1;
 					await appendJsonl(
@@ -819,8 +827,8 @@ export default function thinkingBreaker(pi: ExtensionAPI) {
 			const usage = extractUsage(message);
 			const stopReason = String((message as { stopReason?: unknown }).stopReason ?? "unknown");
 
-			// 增量 vs 累计：delta 之和若接近最终长度即为增量；若最大 delta 长度接近最终
-			// 长度则为累计。判定错误会凭空造出"复读"，因此必须显式记录。
+			// delta 与最终原文的比值：仅作诊断记录。熔断不再依赖它 —— 窗口取自
+			// partial 权威全文，而 message_end 的 thinking.text 也是权威值。
 			const deltaSum = stats.thinkingDeltaChars;
 			const finalLen = thinking.text.length;
 			let deltaMode: "incremental" | "cumulative" | "mixed" | "unknown" = "unknown";
@@ -835,7 +843,7 @@ export default function thinkingBreaker(pi: ExtensionAPI) {
 			const tokenRepeat = analyzeTokenRepeat(thinking.text);
 			const lineRepeat = analyzeLineRepeat(thinking.text);
 			const tailPeriod = detectTailPeriod(thinking.text);
-			const verdict = evaluateRepetition(thinking.text, deltaMode, config.alertMinRepeats);
+			const verdict = evaluateRepetition(thinking.text, config.alertMinRepeats);
 
 			// —— 熔断收尾 ——
 			// 我们自己在流式过程中 abort 的消息（stats.abortHit 非空）需要：
@@ -890,9 +898,9 @@ export default function thinkingBreaker(pi: ExtensionAPI) {
 					toolcallEnd: stats.toolcallEnd,
 					redacted: stats.redactedSeen,
 					deltaMode,
-					/** 在线增量校验的最大偏差；非 0 说明 provider 的计数与拼接不完全一致。 */
-					guardSkew: stats.guard.skew,
-					guardTrusted: stats.guard.isTrusted,
+					/** 窗口来源与已产出长度的权威值（取自 partial，非累加）。 */
+					windowSource: "partial",
+					producedChars: stats.window.totalChars,
 				},
 				thinking: {
 					blocks: thinking.blocks,
@@ -951,10 +959,14 @@ export default function thinkingBreaker(pi: ExtensionAPI) {
 			if (config.dryRunAlert && verdict) {
 				alertCount += 1;
 				const unit = thinking.text.slice(-verdict.period).replace(/\s+/g, " ").trim().slice(0, 40);
+				// 文案必须区分两种模式：熔断开着却说“仅观测”会把排查带偏。
+				const suffix = enforceEnabled
+					? "本轮未熔断（可能未达字符/重复阈值，或已产出工具调用）。详情: /breaker"
+					: "本次仅观测，未拦截。详情: /breaker";
 				ctx.ui.notify(
-					`🔁 [thinking-breaker dry-run] ${stats.provider}/${stats.model} 思考尾部连续重复 ` +
+					`🔁 [thinking-breaker${enforceEnabled ? "" : " dry-run"}] ${stats.provider}/${stats.model} 思考尾部连续重复 ` +
 						`${verdict.repeats} 次（单元 “${unit}”，共 ${verdict.tailChars} 字符）。\n` +
-						`本次仅观测，未拦截。详情: /breaker`, 
+						suffix,
 					"warning",
 				);
 			}

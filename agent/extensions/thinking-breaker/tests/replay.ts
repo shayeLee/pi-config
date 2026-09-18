@@ -2,7 +2,7 @@
  * thinking-breaker 回放测试。
  *
  * 用本机真实的思考原文日志（~/.pi/agent/thinking-breaker/*.thinking.jsonl）跑：
- *   1. 零误报回归 —— 2648 条真实思考在熔断阈值下不得命中；
+ *   1. 零误报回归 —— 5000+ 条真实思考在熔断阈值下不得命中；
  *   2. 真实事故提前拦截 —— 2026-09-17 的 35 万字符复读必须在前 5 万字符内命中；
  *   3. 剥复读正确性 —— 剥掉后不再命中，且保留的前缀里没有复读。
  *
@@ -12,7 +12,6 @@ import { readFileSync, readdirSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import {
-	DeltaGuard,
 	TailWindow,
 	capKeptPrefix,
 	detectTailPeriod,
@@ -82,10 +81,11 @@ if (rows.length === 0) {
 	const falsePositives: string[] = [];
 	for (const row of rows) {
 		const text = fullText(row);
-		const hit = shouldBreak(text, text.length, true, ENFORCE);
+		const hit = shouldBreak(text, text.length, ENFORCE);
 		if (hit) falsePositives.push(`${row.model} ${row.ts} repeats=${hit.hit.repeats}`);
 	}
-	// 已知的两条真实复读样本（16 次、29 次）本就该命中，从误报里排除。
+	// 已知的真实复读样本本就该命中，从误报里排除。
+	// 2026-09-16/17/18 共 4 条 workbuddy/deepseek-v4.1-flash 事故。
 	const known = falsePositives.filter((line) => !line.includes("deepseek-v4.1-flash"));
 	check(
 		`无非复读模型被误伤（${rows.length} 条中 ${falsePositives.length} 条命中，全部属于已知复读模型）`,
@@ -93,8 +93,8 @@ if (rows.length === 0) {
 		known.slice(0, 3).join(" | "),
 	);
 	check(
-		`命中样本数 ≤ 已知的 2 条`,
-		falsePositives.length <= 2,
+		`命中样本数 ≤ 已知的 4 条`,
+		falsePositives.length <= 4,
 		`实际 ${falsePositives.length}`,
 	);
 
@@ -107,7 +107,7 @@ if (rows.length === 0) {
 		const text = fullText(incident);
 		let firstHit: number | null = null;
 		for (let cut = ENFORCE.minChars; cut <= text.length; cut += 500) {
-			if (shouldBreak(text.slice(0, cut), cut, true, ENFORCE)) {
+			if (shouldBreak(text.slice(0, cut), cut, ENFORCE)) {
 				firstHit = cut;
 				break;
 			}
@@ -171,37 +171,33 @@ check(
 const shortLoop = "OK. ".repeat(50);
 check(
 	"短思考不触发（minChars 门禁）",
-	shouldBreak(shortLoop, shortLoop.length, true, ENFORCE) === null,
+	shouldBreak(shortLoop, shortLoop.length, ENFORCE) === null,
 );
 
-// delta 校验失败则永不熔断（累计模式保护）。
+// 长复读必须命中。
 const longLoop = "分析完成。\n" + "OK. Let me write. Go. ".repeat(2000);
-const guard = new DeltaGuard();
-// 模拟 cumulative：第 i 个 delta 是"到目前的全量"（i+1 个单元），而 partial 只有
-// 一个单元的推进 —— 拼接长度会迅速远超 partial，必须被判定为不可信。
-for (let i = 0; i < 20; i++) guard.observe(20 * (i + 1), 20 * (i + 1));
-check("累计模式被 DeltaGuard 识别为不可信", !guard.isTrusted);
 check(
-	"不可信时不熔断",
-	shouldBreak(longLoop, longLoop.length, guard.isTrusted, ENFORCE) === null,
+	"长复读且可信时熔断",
+	shouldBreak(longLoop, longLoop.length, ENFORCE) !== null,
 );
 
-// 增量模式必须被信任。
-const goodGuard = new DeltaGuard();
-// 增量：第 i 个 delta 是 20 字符，partial 累计到 20*(i+1)，两者严格同步。
-for (let i = 0; i < 20; i++) goodGuard.observe(20, 20 * (i + 1));
-check("增量模式保持可信", goodGuard.isTrusted);
-check(
-	"可信且长复读时熔断",
-	shouldBreak(longLoop, longLoop.length, goodGuard.isTrusted, ENFORCE) !== null,
-);
-
-// TailWindow 的窗口裁剪不改变检测结论。
+// TailWindow 直接用 provider 的权威全文刷新，窗口裁剪不改变检测结论。
 const win = new TailWindow(2000);
-for (let i = 0; i < 5000; i++) win.append("OK. ");
+for (let i = 0; i < 5000; i++) win.update("OK. ".repeat(i + 1));
 check("TailWindow 只保留尾部窗口", win.tail.length <= 2000);
-check("TailWindow 记录总长度", win.totalChars === 20_000);
+check("TailWindow 记录权威总长度", win.totalChars === 20_000);
 check("TailWindow 尾部仍可检测", detectTailPeriod(win.tail, { minRepeats: 10 }) !== null);
+
+// 窗口内容取自 partial：累计/增量不再影响判定（回归 2026-09-18 误杀）。
+// 该事故里 delta 累加与 partial 曾出现 99 字符偏差，旧 DeltaGuard 因此否决了
+// 本条消息的熔断资格；新窗口不依赖 delta，同样的文本必须能命中。
+const incidentLike = "让我检查一下这个问题的细节。\n" + "OK. Let me write. Go. ".repeat(1500);
+const incidentWin = new TailWindow(2000);
+incidentWin.update(incidentLike);
+check(
+	"窗口取自 partial，不受 delta 计数偏差影响",
+	shouldBreak(incidentWin.tail, incidentWin.totalChars, ENFORCE) !== null,
+);
 
 console.log(
 	failures === 0

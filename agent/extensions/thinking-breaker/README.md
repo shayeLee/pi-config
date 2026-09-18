@@ -31,6 +31,7 @@ OK. Let me write. Go. Now.
 |---|---|---|
 | 哪些模型吐思考原文？ | 12 个模型里 11 个吐，捕获率 78%–100% | `deltaMode` 与 `deltaCapture` 汇总 |
 | `delta` 是增量还是累计？ | 全部 `incremental` | 流式明细里 `deltaLen` 与 `partialThinkingLen` 严格同步递增 |
+| `delta` 值得信赖吗？ | **不值得** —— 已弃用 | 判"不可信"的 259 条消息，delta 累加值 100% 等于原文长度，全是误杀 |
 | `usage.reasoning` 可用吗？ | **对 workbuddy 不可用** | 事故记录 `reasoningReported: false`，input/output/cache 全 0 |
 | 复读只出现在哪？ | 只有 `workbuddy/deepseek-v4.1-flash` | 2679 条样本中仅 2 条命中（16 次、29 次），其余模型 0 命中 |
 
@@ -42,8 +43,8 @@ OK. Let me write. Go. Now.
 
 ```
 thinking_delta（每 750ms 节流检测一次）
-  → 尾部窗口 detectTailPeriod ≥ 10 次连续重复
-  → 在线 DeltaGuard 校验 delta 为增量（否则本条永不熔断）
+  → 尾部窗口取自 provider 的 partial 全文（不拼接 delta）
+  → detectTailPeriod ≥ 10 次连续重复
   → 打标记 + ctx.abort()
 message_end(stopReason="aborted" 且标记命中)
   → stripAllLoopTail 剥掉复读 → 替换消息（这是关键：中止后的思考块会完整留在上下文里）
@@ -62,8 +63,8 @@ message_end(stopReason="aborted" 且标记命中)
 ### 三条纪律
 
 1. **只信尾部周期**。全篇词频会被模板化枚举污染（`第 1 项…第 2 项…`）——实测这种文本在词频方案下必然误报，在尾部周期方案下 0 误报。
-2. **delta 必须是增量**。累计模式下把 delta 拼起来会凭空造出复读。`DeltaGuard` 在线校验拼接长度与 partial 长度是否同步，偏差超容差就永久放弃该消息。
-3. **拿不到证据就不动手**。没有思考原文、delta 校验不过、已产出工具调用或文本 —— 一律只观测。
+2. **窗口只取 provider 的 `partial` 全文，不拼接 `delta`**。`delta` 是增量还是累计取决于 provider，猜错的代价极高。历史上用 `DeltaGuard` 在线猜：它取 `|拼接长度 − partial 长度|` 的绝对值，只要超过容差就永久否决该消息的熔断资格。实测 259 条被判"不可信"的消息，delta 累加值 **100% 精确等于**最终思考原文长度 —— 它们全是增量，`DeltaGuard` 一次都没判对。而 2026-09-18 那次 50 万字符事故就死在这道门上（`guardSkew: 99` 超过容差 64）。改为直接取 `partial.content[].thinking` 的尾部，歧义从根上消失。
+3. **拿不到证据就不动手**。没有思考原文、已产出工具调用或文本 —— 一律只观测。
 
 ### 剥复读为什么不能用"按周期整块比对"
 
@@ -128,7 +129,7 @@ message_end(stopReason="aborted" 且标记命中)
 |---|---|
 | `YYYY-MM-DD.jsonl` | 每条 assistant 消息一行指标摘要（含 `break` 熔断台账） |
 | `YYYY-MM-DD.thinking.jsonl` | 思考原文（可单独删除） |
-| `YYYY-MM-DD.stream.jsonl` | 前 40 个 thinking_delta 的流式明细（用于判定增量/累计） |
+| `YYYY-MM-DD.stream.jsonl` | 前 40 个 thinking_delta 的流式明细（诊断 delta/partial 计数差异） |
 
 14 天惰性清理，单文件 20MB 上限。**任何写失败、检测异常都绝不打断 agent。**
 

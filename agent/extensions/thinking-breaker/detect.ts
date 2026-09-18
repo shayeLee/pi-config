@@ -2,13 +2,13 @@
  * thinking-breaker — 复读检测的纯函数层。
  *
  * 这一层刻意不依赖 pi 的任何 API：它是熔断决策的唯一依据，必须能被离线回放
- * 测试直接调用（tests/run-replay.mjs 用真实思考原文跑零误报回归）。
+ * 测试直接调用（tests/replay.ts 用真实思考原文跑零误报回归）。
  *
  * 判定纪律（由 Phase 1 的 2601 条真实思考原文实测确定）：
  *   - 只看**尾部周期性复读**，不看全篇词频。模板化枚举（"第 1 项…第 2 项…"）
  *     会污染词频统计，但不会形成尾部周期。
- *   - `delta` 必须是增量。累计模式下拼接 delta 会凭空造出复读，因此调用方
- *     必须先用 `DeltaGuard` 在线校验，校验不通过就不允许熔断。
+ *   - 窗口内容只取自 provider 给出的 `partial`（权威全文），**不拼接 `delta`**。
+ *     拼接 delta 在累计模式下会凭空造出复读，因此这个歧义从根上消除。
  */
 
 /** 尾部周期复读的检测结果。 */
@@ -73,10 +73,17 @@ export function detectTailPeriod(
 }
 
 /**
- * 增量文本的滑动尾部窗口。
+ * 尾部窗口 —— 内容直接取自 provider 的 `partial`，而不是拼接 `delta`。
  *
- * 熔断要在流式过程中做判断，但每次都重新拼接全文是 O(n²)。这里只保留末尾
- * `windowChars` 个字符，append 是均摊 O(delta)，检测成本与已产出长度无关。
+ * 为什么不再拼接 delta：`delta` 是增量还是累计取决于 provider，一旦判错
+ * （把累计值拼起来）就会凭空造出复读，是最危险的误判来源。历史上用
+ * `DeltaGuard` 在线猜这件事，代价是 259 条真实消息被误判为"不可信"而彻底
+ * 丧失熔断资格 —— 事后核对，这 259 条的 delta 累加值 100% 精确等于最终思考
+ * 原文长度，即它们全都是增量。猜错的代价远高于收益。
+ *
+ * `partial.content[].thinking` 就是 provider 给出的权威全文，直接取其尾部即可，
+ * 增量/累计的歧义从根上消失。每次更新只做一次 `slice(-windowChars)`，
+ * 复杂度 O(windowChars)，与已产出长度无关。
  */
 export class TailWindow {
 	private buffer = "";
@@ -87,69 +94,26 @@ export class TailWindow {
 		this.windowChars = windowChars;
 	}
 
-	append(chunk: string): void {
-		if (chunk.length === 0) return;
-		this.seen += chunk.length;
-		this.buffer += chunk;
-		// 多留一截，避免每次 append 都触发 slice。
-		if (this.buffer.length > this.windowChars * 2) {
-			this.buffer = this.buffer.slice(-this.windowChars);
-		}
+	/** 用 provider 给出的完整思考原文刷新窗口与总长度。 */
+	update(fullText: string): void {
+		this.seen = fullText.length;
+		this.buffer =
+			fullText.length > this.windowChars ? fullText.slice(-this.windowChars) : fullText;
 	}
 
-	/** 已经喂进来的总字符数（不受窗口裁剪影响）。 */
+	/** 已经产出的总字符数（权威值，来自 partial 而非累加）。 */
 	get totalChars(): number {
 		return this.seen;
 	}
 
 	/** 当前窗口内容。 */
 	get tail(): string {
-		return this.buffer.length > this.windowChars
-			? this.buffer.slice(-this.windowChars)
-			: this.buffer;
+		return this.buffer;
 	}
 
 	reset(): void {
 		this.buffer = "";
 		this.seen = 0;
-	}
-}
-
-/**
- * 在线校验 delta 是"增量"而不是"累计"。
- *
- * 累计模式下把每个 delta 拼起来会凭空造出复读，是最危险的误判来源。判据：
- * 拼接得到的长度必须与 provider 给出的 partial 长度同步增长；偏差一旦超过
- * 容差就永久放弃这条消息的熔断资格（保守失败，只观测）。
- */
-export class DeltaGuard {
-	private acc = 0;
-	private maxSkew = 0;
-	private trusted = true;
-
-	/** 喂入一个 delta 与其对应的 partial 长度。 */
-	observe(deltaChars: number, partialChars: number): void {
-		this.acc += deltaChars;
-		const skew = Math.abs(this.acc - partialChars);
-		if (skew > this.maxSkew) this.maxSkew = skew;
-		// 容差随长度放宽（provider 可能对空白/工具调用块计数不同），但绝不无限放宽。
-		const tolerance = Math.max(64, Math.floor(partialChars * 0.05));
-		if (skew > tolerance) this.trusted = false;
-	}
-
-	/** 是否仍然可以信任 delta 为增量。 */
-	get isTrusted(): boolean {
-		return this.trusted;
-	}
-
-	get skew(): number {
-		return this.maxSkew;
-	}
-
-	reset(): void {
-		this.acc = 0;
-		this.maxSkew = 0;
-		this.trusted = true;
 	}
 }
 
@@ -162,18 +126,15 @@ export interface BreakDecision {
 /**
  * 熔断判定：把"检测结果"翻译成"要不要动手"。
  *
- * 三道门都必须过：
- *   1. delta 增量校验通过（否则宁可不动）
- *   2. 思考长度达到 minChars（避免对短思考动手）
- *   3. 尾部周期重复次数达到 minRepeats
+ * 两道门都必须过：
+ *   1. 思考长度达到 minChars（避免对短思考动手）
+ *   2. 尾部周期重复次数达到 minRepeats
  */
 export function shouldBreak(
 	tailText: string,
 	producedChars: number,
-	trusted: boolean,
 	options: { minRepeats: number; minChars: number; maxPeriod: number; windowChars: number },
 ): BreakDecision | null {
-	if (!trusted) return null;
 	if (producedChars < options.minChars) return null;
 	const hit = detectTailPeriod(tailText, {
 		windowChars: options.windowChars,
