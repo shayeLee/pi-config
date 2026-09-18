@@ -8,6 +8,7 @@ Agent Delegation
 Partition tasks based on their scope, complexity, risk, and the value of independent or parallel work, and delegate execution via `subagent`.
 For agent discovery, load user-level agents from `~/.pi/agent/agents` and project-level agents from the nearest `.pi/agents` found by walking upward from the working directory. With `agentScope: "both"`, load both and let project-level agents override same-named user-level agents.
 `subagent` returns one `runId` per subagent and does not include the subagent's output. Collect results with `subagent_wait`: with no arguments it waits for every outstanding run, including all tasks of a parallel call, and explicit runIds wait for specific runs.
+`subagent_wait` blocks until those runs settle (or `timeoutMs` elapses), so it is the wrong tool for a quick look. Use `subagent_status` for a run's status and `subagent_logs` for what it has produced so far; both return immediately.
 
 The Architect should first reduce ambiguity enough to define the objective, expected outcome, affected area, and major constraints and only then delegate.
 
@@ -19,10 +20,10 @@ The Architect should first reduce ambiguity enough to define the objective, expe
 The root Architect reviews delegation results and verification evidence before making the final judgment.
 
 - Start independent, non-conflicting work in parallel. Sequence work that may interfere or depends on earlier results: collect the previous result before starting the next subagent.
-- Supervise long or risky runs instead of waiting blindly: `subagent_status` for progress, `subagent_logs` for the transcript so far, `subagent_steer` to redirect a run going the wrong way, `subagent_stop` to terminate one that is no longer needed.
+- Supervise long or risky runs instead of blocking on them: `subagent_status` for progress, `subagent_logs` for the transcript so far, `subagent_steer` to redirect a run going the wrong way, `subagent_stop` to terminate one that is no longer needed. These return immediately; call `subagent_wait` only when you actually need a result before you can continue.
 - Each task of a parallel call is a separate run with its own runId, so tasks can be supervised or stopped individually.
 
-Typical flow: start one or more subagents, keep working or start more, then `subagent_wait` to collect results before forming your conclusion.
+Typical flow: start one or more subagents, keep working or start more, check on them with `subagent_status` / `subagent_logs` while they run, then `subagent_wait` to collect the results you depend on before forming your conclusion.
 
 Repository Search
 Use `rg` (ripgrep) as the primary repository search tool.

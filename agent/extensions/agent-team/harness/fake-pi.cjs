@@ -175,6 +175,20 @@ const assistant = (text) => ({
 });
 
 if (task.includes("SCENARIO:tool_in_flight")) {
+	// Durable: the subagent narrated what it is doing, then asked for `read`
+	// (which finished). The narration is what wait progress should surface.
+	emit({
+		type: "message_end",
+		message: {
+			role: "assistant",
+			content: [
+				{ type: "text", text: "IN-FLIGHT-NARRATION: reading the input file now" },
+			],
+			usage: { input: 10, output: 5, cacheRead: 1, cacheWrite: 0, totalTokens: 15, cost: { total: 0.0001 } },
+			model: "fake/provider",
+			stopReason: "end",
+		},
+	});
 	// Durable: assistant asked for `read`, and it finished.
 	emit({
 		type: "message_end",

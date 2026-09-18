@@ -565,6 +565,52 @@ function getDisplayItems(messages: Message[], includeToolResults = false): Displ
 	return items;
 }
 
+/** The subagent's most recent assistant prose, clipped, or "" when it has none. */
+function latestAssistantText(messages: readonly unknown[]): string {
+	for (let i = messages.length - 1; i >= 0; i--) {
+		const summary = summarizeMessage(messages[i]);
+		if (!summary || summary.startsWith("calling ") || summary.startsWith("finished ")) continue;
+		return summary;
+	}
+	return "";
+}
+
+/**
+ * One-line description of a single message, used for wait progress.
+ *
+ * `live.messages` holds whatever the subagent has emitted so far, so reading the
+ * last entries shows the caller what the run is doing right now. Assistant text
+ * is preferred over tool calls: it is what the subagent is actually saying, which
+ * tells the caller more than the name of a tool it happens to be running. Tool
+ * calls and results are used as a fallback when the run has not spoken yet.
+ * Returns "" for an unrecognised shape so the caller can fall back.
+ */
+function summarizeMessage(message: unknown): string {
+	if (!isRecord(message)) return "";
+	const clip = (text: string): string => {
+		const single = text.replace(/\s+/g, " ").trim();
+		return single.length > 120 ? `${single.slice(0, 120)}…` : single;
+	};
+	if (message.role === "toolResult" && typeof message.toolName === "string") {
+		return `finished ${message.toolName}`;
+	}
+	if (message.role === "assistant" && Array.isArray(message.content)) {
+		// Assistant prose first: it is the subagent's own account of where it is.
+		for (const part of message.content) {
+			if (isRecord(part) && part.type === "text" && typeof part.text === "string" && part.text.trim()) {
+				const text = clip(part.text);
+				if (text) return text;
+			}
+		}
+		for (const part of message.content) {
+			if (isRecord(part) && part.type === "toolCall" && typeof part.name === "string") {
+				return `calling ${part.name}`;
+			}
+		}
+	}
+	return "";
+}
+
 /**
  * Projects a live FleetRun onto the settled SingleResult shape the transcript
  * renderer already consumes. `subagent` announces runs before any durable
@@ -1793,9 +1839,11 @@ export default function (pi: ExtensionAPI) {
 		label: "Subagent",
 		description: [
 			"Delegate tasks to specialized subagents with isolated context.",
-			"Returns one runId per subagent; the subagent's output is collected with subagent_wait.",
-			"Modes: single (agent + task), parallel (tasks array).",
-			"Runs are supervised with subagent_status, subagent_logs, subagent_steer, and subagent_stop.",
+			"Modes: single (agent + task), parallel (tasks array). Each returns one runId immediately;",
+			"the subagent's output is not included.",
+			"Collect results with subagent_wait, which blocks until the run settles. To look without blocking,",
+			"use subagent_status (status) or subagent_logs (transcript so far).",
+			"While a run is going, subagent_steer redirects it and subagent_stop terminates it.",
 			"For sequential work, call subagent again with the previous result.",
 			`Default agent scope is "both": user-level agents plus ${CONFIG_DIR_NAME}/agents from the current project.`,
 			`Project-level agents override user-level agents with the same name.`,
@@ -2225,8 +2273,6 @@ export default function (pi: ExtensionAPI) {
 		label: "Subagent Wait",
 		description: [
 			"Wait for background subagents to finish and return their results.",
-			"This is the reliable way to collect results: the follow-up notification is best-effort and is",
-			"lost when the session ends first, whereas subagent_wait reads the result directly.",
 			"Waits for the given runIds, or for every running background subagent when omitted.",
 			"This blocks until the run settles (up to timeoutMs), so use subagent_status or subagent_logs",
 			"to check progress without waiting. Aborting it (or pressing Esc) ends the wait without",
@@ -2270,8 +2316,28 @@ export default function (pi: ExtensionAPI) {
 			let timedOut = false;
 			let aborted = false;
 			const total = requested.length;
+			const waitStartedAt = Date.now();
 			const settledCount = () =>
 				requested.filter((r) => backgroundRuns.get(r.runId)?.status !== "running").length;
+			// A bare "0/1 settled" never changes while a single run works, which is no
+			// better than a static "Working". Report elapsed time and the subagent's own
+			// latest words so the caller can see what the run is doing and saying.
+			const describeProgress = (): string => {
+				const settled = settledCount();
+				const elapsed = Math.round((Date.now() - waitStartedAt) / 1000);
+				const lines = [`${settled}/${total} settled after ${elapsed}s`];
+				for (const record of requested) {
+					const current = backgroundRuns.get(record.runId);
+					if (!current || current.status !== "running") continue;
+					const messages = current.live?.messages ?? [];
+					const label = total > 1 ? `run ${current.runId} (${current.agent})` : current.agent;
+					// The newest assistant text is the most useful signal; fall back to the
+					// newest message of any kind, then to "starting".
+					const said = latestAssistantText(messages) || summarizeMessage(messages[messages.length - 1]);
+					lines.push(said ? `${label}: ${said}` : `${label}: starting`);
+				}
+				return lines.join("\n");
+			};
 			const abortPromise = new Promise<void>((resolve) => {
 				if (!signal) return;
 				if (signal.aborted) {
@@ -2291,9 +2357,7 @@ export default function (pi: ExtensionAPI) {
 			// Report progress while waiting, otherwise the row sits on "Working" with no
 			// sign of which runs are still outstanding.
 			const progressTimer = setInterval(() => {
-				onUpdate?.({
-					content: [{ type: "text", text: `${settledCount()}/${total} settled, waiting on ${total - settledCount()}…` }],
-				});
+				onUpdate?.({ content: [{ type: "text", text: `${describeProgress()}…` }] });
 			}, 1000);
 			progressTimer.unref?.();
 			try {

@@ -185,6 +185,45 @@ async function main() {
 
 		const subagent = tools.get("subagent");
 		check("subagent tool registered", Boolean(subagent));
+
+		// The tool descriptions are the context the model actually sees when it
+		// decides which tool to call, so they must state the blocking semantics and
+		// point at the non-blocking alternatives. Nothing asserted these before,
+		// which is how they drifted out of step with the implementation.
+		const subagentDescription = subagent?.description ?? "";
+		check(
+			"subagent description says the result arrives via subagent_wait",
+			subagentDescription.includes("subagent_wait"),
+		);
+		check(
+			"subagent description warns that subagent_wait blocks",
+			subagentDescription.includes("blocks"),
+			subagentDescription.slice(0, 160),
+		);
+		check(
+			"subagent description points at the non-blocking alternatives",
+			subagentDescription.includes("subagent_status") && subagentDescription.includes("subagent_logs"),
+		);
+		check(
+			"subagent description no longer mentions the removed background flag",
+			!subagentDescription.includes("background"),
+			subagentDescription,
+		);
+		const waitDescription = tools.get("subagent_wait")?.description ?? "";
+		check(
+			"subagent_wait description warns that it blocks",
+			waitDescription.includes("blocks"),
+			waitDescription.slice(0, 160),
+		);
+		check(
+			"subagent_wait description offers a non-blocking alternative to check progress",
+			waitDescription.includes("subagent_status") && waitDescription.includes("subagent_logs"),
+		);
+		check(
+			"subagent_wait description says aborting does not stop the subagents",
+			waitDescription.includes("without stopping the subagents"),
+			waitDescription.slice(-160),
+		);
 		check("session_start handler registered", (handlers.get("session_start") ?? []).length === 1);
 		check("subagents command registered", Boolean(commands.get("subagents")));
 		check("ctrl+alt+f shortcut registered", Boolean(shortcuts.get("ctrl+alt+f")));
@@ -801,6 +840,41 @@ async function main() {
 			progressUpdates.length > 0 && String(progressUpdates[0]?.content?.[0]?.text ?? "").includes("settled"),
 			JSON.stringify(progressUpdates[0]?.content?.[0]?.text),
 		);
+		// Progress must show what the subagent is actually doing/saying, not just a
+		// counter: the caller is waiting precisely because they want to know that.
+		const narrated = await subagent.execute(
+			"harness-call",
+			{ agent: "worker", task: "SCENARIO:tool_in_flight" },
+			undefined,
+			undefined,
+			ctx,
+		);
+		const narratedId = /runId: (\d+)/.exec(narrated.content[0]?.text ?? "")?.[1];
+		const narratedUpdates = [];
+		const narratedAc = new AbortController();
+		const narratedWait = waitTool.execute(
+			"harness-call",
+			{ runIds: [narratedId], timeoutMs: 60_000 },
+			narratedAc.signal,
+			(update) => narratedUpdates.push(String(update.content?.[0]?.text ?? "")),
+			ctx,
+		);
+		for (let i = 0; i < 40 && narratedUpdates.length < 2; i++) {
+			await new Promise((resolve) => setTimeout(resolve, 100));
+		}
+		check(
+			"wait progress shows the subagent's own latest message",
+			narratedUpdates.some((text) => text.includes("IN-FLIGHT-NARRATION")),
+			JSON.stringify(narratedUpdates.slice(0, 2)),
+		);
+		check(
+			"wait progress names the agent it is waiting on",
+			narratedUpdates.some((text) => text.includes("worker")),
+			JSON.stringify(narratedUpdates[0]),
+		);
+		narratedAc.abort();
+		await Promise.race([narratedWait, new Promise((r) => setTimeout(r, 3000))]);
+		await callTool(stopTool, { runId: narratedId });
 		ac.abort();
 		// Race the wait against a short deadline so a wait that ignores the signal
 		// fails the assertion instead of hanging the suite.

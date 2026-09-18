@@ -24,6 +24,10 @@
 
 `subagent` 为每个子代理返回一个 `runId`，不包含子代理的输出。用 `subagent_wait` 收取结果：不带参数时等待所有尚未收取的 run（包括并行调用的全部任务），传入明确的 runId 则等待指定的 run。
 
+> `subagent_wait` blocks until those runs settle (or `timeoutMs` elapses), so it is the wrong tool for a quick look. Use `subagent_status` for a run's status and `subagent_logs` for what it has produced so far; both return immediately.
+
+`subagent_wait` 会阻塞到这些 run 结束（或 `timeoutMs` 到期），所以它不适合用来看一眼进展。查看某个 run 的状态用 `subagent_status`，查看它目前产出的内容用 `subagent_logs`；两者都立即返回。
+
 > The Architect should first reduce ambiguity enough to define the objective, expected outcome, affected area, and major constraints and only then delegate.
 
 Architect 应先将歧义降低到足以明确目标、预期结果、受影响范围和主要约束，然后再进行委派。
@@ -48,16 +52,16 @@ Architect 应先将歧义降低到足以明确目标、预期结果、受影响�
 - > Start independent, non-conflicting work in parallel. Sequence work that may interfere or depends on earlier results: collect the previous result before starting the next subagent.
 
   并行开展相互独立且不冲突的工作；可能相互干扰或依赖先前结果的工作应按顺序进行：先收取上一个结果，再启动下一个子代理。
-- > Supervise long or risky runs instead of waiting blindly: `subagent_status` for progress, `subagent_logs` for the transcript so far, `subagent_steer` to redirect a run going the wrong way, `subagent_stop` to terminate one that is no longer needed.
+- > Supervise long or risky runs instead of blocking on them: `subagent_status` for progress, `subagent_logs` for the transcript so far, `subagent_steer` to redirect a run going the wrong way, `subagent_stop` to terminate one that is no longer needed. These return immediately; call `subagent_wait` only when you actually need a result before you can continue.
 
-  对耗时较长或有风险的 run 应主动监督，而不是盲目等待：`subagent_status` 查看进度，`subagent_logs` 查看目前已采集的记录，`subagent_steer` 纠正跑偏的 run，`subagent_stop` 终止不再需要的 run。
+  对耗时较长或有风险的 run 主动监督，而不是阻塞等待：`subagent_status` 查看进度，`subagent_logs` 查看目前已采集的记录，`subagent_steer` 纠正跑偏的 run，`subagent_stop` 终止不再需要的 run。这些都会立即返回；只有确实需要结果才能继续时，才调用 `subagent_wait`。
 - > Each task of a parallel call is a separate run with its own runId, so tasks can be supervised or stopped individually.
 
   并行调用的每个任务都是独立的 run，各有自己的 runId，因此可以逐个监督或停止。
 
-> Typical flow: start one or more subagents, keep working or start more, then `subagent_wait` to collect results before forming your conclusion.
+> Typical flow: start one or more subagents, keep working or start more, check on them with `subagent_status` / `subagent_logs` while they run, then `subagent_wait` to collect the results you depend on before forming your conclusion.
 
-典型流程：先启动一个或多个子代理，期间继续工作或再启动更多子代理，然后用 `subagent_wait` 收齐结果后再形成结论。
+典型流程：先启动一个或多个子代理，期间继续工作或再启动更多子代理，运行时用 `subagent_status` / `subagent_logs` 查看情况，然后用 `subagent_wait` 收齐你依赖的结果后再形成结论。
 
 > Repository Search
 
