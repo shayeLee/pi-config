@@ -51,6 +51,17 @@
  * `TRANSIENT_OUTAGE_COOLDOWN_MS` 冷却期的 `resetsAt`,让 failback 换到链上
  * 其它 provider 继续任务;冷却期过后 ban 自动过期,模型重新可用。
  * 阈值设为 0 即完全关闭该逃逸,回到"全部交给 pi 重试"的旧行为。
+ *
+ * 关于 WAF 拦截页的例外:腾讯云 WAF 会直接返回 403 的 HTML 拦截页
+ * (`403 <!DOCTYPE html>…<title>WAF Block Page</title>…waf-intl.qq.com…`)。它接不住
+ * 上面两条既有路径:`readStatus` 只认 `"403:"` 冒号形式,而真实文本是 `403 <!DOCTYPE`
+ * (openai SDK 的 `APIError.makeMessage` 形如 `${status} ${msg}`);
+ * `extractFirstJsonObject` 也因 HTML 里内联 `<script>` 的 `{` 解析失败而返回 undefined。
+ * 更关键的是 **pi 的 `RETRYABLE_PROVIDER_ERROR_PATTERN` 不含 403**,一次 403 就直接终止
+ * 该 run,不可能产生第二次 `message_end` —— 因此 5xx 那套"连续 N 次才逃逸"的 streak
+ * 语义对 WAF 完全无效,必须**默认首次即逃逸**(`DEFAULT_WAF_BLOCK_STREAK = 1`)。
+ * WAF 是 IP/请求特征级封禁,换同 provider 的其他模型无效,故 `scope: "cross-provider"`;
+ * 冷却期用固定的 `WAF_BLOCK_COOLDOWN_MS`(10 分钟),不做成配置项。
  */
 
 import type { ProviderFailbackHandler } from "./types";
@@ -169,6 +180,24 @@ export function classifyTransientOutage(text: string): TransientOutage | undefin
   return undefined;
 }
 
+/**
+ * 识别 WorkBuddy 侧的腾讯云 WAF 403 拦截页。
+ *
+ * **必须没有结构化错误体**:有 JSON 的一律交给 code 判定(与 `classifyTransientOutage`
+ * 同一条纪律),免得把上游透传的、带 JSON 的 403 当成 WAF 页。
+ * 这里匹配的是 WorkBuddy 侧 WAF 的**专有特征串**,不是"所有 403"的通用规则:
+ * 故意不经过 `readStatus`,也不做任何状态码门禁。
+ */
+export function classifyWafBlock(text: string): boolean {
+  if (extractFirstJsonObject(text) !== undefined) return false;
+  return (
+    /<title>\s*waf\s+block\s+page\s*<\/title>/i.test(text) ||
+    /waf-intl\.qq\.com/.test(text) ||
+    /web\s+application\s+firewall/i.test(text) ||
+    /block-pages\/403/.test(text)
+  );
+}
+
 /** 连续故障的计数窗口:超出这个间隔视为新的一轮,避免长任务里偶发 5xx 累加成逃逸。 */
 export const TRANSIENT_OUTAGE_WINDOW_MS = 120_000;
 /** 逃逸后对该模型的冷却期:ban 在此期间生效,到期自动解除,模型重新可用。 */
@@ -178,12 +207,24 @@ export const DEFAULT_TRANSIENT_OUTAGE_STREAK = 3;
 /** 限流逃逸后对该模型的冷却期:ban 在此期间生效,到期自动解除,模型重新可用。 */
 export const DEFAULT_RATE_LIMIT_COOLDOWN_MS = 60_000;
 
+/** WAF 拦截页逃逸后对该模型的冷却期(固定值,不做成配置项)。 */
+export const WAF_BLOCK_COOLDOWN_MS = 600_000;
+
+/** 默认首次即逃逸:pi 不重试 403,一次拦截就终止 run,没有第二次机会。 */
+export const DEFAULT_WAF_BLOCK_STREAK = 1;
+
 let transientOutageStreak = DEFAULT_TRANSIENT_OUTAGE_STREAK;
 let rateLimitCooldownMs = DEFAULT_RATE_LIMIT_COOLDOWN_MS;
+let wafBlockStreak = DEFAULT_WAF_BLOCK_STREAK;
 
 /** 由扩展入口按配置注入;<=0 或非有限值表示关闭逃逸。 */
 export function setWorkbuddyTransientOutageStreak(value: number): void {
   transientOutageStreak = Number.isFinite(value) && value > 0 ? Math.floor(value) : 0;
+}
+
+/** 由扩展入口按配置注入;<=0 或非有限值表示关闭 WAF 逃逸。 */
+export function setWorkbuddyWafBlockStreak(value: number): void {
+  wafBlockStreak = Number.isFinite(value) && value > 0 ? Math.floor(value) : 0;
 }
 
 /** 由扩展入口按配置注入;<=0 或非有限值表示关闭限流逃逸。 */
@@ -199,13 +240,24 @@ export function setWorkbuddyRateLimitCooldownMs(value: number): void {
 export function createWorkbuddyHandler(
   getTransientOutageStreak: () => number = () => transientOutageStreak,
   getRateLimitCooldownMs: () => number = () => rateLimitCooldownMs,
+  getWafBlockStreak: () => number = () => wafBlockStreak,
 ): ProviderFailbackHandler {
   const outages = new Map<string, { count: number; lastAt: number }>();
-  const resetWorkbuddyOutages = () => outages.clear();
-  const noteOutage = (key: string, now: number): number => {
-    const previous = outages.get(key);
+  // WAF 拦截页用**独立**的计数器:它与 5xx 网关故障是不同的上游语义,
+  // 共享计数会让一侧的偶发失败把另一侧推到阈值。
+  const wafOutages = new Map<string, { count: number; lastAt: number }>();
+  const resetWorkbuddyOutages = () => {
+    outages.clear();
+    wafOutages.clear();
+  };
+  const noteOutage = (
+    map: Map<string, { count: number; lastAt: number }>,
+    key: string,
+    now: number,
+  ): number => {
+    const previous = map.get(key);
     const count = previous && now - previous.lastAt <= TRANSIENT_OUTAGE_WINDOW_MS ? previous.count + 1 : 1;
-    outages.set(key, { count, lastAt: now });
+    map.set(key, { count, lastAt: now });
     return count;
   };
   return {
@@ -250,6 +302,23 @@ export function createWorkbuddyHandler(
       return null;
     }
 
+    // WAF 403 拦截页:pi 不重试 403,一次即终止 run,所以默认首次就逃逸(见文件头说明)。
+    if (classifyWafBlock(text)) {
+      const wafBlockStreak = getWafBlockStreak();
+      if (wafBlockStreak <= 0) return null;
+      const model = typeof msg.model === "string" ? msg.model : "";
+      const wafKey = `${msg.provider}/${model}`;
+      const count = noteOutage(wafOutages, wafKey, Date.now());
+      if (count < wafBlockStreak) return null;
+      wafOutages.delete(wafKey);
+      return {
+        reason: "waf_blocked",
+        scope: "cross-provider",
+        resetsAt: Date.now() + WAF_BLOCK_COOLDOWN_MS,
+        note: "WorkBuddy 被腾讯云 WAF 拦截(403 拦截页),已切换备用链",
+      };
+    }
+
     // 上游网关连续故障:单次仍按瞬时错误交给 pi 重试,连续多次才允许一次跨 provider 逃逸。
     const outage = classifyTransientOutage(text);
     if (outage !== undefined) {
@@ -257,7 +326,7 @@ export function createWorkbuddyHandler(
       if (transientOutageStreak <= 0) return null;
       const model = typeof msg.model === "string" ? msg.model : "";
       const outageKey = `${msg.provider}/${model}`;
-      const count = noteOutage(outageKey, Date.now());
+      const count = noteOutage(outages, outageKey, Date.now());
       if (count < transientOutageStreak) return null;
       outages.delete(outageKey);
       return {

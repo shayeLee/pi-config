@@ -13,12 +13,16 @@ import { commandCodeHandler } from "../providers/command-code";
 import { workbuddyHandler } from "../providers/workbuddy";
 import {
   classifyTransientOutage,
+  classifyWafBlock,
   DEFAULT_RATE_LIMIT_COOLDOWN_MS,
   DEFAULT_TRANSIENT_OUTAGE_STREAK,
+  DEFAULT_WAF_BLOCK_STREAK,
   resetWorkbuddyOutages,
   setWorkbuddyRateLimitCooldownMs,
   setWorkbuddyTransientOutageStreak,
+  setWorkbuddyWafBlockStreak,
   TRANSIENT_OUTAGE_COOLDOWN_MS,
+  WAF_BLOCK_COOLDOWN_MS,
 } from "../providers/workbuddy";
 import { supportedProviders } from "../providers/registry";
 
@@ -134,6 +138,23 @@ function creditsFailure(provider: string, model: string): Record<string, unknown
   return assistantFailure(provider, model, '{"type":"CreditsError","message":"Insufficient balance"}');
 }
 
+/**
+ * 真实 WAF 拦截页的忠实裁剪版(来自真实 session):保留 `403 <!DOCTYPE html>` 前缀
+ * (openai SDK 的 `${status} ${msg}` 形状,而不是 `403:`)、WAF 特征串,以及内联
+ * `<script> function submitWafFeedback() { … }` —— HTML 里有 `{` 但没有合法 JSON。
+ */
+const WAF_BLOCK_PAGE =
+  '403 <!DOCTYPE html><html lang="en"><head><meta charset="UTF-8" /><title>WAF Block Page</title>' +
+  '<link rel="stylesheet" text="text/css" href="https://domain-config-1256704386.cos.accelerate.myqcloud.com/block-pages/403/main_en.css" />' +
+  '</head><script> function submitWafFeedback() { var uuid = document.getElementById("uuid").innerHTML; window.location.href = "https://api.waf-intl.qq.com/waf-attack-feedback/" + uuid; } </script>' +
+  '<body><div class="wrapper"><div class="body"><p class="title">Your request has been interrupted</p>' +
+  '<p class="desc">The web application firewall has detected a security risk or non-compliance in your visit</p>' +
+  '<p class="uuid-wrapper"> Request UUID:<span id="uuid">c93317e20eea317765e94c5abb64cfea-80996126fd197e8e2aa9814fc60a0583</span></p>' +
+  '</div></div></body></html>\n';
+
+const GATEWAY_PAGE_502 =
+  "502 <html><head><title>502 Bad Gateway</title></head><body>openresty</body></html>";
+
 function waitForTimers(): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, 10));
 }
@@ -147,6 +168,7 @@ function engineHarness(
     autoRestore?: boolean;
     workbuddyTransientOutageStreak?: number;
     workbuddyRateLimitCooldownMs?: number;
+    workbuddyWafStreak?: number;
   },
   models: Array<{ provider: string; id: string }> = [],
   currentModel: { provider: string; id: string } = { provider: "openai-codex", id: "gpt-5.6-sol" },
@@ -1574,6 +1596,189 @@ async function runRegressionTests(): Promise<TestResult[]> {
     expect(
       ban!.resetsAt! > before && ban!.resetsAt! <= Date.now() + cooldownMs + 1_000,
       "the configured cooldown must be honored",
+    );
+  }));
+
+  results.push(await runTest("workbuddy waf block page escapes immediately", () => {
+    // pi 的 RETRYABLE_PROVIDER_ERROR_PATTERN 不含 403:一次 403 就终止该 run,
+    // 不可能有第二次 message_end,所以 WAF 必须默认首次即逃逸。
+    setWorkbuddyWafBlockStreak(DEFAULT_WAF_BLOCK_STREAK);
+    resetWorkbuddyOutages();
+    expect(classifyWafBlock(WAF_BLOCK_PAGE), "the real WAF block page must be classified as a WAF block");
+
+    const before = Date.now();
+    const verdict = workbuddyHandler.inspect(
+      assistantFailure("workbuddy", "deepseek-v4.1-flash", WAF_BLOCK_PAGE),
+    );
+    expect(verdict, "a WAF block page must escape on the first occurrence");
+    expect(verdict.reason === "waf_blocked", `unexpected reason: ${verdict.reason}`);
+    expect(verdict.scope === "cross-provider", `unexpected scope: ${verdict.scope}`);
+    expect(typeof verdict.resetsAt === "number", "a WAF escape must carry a cooldown");
+    expect(
+      verdict.resetsAt! > before && verdict.resetsAt! <= before + WAF_BLOCK_COOLDOWN_MS + 1_000,
+      "the WAF cooldown must be bounded",
+    );
+
+    // 每个特征串单独出现时也能命中。
+    const features = [
+      '403 <!DOCTYPE html><html><head><title>WAF Block Page</title></head><body>blocked</body></html>',
+      '403 <!DOCTYPE html><html><body><script>window.location.href = "https://api.waf-intl.qq.com/waf-attack-feedback/" + uuid;</script></body></html>',
+      '403 <!DOCTYPE html><html><body><p class="desc">The web application firewall has detected a security risk</p></body></html>',
+    ];
+    for (const sample of features) {
+      expect(classifyWafBlock(sample), `WAF feature was not detected: ${sample.slice(0, 60)}`);
+    }
+    resetWorkbuddyOutages();
+  }));
+
+  results.push(await runTest("workbuddy waf classification excludes json bodies and unrelated pages", () => {
+    // 有结构化错误体的一律走 code 判定,不带 JSON 的普通错误/普通 HTML 页也不得命中。
+    const samples = [
+      '403: {"message":"UsageLimitLicenseExpired","type":"invalid_request_error","code":"14015"}',
+      "403 upgrade_required",
+      '401 <!DOCTYPE html><html><head><title>Unauthorized</title></head><body>nginx</body></html>',
+      "403 status code (no body)",
+      '500 <html><head><title>500 Internal Server Error</title></head><body>openresty</body></html>',
+    ];
+    for (const sample of samples) {
+      expect(!classifyWafBlock(sample), `must not be classified as a WAF page: ${sample}`);
+    }
+
+    resetWorkbuddyOutages();
+    setWorkbuddyWafBlockStreak(DEFAULT_WAF_BLOCK_STREAK);
+    const handlerSamples = [
+      '403: {"code":"14015"}',
+      "403 upgrade_required",
+      "403 status code (no body)",
+    ];
+    for (const sample of handlerSamples) {
+      expect(
+        workbuddyHandler.inspect(assistantFailure("workbuddy", "deepseek-v4.1-flash", sample)) === null,
+        `handler must stay non-terminal: ${sample}`,
+      );
+    }
+
+    // 回归确认 5xx 网关页仍走原路径:默认阈值下第一次仍是瞬时错误。
+    resetWorkbuddyOutages();
+    setWorkbuddyTransientOutageStreak(DEFAULT_TRANSIENT_OUTAGE_STREAK);
+    expect(
+      workbuddyHandler.inspect(
+        assistantFailure("workbuddy", "deepseek-v4.1-flash", GATEWAY_PAGE_502),
+      ) === null,
+      "a single gateway page must still be transient",
+    );
+    resetWorkbuddyOutages();
+  }));
+
+  results.push(await runTest("workbuddy waf escape can be thresholded or disabled", () => {
+    const wafFailure = () => assistantFailure("workbuddy", "deepseek-v4.1-flash", WAF_BLOCK_PAGE);
+
+    setWorkbuddyWafBlockStreak(0);
+    resetWorkbuddyOutages();
+    for (let i = 0; i < 3; i++) {
+      expect(workbuddyHandler.inspect(wafFailure()) === null, "a disabled WAF escape must never escape");
+    }
+
+    setWorkbuddyWafBlockStreak(2);
+    resetWorkbuddyOutages();
+    expect(workbuddyHandler.inspect(wafFailure()) === null, "the first WAF page must stay transient at threshold 2");
+    const second = workbuddyHandler.inspect(wafFailure());
+    expect(second, "the second WAF page must escape at threshold 2");
+    expect(second.reason === "waf_blocked", `unexpected reason: ${second.reason}`);
+    expect(workbuddyHandler.inspect(wafFailure()) === null, "the WAF streak must reset after an escape");
+
+    // WAF 计数与 5xx 计数互不干扰:先打一次 5xx 网关页,再打一次 WAF 页,
+    // 两者都用默认阈值,WAF 那次必须仍然逃逸。
+    setWorkbuddyWafBlockStreak(DEFAULT_WAF_BLOCK_STREAK);
+    setWorkbuddyTransientOutageStreak(DEFAULT_TRANSIENT_OUTAGE_STREAK);
+    resetWorkbuddyOutages();
+    expect(
+      workbuddyHandler.inspect(
+        assistantFailure("workbuddy", "deepseek-v4.1-flash", GATEWAY_PAGE_502),
+      ) === null,
+      "a single gateway page must stay transient",
+    );
+    const escaped = workbuddyHandler.inspect(wafFailure());
+    expect(escaped, "a gateway outage must not consume the WAF streak");
+    expect(escaped.reason === "waf_blocked", `unexpected reason: ${escaped.reason}`);
+
+    setWorkbuddyWafBlockStreak(DEFAULT_WAF_BLOCK_STREAK);
+    resetWorkbuddyOutages();
+  }));
+
+  results.push(await runTest("engine switches provider on a workbuddy waf block", async () => {
+    const harness = engineHarness(
+      {
+        chains: [[
+          "workbuddy/deepseek-v4.1-flash",
+          "workbuddy/deepseek-v4.1-flash-sg",
+          "command-code/deepseek/deepseek-v4.1-flash",
+        ]],
+        fallbacks: {},
+      },
+      [
+        { provider: "workbuddy", id: "deepseek-v4.1-flash" },
+        { provider: "workbuddy", id: "deepseek-v4.1-flash-sg" },
+        { provider: "command-code", id: "deepseek/deepseek-v4.1-flash" },
+      ],
+      { provider: "workbuddy", id: "deepseek-v4.1-flash" },
+    );
+
+    const before = Date.now();
+    await harness.emit(assistantFailure("workbuddy", "deepseek-v4.1-flash", WAF_BLOCK_PAGE));
+
+    // cross-provider 守卫必须跳过同 provider 的 deepseek-v4.1-flash-sg。
+    const called = harness.pi.setModelCalls as Array<{ provider: string; id: string }>;
+    expect(called.length === 1, `expected 1 switch, got ${called.length}`);
+    expect(
+      called[0].provider === "command-code",
+      `wrong fallback target: ${called[0].provider}/${called[0].id}`,
+    );
+
+    const ban = harness.bans.get("workbuddy/deepseek-v4.1-flash");
+    expect(ban, "a WAF block must ban the source model");
+    expect(ban!.reason === "waf_blocked", `unexpected ban reason: ${ban!.reason}`);
+    expect(ban!.scope === "cross-provider", `unexpected ban scope: ${ban!.scope}`);
+    expect(typeof ban!.resetsAt === "number", "a WAF ban must carry a cooldown");
+    expect(
+      ban!.resetsAt! > before && ban!.resetsAt! <= before + WAF_BLOCK_COOLDOWN_MS + 1_000,
+      "the WAF cooldown must be bounded",
+    );
+
+    expect(harness.pi.userMessages.length === 1, "a WAF block must steer a continuation");
+    expect(
+      (harness.pi.userMessages[0].options as { deliverAs: string }).deliverAs === "steer",
+      "the continuation must be delivered as steer",
+    );
+  }));
+
+  results.push(await runTest("engine keeps a workbuddy waf block on pi retry when disabled", async () => {
+    const harness = engineHarness(
+      {
+        chains: [[
+          "workbuddy/deepseek-v4.1-flash",
+          "workbuddy/deepseek-v4.1-flash-sg",
+          "command-code/deepseek/deepseek-v4.1-flash",
+        ]],
+        fallbacks: {},
+        workbuddyWafStreak: 0,
+      },
+      [
+        { provider: "workbuddy", id: "deepseek-v4.1-flash" },
+        { provider: "workbuddy", id: "deepseek-v4.1-flash-sg" },
+        { provider: "command-code", id: "deepseek/deepseek-v4.1-flash" },
+      ],
+      { provider: "workbuddy", id: "deepseek-v4.1-flash" },
+    );
+
+    await harness.emit(assistantFailure("workbuddy", "deepseek-v4.1-flash", WAF_BLOCK_PAGE));
+
+    expect(harness.pi.setModelCalls.length === 0, "a disabled WAF escape must not switch models");
+    expect(harness.bans.get("workbuddy/deepseek-v4.1-flash") === undefined, "a disabled escape must not ban");
+    expect(harness.pi.userMessages.length === 0, "a disabled escape must not queue a continuation");
+    expect(
+      !harness.pi.entries.some((entry) => entry.type === "model-failback-ban"),
+      "a disabled escape must not write a ban entry",
     );
   }));
 

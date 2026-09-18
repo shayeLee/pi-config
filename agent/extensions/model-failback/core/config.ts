@@ -33,6 +33,11 @@ export interface FailbackConfig {
    * 并对该模型设这么久的冷却 ban。默认 60s;<=0 关闭(回到全部交给 pi 重试)。
    */
   workbuddyRateLimitCooldownMs?: number;
+  /**
+   * workbuddy:连续几次 WAF 拦截页(腾讯云 403 拦截页)后跨 provider 逃逸。
+   * 默认 1(首次即逃逸,因为 pi 不重试 403,一次即终止该 run);<=0 关闭。
+   */
+  workbuddyWafStreak?: number;
 }
 
 export const DEFAULT_COOLDOWN_MS = 60_000;
@@ -76,6 +81,10 @@ export function loadConfig(path?: string): FailbackConfig {
       ...(typeof raw.workbuddyRateLimitCooldownMs === "number" &&
       Number.isFinite(raw.workbuddyRateLimitCooldownMs)
         ? { workbuddyRateLimitCooldownMs: raw.workbuddyRateLimitCooldownMs }
+        : {}),
+      ...(typeof raw.workbuddyWafStreak === "number" &&
+      Number.isFinite(raw.workbuddyWafStreak)
+        ? { workbuddyWafStreak: raw.workbuddyWafStreak }
         : {}),
     };
   } catch {

@@ -28,10 +28,15 @@ export interface ProviderRegistry {
 export function createProviderRegistry(
   getWorkbuddyTransientOutageStreak?: () => number,
   getWorkbuddyRateLimitCooldownMs?: () => number,
+  getWorkbuddyWafBlockStreak?: () => number,
 ): ProviderRegistry {
   const handlers = [
     ...STATIC_HANDLERS,
-    createWorkbuddyHandler(getWorkbuddyTransientOutageStreak, getWorkbuddyRateLimitCooldownMs),
+    createWorkbuddyHandler(
+      getWorkbuddyTransientOutageStreak,
+      getWorkbuddyRateLimitCooldownMs,
+      getWorkbuddyWafBlockStreak,
+    ),
   ];
   return {
     get(provider) {

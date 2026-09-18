@@ -7,7 +7,11 @@
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { createProviderRegistry } from "../providers/registry";
-import { DEFAULT_RATE_LIMIT_COOLDOWN_MS, DEFAULT_TRANSIENT_OUTAGE_STREAK } from "../providers/workbuddy";
+import {
+  DEFAULT_RATE_LIMIT_COOLDOWN_MS,
+  DEFAULT_TRANSIENT_OUTAGE_STREAK,
+  DEFAULT_WAF_BLOCK_STREAK,
+} from "../providers/workbuddy";
 import type { BanStore } from "./ban-store";
 import type { FailbackConfig } from "./config";
 import { DEFAULT_MAX_CONSECUTIVE, resolveFallback, splitModelKey } from "./config";
@@ -168,6 +172,11 @@ export function createEngine(
       const value = getConfig().workbuddyRateLimitCooldownMs;
       // Same contract as above: a valid <=0 disables the escape entirely.
       return Number.isFinite(value) ? Math.floor(value!) : DEFAULT_RATE_LIMIT_COOLDOWN_MS;
+    },
+    () => {
+      const value = getConfig().workbuddyWafStreak;
+      // Same contract as above: a valid <=0 disables the escape entirely.
+      return Number.isFinite(value) ? Math.floor(value!) : DEFAULT_WAF_BLOCK_STREAK;
     },
   );
   let redirectingBlockedSelection = false;

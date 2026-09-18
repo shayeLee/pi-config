@@ -114,6 +114,36 @@ WorkBuddy 的推理端点(apisix/openresty 网关)会以**纯 HTML 页面**返�
 - **阈值 <=0 完全关闭**该逃逸,回到"全部交给 pi 重试"的旧行为。
 - 逃逸成功后计数复位,后续单次故障又回到瞬时错误语义。
 
+### WAF 拦截页(403)的即时逃逸
+
+腾讯云 WAF 会直接返回 403 的 **HTML 拦截页**,真实样本形状:
+
+```
+403 <!DOCTYPE html><html lang="en"><head><meta charset="UTF-8" /><title>WAF Block Page</title>
+<link rel="stylesheet" href="https://domain-config-1256704386.cos.accelerate.myqcloud.com/block-pages/403/main_en.css" />
+</head><script> function submitWafFeedback() { … window.location.href = "https://api.waf-intl.qq.com/waf-attack-feedback/" + uuid; } </script>
+<body>…<p class="desc">The web application firewall has detected a security risk or non-compliance in your visit</p>…
+```
+
+这条路径上面的两套机制都接不住:
+
+- `readStatus` 只认 `"403:"` 冒号形式,而真实文本是 `403 <!DOCTYPE`(openai SDK 的 `APIError.makeMessage` 形如 `${status} ${msg}`),所以状态码读不出来;
+- `classifyTransientOutage` 的 `GATEWAY_STATUS_PATTERN` 只含 500/502/503/504/524,403 不命中;而且 HTML 里内联 `<script>` 的 `{` 会让 `extractFirstJsonObject` 解析失败。
+
+**为什么不能复用 5xx 的 streak 语义**:pi 的 `RETRYABLE_PROVIDER_ERROR_PATTERN` 不含 403,403 不会被 pi 退避重试 —— 一次 403 就直接终止该 run,不可能产生第二次 `message_end`。「连续 N 次才逃逸」对 WAF 永远等不到第 N 次,所以必须**默认首次即逃逸**(`DEFAULT_WAF_BLOCK_STREAK = 1`)。
+
+- 判定为 `waf_blocked` + `scope: cross-provider` —— WAF 是 IP/请求特征级封禁,换同 provider 的其他模型无效,必须换 provider;
+- 冷却期用固定的 `WAF_BLOCK_COOLDOWN_MS`(10 分钟),不做成配置项,`resetsAt` 到期自动解 ban;
+- WAF 计数与 5xx 网关故障**各用一套计数器**,互不干扰。
+
+**不触发**(三条纪律):
+
+- **带 JSON 体的 403** 优先走业务码判定(`extractFirstJsonObject` 非空即直接返回 false),不得当成 WAF 页;
+- **普通 403 HTML 页**(如 nginx 的 `401/403` 页)没有 WAF 特征串,不触发;
+- **裸 `403 status code (no body)`**(未经 `pi-workbuddy-connect` 补全时的退化文案)不触发。
+
+判定只看 WorkBuddy 侧 WAF 的**专有特征串**(`<title>WAF Block Page</title>` / `waf-intl.qq.com` / `web application firewall` / `block-pages/403`),不是「所有 403」的通用规则,也刻意不经过 `readStatus` 做状态码门禁。
+
 ## 配置
 
 `~/.pi/agent/model-failback.json`:链式表达 `A → B → C`,首节点可为 `provider/*` 通配:
@@ -142,6 +172,7 @@ WorkBuddy 的推理端点(apisix/openresty 网关)会以**纯 HTML 页面**返�
 | `autoRestore` | `false` | 配额恢复后自动切回原模型(每次 agent 启动时检查,不打断进行中的任务) |
 | `workbuddyTransientOutageStreak` | `3` | workbuddy:2 分钟内同一模型连续几次上游 5xx 网关页后允许一次跨 provider 逃逸;`<=0` 关闭 |
 | `workbuddyRateLimitCooldownMs` | `60000` | workbuddy:命中瞬时限流(`14003`/`6005`-`6008`/裸 `429`)时直接切备用链,并对源模型设这么久的冷却 ban;`<=0` 关闭(交给 pi 退避重试) |
+| `workbuddyWafStreak` | `1` | workbuddy:连续几次 WAF 拦截页后跨 provider 逃逸;默认 `1`(首次即逃逸,pi 不重试 403);`<=0` 关闭 |
 
 ### 链式语义
 
@@ -252,6 +283,7 @@ export const myProviderHandler: ProviderFailbackHandler = {
 - Command Code 解析纪律:换行后追加的 `metadata.raw` 与嵌套字段里的同名 token 不得把非终态错误升级为终态;终态 code 不被同层非终态 `type` 覆盖;`MODEL_NOT_IN_PLAN` 走 `scope:"any"` 时不会跳过同 provider 的可用模型
 - WorkBuddy 账户额度码(`14001` 等 9 个)判为终态、非终态码(限流/鉴权/未开通/模型错误/上下文超长/会话数/联网搜索)全部排除、未知 code 不猜测、无 code 的 `429` 需额度文案佐证;以及 workbuddy 链路的引擎级接续
 - WorkBuddy 上游网关故障的有界逃逸:单次 502/504 页保持瞬时、连续到阈值才逃逸、逃逸后计数复位、阈值 `<=0` 关闭、计数按模型隔离;带 JSON 体的响应与裸 5xx 状态行都不误判为网关页;以及引擎级的连续故障切换与 steering
+- WorkBuddy WAF 403 拦截页的即时逃逸:真实样本(含内联 `<script>` 的 HTML)首次即判 `waf_blocked` + `cross-provider` + 有界冷却,引擎级切换会跳过同 provider 的下一跳;带 JSON 体的 403、普通 403 HTML 页与裸 `403 status code (no body)` 都不触发;WAF 计数与 5xx 计数互不干扰,阈值 `<=0` 关闭后不再切换/ban/steering
 - `pi-workbuddy-connect` 的错误信封补全:`{code,msg}` → `{error:{message,type,code}}`,`code` 以字符串保留(实测真实 API 的 `11101` 与 mock 的 `14001` 均能活到 `errorMessage`)
 - ModelScope Qwen 的 `insufficient balance` 真实 lite subagent 接续
 - 两层 failback、链内已 ban 节点跳过、环检测、连跳上限和 cross-provider 守卫
