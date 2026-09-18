@@ -45,6 +45,45 @@ Architect 应先将歧义降低到足以明确目标、预期结果、受影响�
 
 并行执行相互独立且不冲突的委派；可能相互干扰或依赖先前结果的委派应按顺序执行。
 
+> Repository Search
+
+仓库检索
+
+> Use `rg` (ripgrep) as the primary repository search tool.
+
+使用 `rg`（ripgrep）作为首选的仓库检索工具。
+
+- > Use `rg` for recursive content search. Do not use `grep -r` or `grep -R` when `rg` is available.
+
+  使用 `rg` 进行递归内容检索。`rg` 可用时，不要使用 `grep -r` 或 `grep -R`。
+- > Use `rg --files` for repository file enumeration and prefer it over `find` for ordinary source-tree discovery.
+
+  使用 `rg --files` 枚举仓库文件；常规的源码树发现优先使用它而非 `find`。
+- > For filename filtering, prefer `rg --files | rg '<pattern>'` when appropriate.
+
+  按文件名过滤时，在合适场景下优先使用 `rg --files | rg '<pattern>'`。
+- > Scope searches to likely directories, file types, filenames, or symbols whenever possible.
+
+  尽可能将检索范围限定在可能的目录、文件类型、文件名或符号上。
+- > Prefer one targeted `rg` query over broad repository-wide scans followed by shell filtering.
+
+  优先使用一次有针对性的 `rg` 查询，而不是先全仓库扫描再用 shell 过滤。
+- > Respect `.gitignore` and other ignore rules by default. Search ignored or hidden content only when the task requires it.
+
+  默认遵守 `.gitignore` 及其他忽略规则；仅在任务需要时才检索被忽略或隐藏的内容。
+- > Use `rg -uu` only when there is a concrete reason to include ignored and hidden files.
+
+  仅在确有理由包含被忽略和隐藏文件时才使用 `rg -uu`。
+- > Avoid repeated full-tree scans for closely related queries.
+
+  对相互关联的查询，避免重复进行全树扫描。
+- > `grep` is allowed, but it is not the default search tool. Use it only when `rg` is unavailable or when `grep` provides semantics specifically needed by the task.
+
+  允许使用 `grep`，但它不是默认检索工具。仅在 `rg` 不可用，或任务确实需要 `grep` 特有的语义时才使用。
+- > `find` and equivalent tools are also allowed when their specific behavior is required, but should not be the default for ordinary repository discovery.
+
+  当需要 `find` 及其同类工具的特定行为时也允许使用，但常规的仓库发现不应默认使用它们。
+
 > Node Toolchain Commands
 
 Node 工具链命令

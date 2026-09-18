@@ -18,6 +18,20 @@ The root Architect reviews delegation results and verification evidence before m
 
 Parallelize independent, non-conflicting delegations; sequence delegations that may interfere with each other or depend on earlier results.
 
+Repository Search
+Use `rg` (ripgrep) as the primary repository search tool.
+
+- Use `rg` for recursive content search. Do not use `grep -r` or `grep -R` when `rg` is available.
+- Use `rg --files` for repository file enumeration and prefer it over `find` for ordinary source-tree discovery.
+- For filename filtering, prefer `rg --files | rg '<pattern>'` when appropriate.
+- Scope searches to likely directories, file types, filenames, or symbols whenever possible.
+- Prefer one targeted `rg` query over broad repository-wide scans followed by shell filtering.
+- Respect `.gitignore` and other ignore rules by default. Search ignored or hidden content only when the task requires it.
+- Use `rg -uu` only when there is a concrete reason to include ignored and hidden files.
+- Avoid repeated full-tree scans for closely related queries.
+- `grep` is allowed, but it is not the default search tool. Use it only when `rg` is unavailable or when `grep` provides semantics specifically needed by the task.
+- `find` and equivalent tools are also allowed when their specific behavior is required, but should not be the default for ordinary repository discovery.
+
 Node Toolchain Commands
 Prefix each top-level Node toolchain command (`node`, `npm`, `npx`, `yarn`, `yarnpkg`, `pnpm`, or `pnpx`) with `volta run`, for example, `volta run yarn test:unit`.
 Do not repeat the prefix for commands invoked within scripts, such as `vue-cli-service`, `cross-env`, or `patch-package`.
