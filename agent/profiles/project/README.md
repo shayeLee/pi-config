@@ -32,7 +32,7 @@
 
 | 角色 | 用途 | 模型 |
 | --- | --- | --- |
-| `worker` | 复杂执行与验证 | `openai-codex/gpt-5.6-luna` |
+| `worker` | 目标明确后的较大规模/多步骤执行与验证 | `openai-codex/gpt-5.6-luna` |
 | `lite` | 明确、局部、可逆、低风险执行 | `openai-codex/gpt-5.6-luna` |
 | `reviewer` | 只读审查 | `openai-codex/gpt-5.6-sol` |
 | `rescue` | 反复失败后的只读诊断 | `openai-codex/gpt-5.6-sol` |
