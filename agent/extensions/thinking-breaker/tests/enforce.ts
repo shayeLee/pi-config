@@ -65,6 +65,73 @@ function buildLoopedThinking(): string {
 	return `${analysis}\n\n${loop.join("\n\n")}\n\n`;
 }
 
+/**
+ * 2026-09-18 报障事故的形状：复读单元 **405 字符**（9 个短句变体轮换，句序随机），
+ * 远比旧 `enforceMaxPeriod = 200` 大 —— 这正是熔断失效的根因。
+ *
+ * 注意：单元内部句序随机，因此它不是“固定 2 变体交替”，而是 9 句的变体轮换。
+ * 周期性来自整个 405 字符单元的逐字重复（探针 A 在 maxPeriod 放宽到 600 后可见），
+ * 同时尾部不同行数塌缩到个位数（探针 B 可见）。
+ */
+function buildReportedIncidentThinking(): { text: string; unit: string } {
+	const sentences = [
+		"Let me write.",
+		"OK.",
+		"Go.",
+		"Now.",
+		"Let me read.",
+		"Let me do it.",
+		"Let me go.",
+		"Let me issue.",
+		"Let me execute.",
+	];
+	// 定长伪随机轮换：单元内部句序不规则，但整个 405 字符单元逐字重复。
+	const unit = (() => {
+		let u = "";
+		let seed = 7;
+		while (u.length < 405) {
+			seed = (seed * 1103515245 + 12345) & 0x7fffffff;
+			u += `${sentences[seed % sentences.length]}\n\n`;
+		}
+		return u.slice(0, 405);
+	})();
+	const analysis = Array.from(
+		{ length: 400 },
+		(_, i) => `第 ${i + 1} 步分析：检查模块 ${i + 1} 的边界条件，确认与上游契约一致。`,
+	).join("\n\n");
+	return { text: `${analysis}\n\n${unit.repeat(400)}\n\n`, unit };
+}
+
+/**
+ * 无精确周期的行级复读（探针 B 的专属场景）：~10 种短句的用户，顺序伪随机，
+ * `detectTailPeriod` 必然失明，只有词表塌缩会命中。
+ */
+function buildCollapseShapedThinking(): string {
+	const vocab = [
+		"OK.",
+		"Let me go.",
+		"Now.",
+		"Let me write.",
+		"Let me read.",
+		"Let me do it.",
+		"Let me issue.",
+		"Let me execute.",
+		"Go.",
+		"Done.",
+	];
+	const loop: string[] = [];
+	let seed = 12345;
+	for (let i = 0; i < 3000; i++) {
+		seed = (seed * 1103515245 + 12345) & 0x7fffffff;
+		loop.push(vocab[seed % vocab.length]);
+	}
+	const analysis = Array.from(
+		{ length: 400 },
+		(_, i) => `第 ${i + 1} 步分析：检查模块 ${i + 1} 的边界条件，确认与上游契约一致。`,
+	).join("\n\n");
+	return `${analysis}\n\n${loop.join("\n\n")}`;
+}
+
 interface Harness {
 	stream(text: string, chunkSize?: number): { aborted: boolean; abortCount: number };
 	end(text: string, stopReason: string): Promise<unknown>;
@@ -291,6 +358,90 @@ console.log("\n[6] model-failback 缺席时降级为同模型续跑（不能丢�
 		"提示里说明了降级原因",
 		h.notifications.some((n) => n.includes("升级换模型未完成")),
 		h.notifications.slice(-1).join(" | "),
+	);
+}
+
+// ---------------------------------------------------------------- 7) 报障事故形状
+console.log("\n[7] 报障事故形状（405 字符变体轮换）必须 abort + 替换 + 续跑");
+{
+	const h = await createHarness(true);
+	const { text: reported, unit } = buildReportedIncidentThinking();
+	console.log(`  构造的报障形状: ${reported.length} 字符（复读单元 ${unit.length} 字符）`);
+	const r = h.stream(reported);
+	check("触发了 ctx.abort()", r.aborted, `abortCount=${r.abortCount}`);
+	check("只 abort 一次", r.abortCount === 1, `abortCount=${r.abortCount}`);
+	check(
+		"提示里说明了命中（周期或塌缩）",
+		h.notifications.some(
+			(n) => n.includes("尾部连续重复") || n.includes("尾部词表塌缩"),
+		),
+		h.notifications.slice(-1).join(" | "),
+	);
+
+	const replacement = (await h.end(reported, "aborted")) as any;
+	check("返回了替换消息", replacement?.message !== undefined);
+	const replacedText: string = replacement?.message?.content?.[0]?.thinking ?? "";
+	check(
+		`替换后的思考从 ${reported.length} 缩到 ${replacedText.length} 字符（大幅变短）`,
+		replacedText.length > 0 && replacedText.length < reported.length / 5,
+	);
+	check("保留思考签名", replacement?.message?.content?.[0]?.thinkingSignature === "reasoning_content");
+	check(
+		"发送了续跑指令",
+		h.continuations.length === 1 && h.continuations[0].includes("不要重复已完成的步骤"),
+		h.continuations.join(" | ").slice(0, 120),
+	);
+}
+
+// ---------------------------------------------------------------- 8) 塌缩型升级证据
+console.log("\n[8] 探针 B（词表塌缩）命中时，升级 evidence 必须走 collapse 分支");
+{
+	const h = await createHarness(true);
+	const received = h.installFailback({ ok: true, switchedTo: "modelscope/Qwen/Qwen3.8-Flash-Next" });
+	const collapseThinking = buildCollapseShapedThinking();
+	// 两次命中，第二次触发升级。
+	h.stream(collapseThinking);
+	await h.end(collapseThinking, "aborted");
+	h.stream(collapseThinking);
+	await h.end(collapseThinking, "aborted");
+	check("第二次发出升级请求", received.length === 1, `received=${received.length}`);
+	const evidence = received[0]?.evidence;
+	check("evidence.kind === 'collapse'", evidence?.kind === "collapse", JSON.stringify(evidence));
+	check(
+		"evidence 带 distinct / lineCount / repeatRatio / chars / strikes",
+		typeof evidence?.distinct === "number" &&
+			typeof evidence?.lineCount === "number" &&
+			typeof evidence?.repeatRatio === "number" &&
+			evidence?.chars > 0 &&
+			evidence?.strikes === 2,
+		JSON.stringify(evidence),
+	);
+	check(
+		"塌缩型 evidence 不伪造 period 字段",
+		evidence?.period === undefined && evidence?.repeats === undefined,
+		JSON.stringify(evidence),
+	);
+}
+
+// ---------------------------------------------------------------- 9) dry-run 塌缩提示
+console.log("\n[9] dry-run 遇到塌缩型命中时不得崩溃（旧代码对塌缩型取 `verdict.period`）");
+{
+	const h = await createHarness(false); // enforce 关 = 纯观测
+	const collapseThinking = buildCollapseShapedThinking();
+	// 必须先跑流式才会建 `current`（未建时 message_end 直接早退，不会进入 dry-run 路径）。
+	// enforce 关 → 不会 abort，`abortHit` 为空 → 走 dry-run。
+	h.stream(collapseThinking);
+	const replacement = await h.end(collapseThinking, "stopReason");
+	check("dry-run 不返回替换消息", replacement === undefined);
+	check(
+		"dry-run 提示命中词表塌缩",
+		h.notifications.some((n) => n.includes("词表塌缩")),
+		h.notifications.slice(-1).join(" | ").slice(0, 160),
+	);
+	check(
+		"dry-run 提示不含 `undefined`（旧代码会打印它）",
+		!h.notifications.some((n) => n.includes("undefined")),
+		h.notifications.slice(-1).join(" | ").slice(0, 160),
 	);
 }
 
