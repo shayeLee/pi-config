@@ -11,7 +11,7 @@
   对 Markdown frontmatter 的字段级覆盖（model/tools/thinking）与清除/忽略语义。
 
 对应 README 的"核心原则：数据与展示分离"：`run.mjs` 守护数据流产物（`content` /
-`details` / `{previous}`），`presentation.mjs` 守护展示层作为只读消费者时的行为；
+`details`），`presentation.mjs` 守护展示层作为只读消费者时的行为；
 `overrides.mjs` 守护角色配置的覆盖优先级。
 
 ## 运行
@@ -54,16 +54,14 @@ node agent/extensions/agent-team/harness/overrides.mjs
    到达时，transcript 中只保留一条。
 3. **transient 事件隔离**：`tool_execution_update` / `tool_execution_end` 不进入
    `content` 或 `details` 的消息记录，最终文本不含 transient 输出。
-4. **chain `{previous}`**：`{previous}` 只被紧邻上一步的最终 assistant 文本替换；
-   上一步的工具结果文本（`CHAIN-TOOL-SECRET`）和完整 transcript 不会泄漏进下一步
-   的 task。
-5. **父操作中止（single）**：通过 AbortSignal 中止运行中的子代理 → fake `pi` 收到
-   SIGTERM，结果 `exitCode 130`、`stopReason "stopped"`、`errorMessage` 标记父操作
-   中止，部分 assistant 文本保留在 transcript。
-6. **并行中止**：parallel 模式下中止会停止每个运行中的任务（全部 `exitCode 130`）。
-7. **SIGKILL 升级**：对忽略 SIGTERM 的顽固子进程（`SCENARIO:stubborn`），约 5 秒后
+4. **parallel 后台化**：`parallel` 模式下每个 task 成为独立的后台 run，各自返回
+   `runId`；无参 `subagent_wait` 能一次收齐全部结果，并返回带全部已结束 run 结构化记录的
+   `details`。chain 模式已移除，工具 schema 中不再有 `chain` 字段。
+5. **停止单个运行中的子代理**：通过 `subagent_stop` 停止 → fake `pi` 收到 SIGTERM，
+   结果 `exitCode 130`、`stopReason "stopped"`；parallel 中停止一个 task 不影响其他 task。
+6. **SIGKILL 升级**：对忽略 SIGTERM 的顽固子进程（`SCENARIO:stubborn`），约 5 秒后
    被 SIGKILL 强制终止，结果仍报告 `exitCode 130` 且 SIGTERM 确实被送达。
-8. **进程组终止覆盖后代**：fake 组长（`SCENARIO:descendant`）spawn 一个同组后代并忽略
+7. **进程组终止覆盖后代**：fake 组长（`SCENARIO:descendant`）spawn 一个同组后代并忽略
    SIGTERM；组长收到 SIGTERM 退出后，后代必须存活到 5 秒后的进程组 SIGKILL 才被终止——
    守护 README 中“已退出组长的后代仍会被该进程组信号覆盖”的语义。
 

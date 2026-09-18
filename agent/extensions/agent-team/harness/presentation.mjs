@@ -380,6 +380,15 @@ async function main() {
 			if (!hist || hist.status !== "completed") return false;
 			return store.stop(hist.id) === false && hist.stopping !== true;
 		})());
+		// `live` distinguishes runs started in this session from restored history.
+		// Restore re-assigns ids from the same counter, so an old transcript's runId
+		// can collide with an unrelated restored run; the live lookup must not match
+		// history or the transcript would render the wrong subagent.
+		check("runs started in this session are marked live", active.live === true);
+		check(
+			"restored history is not marked live",
+			ids.filter((r) => r.agent.startsWith("hist-")).every((r) => r.live === false),
+		);
 	}
 
 	// ------------------------------------------------------------------------

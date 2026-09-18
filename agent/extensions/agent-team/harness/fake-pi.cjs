@@ -11,7 +11,7 @@
  *   SCENARIO:tool_result_end_only  -> tool_result_end only (durable toolResult)
  *   SCENARIO:dedup                 -> tool_result_end + message_end, same toolCallId
  *   SCENARIO:transient             -> tool_execution_update/end + assistant message_end
- *   SCENARIO:chain STEP:1/STEP:2   -> chain steps with a durable tool result + final text
+ *   SCENARIO:steerable             -> listens on the control socket and logs commands
  *
  * Every invocation appends one JSON line to the file in $FAKE_PI_LOG so the
  * harness can assert exactly what each subagent process received (args, task
@@ -58,7 +58,50 @@ if (logPath) {
 // silent) and then keep the process alive so the extension's termination
 // path (SIGTERM, then SIGKILL after 5s) has something to signal.
 const aliveAfterWrite =
-	task.includes("SCENARIO:long_running") || task.includes("SCENARIO:stubborn") || task.includes("SCENARIO:descendant");
+	task.includes("SCENARIO:long_running") ||
+	task.includes("SCENARIO:stubborn") ||
+	task.includes("SCENARIO:descendant") ||
+	task.includes("SCENARIO:steerable") ||
+	task.includes("SCENARIO:tool_in_flight");
+
+// Steerable scenario: the fake subagent listens on the control socket the
+// extension injected (SUBAGENT_CONTROL_SOCKET) and reports every command it
+// receives, so the harness can prove a steer actually reached the subprocess.
+if (task.includes("SCENARIO:steerable")) {
+	const net = require("node:net");
+	const socketPath = process.env.SUBAGENT_CONTROL_SOCKET;
+	log({ steerable: true, socketPath: socketPath ?? null });
+	if (socketPath) {
+		const server = net.createServer((conn) => {
+			let buf = "";
+			conn.on("data", (chunk) => {
+				buf += chunk.toString();
+				let index;
+				while ((index = buf.indexOf("\n")) !== -1) {
+					const line = buf.slice(0, index);
+					buf = buf.slice(index + 1);
+					if (!line.trim()) continue;
+					let command;
+					try {
+						command = JSON.parse(line);
+					} catch {
+						continue;
+					}
+					// Record receipt so the harness can assert delivery, then keep the
+					// process alive so the run stays "running" until explicitly stopped.
+					log({ steerReceived: command });
+				}
+			});
+		});
+		server.on("error", () => {});
+		server.listen(socketPath);
+	}
+	process.on("SIGTERM", () => {
+		log({ signal: "SIGTERM", task });
+		process.exit(130);
+	});
+	process.on("SIGINT", () => process.exit(130));
+}
 if (task.includes("SCENARIO:descendant")) {
 	// Spawn a descendant in the SAME process group (spawn without detached
 	// inherits the leader's group). The leader exits on SIGTERM; the
@@ -80,6 +123,15 @@ if (task.includes("SCENARIO:descendant")) {
 		env: { ...process.env, FAKE_PI_LOG: logPath },
 	});
 	log({ descendantPid: child.pid, task });
+	process.on("SIGTERM", () => {
+		log({ signal: "SIGTERM", task });
+		process.exit(130);
+	});
+	process.on("SIGINT", () => process.exit(130));
+} else if (task.includes("SCENARIO:tool_in_flight")) {
+	// A run that is still working: one completed tool call in the durable
+	// transcript, plus a tool that is still executing. The `subagent` row must
+	// show the completed call AND the in-flight one while the run is running.
 	process.on("SIGTERM", () => {
 		log({ signal: "SIGTERM", task });
 		process.exit(130);
@@ -122,7 +174,44 @@ const assistant = (text) => ({
 	},
 });
 
-if (task.includes("SCENARIO:tool_result_end_only")) {
+if (task.includes("SCENARIO:tool_in_flight")) {
+	// Durable: assistant asked for `read`, and it finished.
+	emit({
+		type: "message_end",
+		message: {
+			role: "assistant",
+			content: [
+				{
+					type: "toolCall",
+					id: "call-done",
+					name: "read",
+					arguments: { path: "/tmp/in-flight/input.txt" },
+				},
+			],
+			usage: { input: 10, output: 5, cacheRead: 1, cacheWrite: 0, totalTokens: 15, cost: { total: 0.0001 } },
+			model: "fake/provider",
+			stopReason: "end",
+		},
+	});
+	emit({
+		type: "message_end",
+		message: {
+			role: "toolResult",
+			toolName: "read",
+			toolCallId: "call-done",
+			content: [{ type: "text", text: "DURABLE-READ-OUTPUT" }],
+			isError: false,
+		},
+	});
+	// In flight: `bash` is executing right now, so it is not in the durable
+	// transcript yet and only exists as a Fleet toolUpdate.
+	emit({
+		type: "tool_execution_update",
+		toolCallId: "call-live",
+		toolName: "bash",
+		partialResult: { content: [{ type: "text", text: "IN-FLIGHT-OUTPUT" }] },
+	});
+} else if (task.includes("SCENARIO:tool_result_end_only")) {
 	// (1) A durable toolResult that is ONLY ever delivered via the legacy
 	// tool_result_end event. It must still be preserved in the transcript.
 	emit({
@@ -136,6 +225,48 @@ if (task.includes("SCENARIO:tool_result_end_only")) {
 		},
 	});
 	emit(assistant("FINAL-ANSWER-A"));
+} else if (task.includes("SCENARIO:tool_calls")) {
+	// A realistic run: the assistant calls tools, then reports. The transcript must
+	// show the calls and their results, not just the final text.
+	emit({
+		type: "message_end",
+		message: {
+			role: "assistant",
+			content: [
+				{ type: "toolCall", name: "bash", arguments: { command: "ls /tmp/tool-call-demo" }, toolCallId: "call-1" },
+			],
+		},
+	});
+	emit({
+		type: "message_end",
+		message: {
+			role: "toolResult",
+			toolName: "bash",
+			toolCallId: "call-1",
+			content: [{ type: "text", text: "data.txt\nresult.txt" }],
+			isError: false,
+		},
+	});
+	emit({
+		type: "message_end",
+		message: {
+			role: "assistant",
+			content: [
+				{ type: "toolCall", name: "read", arguments: { path: "/tmp/tool-call-demo/data.txt" }, toolCallId: "call-2" },
+			],
+		},
+	});
+	emit({
+		type: "message_end",
+		message: {
+			role: "toolResult",
+			toolName: "read",
+			toolCallId: "call-2",
+			content: [{ type: "text", text: "line-one\nline-two" }],
+			isError: false,
+		},
+	});
+	emit(assistant("FINAL-ANSWER-TOOLS"));
 } else if (task.includes("SCENARIO:dedup")) {
 	// (2) The same toolResult arrives via both tool_result_end and message_end
 	// with the same toolCallId. The extension must keep exactly one.
@@ -191,24 +322,6 @@ if (task.includes("SCENARIO:tool_result_end_only")) {
 			stopReason: "end",
 		},
 	});
-} else if (task.includes("SCENARIO:chain")) {
-	// (4) Chain steps. Step 1 carries a durable tool result that must NOT leak
-	// into {previous}; only the final assistant text may be substituted.
-	if (task.includes("STEP:1")) {
-		emit({
-			type: "tool_result_end",
-			message: {
-				role: "toolResult",
-				toolName: "bash",
-				toolCallId: "call-chain-tool",
-				content: [{ type: "text", text: "CHAIN-TOOL-SECRET" }],
-				isError: false,
-			},
-		});
-		emit(assistant("CHAIN-FIRST-ANSWER"));
-	} else {
-		emit(assistant("CHAIN-SECOND-ANSWER"));
-	}
 } else if (task.includes("SCENARIO:streaming")) {
 	// (5) In-flight assistant text/thinking arrives as delta-only message_update
 	// events (message_start -> *_delta -> *_end -> message_end). The extension

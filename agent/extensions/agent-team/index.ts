@@ -4,18 +4,23 @@
  * Spawns a separate `pi` process for each subagent invocation,
  * giving it an isolated context window.
  *
- * Supports three modes:
+ * Supports two modes:
  *   - Single: { agent: "name", task: "..." }
  *   - Parallel: { tasks: [{ agent: "name", task: "..." }, ...] }
- *   - Chain: { chain: [{ agent: "name", task: "... {previous} ..." }, ...] }
+ *
+ * Both modes return a runId per subagent and are supervised through
+ * subagent_wait / subagent_status / subagent_logs / subagent_steer / subagent_stop.
+ * Sequencing is the caller's job: call subagent again with the previous result.
  *
  * Uses JSON mode to capture structured output from subagents.
  */
 
 import { spawn } from "node:child_process";
 import * as fs from "node:fs";
+import * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
+import { fileURLToPath } from "node:url";
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import { clampThinkingLevel, StringEnum, type Message, type Model, type ModelThinkingLevel } from "@earendil-works/pi-ai";
 import {
@@ -31,14 +36,13 @@ import {
 import { Container, Markdown, Spacer, Text, truncateToWidth, type Component, visibleWidth } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { type AgentConfig, type AgentScope, discoverAgents } from "./agents.ts";
-import { FleetStore, type FleetRunStatus, type FleetStreamingDelta, type RestoredFleetRun } from "./fleet-store.ts";
+import { BackgroundRunRegistry, type BackgroundRunRecord, type BackgroundRunStatus } from "./background-runs.ts";
+import { FleetStore, type FleetRun, type FleetRunStatus, type FleetStreamingDelta, type RestoredFleetRun } from "./fleet-store.ts";
 import { FleetWidget, showFleetOverlay } from "./fleet-view.ts";
 import { FleetWebServer } from "./fleet-web.ts";
 
 const MAX_PARALLEL_TASKS = 8;
-const MAX_CONCURRENCY = 4;
 const COLLAPSED_ITEM_COUNT = 10;
-const PER_TASK_OUTPUT_CAP = 50 * 1024;
 const MAX_FLEET_TOOL_UPDATE_BYTES = 48 * 1024;
 const MAX_FLEET_TRANSIENT_BYTES = 256 * 1024;
 const MAX_FLEET_STREAMING_BYTES = 32 * 1024;
@@ -348,10 +352,36 @@ interface SingleResult {
 }
 
 interface SubagentDetails {
+	// "chain" is no longer produced; it is retained so sessions recorded before
+	// the chain mode was removed can still be restored and rendered.
 	mode: "single" | "parallel" | "chain";
 	agentScope: AgentScope;
 	projectAgentsDir: string | null;
 	results: SingleResult[];
+	// Run ids of background runs announced by `subagent`. Their live state is read
+	// from FleetStore at render time (the store is already the single source of
+	// truth for in-flight runs), so the announced row can show progress before any
+	// durable result exists.
+	liveRunIds?: string[];
+}
+
+/**
+ * Optional hooks that let a caller run `runSingleAgent` without awaiting it.
+ *
+ * When supplied, the run is announced to the caller as soon as its subprocess
+ * exists (`onSpawned`) so the main agent can query or stop it while it is still
+ * running. Omitting the hooks preserves the original fully-awaiting behaviour.
+ */
+interface RunControlHooks {
+	/** Called once the Fleet run and subprocess handle exist. */
+	onSpawned?: (handle: {
+		runId: string;
+		stop: () => boolean;
+		live: { messages: Message[] };
+		controlSocketPath?: string;
+	}) => void;
+	/** Control socket path injected into the child (B-s stage). */
+	controlSocketPath?: string;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -512,17 +542,6 @@ function getResultOutput(result: SingleResult): string {
 	return getFinalOutput(result.messages) || "(no output)";
 }
 
-function truncateParallelOutput(output: string): string {
-	const byteLength = Buffer.byteLength(output, "utf8");
-	if (byteLength <= PER_TASK_OUTPUT_CAP) return output;
-
-	let truncated = output.slice(0, PER_TASK_OUTPUT_CAP);
-	while (Buffer.byteLength(truncated, "utf8") > PER_TASK_OUTPUT_CAP) {
-		truncated = truncated.slice(0, -1);
-	}
-	return `${truncated}\n\n[Output truncated: ${byteLength - Buffer.byteLength(truncated, "utf8")} bytes omitted. Full output preserved in tool details.]`;
-}
-
 type DisplayItem =
 	| { type: "text"; text: string }
 	| { type: "toolCall"; name: string; args: Record<string, any> }
@@ -546,24 +565,424 @@ function getDisplayItems(messages: Message[], includeToolResults = false): Displ
 	return items;
 }
 
-async function mapWithConcurrencyLimit<TIn, TOut>(
-	items: TIn[],
-	concurrency: number,
-	fn: (item: TIn, index: number) => Promise<TOut>,
-): Promise<TOut[]> {
-	if (items.length === 0) return [];
-	const limit = Math.max(1, Math.min(concurrency, items.length));
-	const results: TOut[] = new Array(items.length);
-	let nextIndex = 0;
-	const workers = new Array(limit).fill(null).map(async () => {
-		while (true) {
-			const current = nextIndex++;
-			if (current >= items.length) return;
-			results[current] = await fn(items[current], current);
+/**
+ * Projects a live FleetRun onto the settled SingleResult shape the transcript
+ * renderer already consumes. `subagent` announces runs before any durable
+ * result exists, so reading FleetStore at render time is what makes the row
+ * show progress live.
+ */
+function fleetRunToSingleResult(run: FleetRun): SingleResult {
+	const messages = run.messages.slice();
+	// `getDisplayItems` only reads durable messages, so a tool call whose assistant
+	// message_end has not landed yet is invisible. toolUpdates entries are exactly
+	// the in-flight calls; add synthetic assistant toolCall messages for the ones
+	// the durable transcript does not carry already, so the Activity section can
+	// reuse its normal rendering.
+	const durableCallIds = new Set<string>();
+	for (const message of messages) {
+		if (message.role !== "assistant") continue;
+		for (const part of message.content) if (part.type === "toolCall") durableCallIds.add(part.id);
+	}
+	for (const [toolCallId, update] of Object.entries(run.toolUpdates)) {
+		if (update.phase !== "streaming" || durableCallIds.has(toolCallId)) continue;
+		messages.push({
+			role: "assistant",
+			content: [{ type: "toolCall", id: toolCallId, name: update.toolName, arguments: {} }],
+		} as unknown as Message);
+		// Pair the call with its streaming output so an expanded row shows what the
+		// subagent is producing right now, not just that some tool is running.
+		const streamed = fleetToolOutputText(update.content);
+		if (streamed) {
+			messages.push({
+				role: "toolResult",
+				toolName: update.toolName,
+				toolCallId,
+				content: [{ type: "text", text: streamed }],
+				isError: Boolean(update.isError),
+			} as unknown as Message);
 		}
-	});
-	await Promise.all(workers);
+	}
+	const status = run.status;
+	return {
+		runId: run.id,
+		agent: run.agent,
+		agentSource: run.agentSource ?? "unknown",
+		task: run.task,
+		exitCode: status === "running" ? -1 : status === "completed" ? 0 : 1,
+		messages,
+		stderr: "",
+		usage: run.usage,
+		model: run.model,
+		thinkingLevel: run.thinkingLevel,
+		stopReason: status === "running" ? undefined : status === "stopped" ? "stopped" : status,
+		startedAt: run.startedAt,
+		endedAt: run.endedAt,
+	};
+}
+
+/**
+ * Live results for announced run ids, in announcement order; pruned ids drop out.
+ *
+ * Only runs started in this session qualify. A restored run reuses the id space,
+ * so trusting an id alone would let an old transcript's runId resolve to an
+ * unrelated restored run and render the wrong subagent.
+ */
+function liveFleetResults(runIds: readonly string[], fleetStore: FleetStore): SingleResult[] {
+	const byId = new Map(
+		fleetStore
+			.list()
+			.filter((run) => run.live)
+			.map((run) => [run.id, run] as const),
+	);
+	const results: SingleResult[] = [];
+	for (const id of runIds) {
+		const run = byId.get(id);
+		if (run) results.push(fleetRunToSingleResult(run));
+	}
 	return results;
+}
+
+/**
+ * A live row that rebuilds its content on every repaint.
+ *
+ * The transcript constructs a tool row once, when the tool returns, and then
+ * repaints that same component tree. A `subagent` row read once at construction
+ * would therefore freeze at "no output" for the whole run. Re-reading the run
+ * state inside `render()` is what keeps the row live; there is no subscription
+ * because a Component has no dispose hook to unsubscribe from.
+ */
+class LiveSubagentRow implements Component {
+	constructor(private readonly build: () => Component) {}
+
+	render(width: number): string[] {
+		return this.build().render(width);
+	}
+
+	invalidate(): void {
+		// Nothing cached: the next render rebuilds from current run state.
+	}
+}
+
+/**
+ * Renders a subagent tool result: header, tool-call activity and final output.
+ *
+ * Shared by `subagent` and `subagent_wait`: `subagent` announces runs as they
+ * start and carries no settled results, while `subagent_wait` carries the
+ * settled ones. Both must render identically, so the logic lives here instead
+ * of being duplicated per tool.
+ *
+ * Returns a component that re-reads the announced runs on every render, so a
+ * running `subagent` row keeps showing progress. The settled path is static and
+ * is built once.
+ */
+function renderSubagentResult(
+	result: AgentToolResult<SubagentDetails | undefined>,
+	{ expanded, isPartial }: ToolRenderResultOptions,
+	isError: boolean,
+	theme: Theme,
+	fleetStore: FleetStore,
+): Component {
+	const rawDetails = result.details as SubagentDetails | undefined;
+	const isLive = Boolean(rawDetails && rawDetails.results.length === 0 && rawDetails.liveRunIds?.length);
+	if (!isLive) {
+		return buildSubagentResultComponent(result, { expanded, isPartial }, isError, theme, fleetStore);
+	}
+	return new LiveSubagentRow(() =>
+		buildSubagentResultComponent(result, { expanded, isPartial }, isError, theme, fleetStore),
+	);
+}
+
+function buildSubagentResultComponent(
+	result: AgentToolResult<SubagentDetails | undefined>,
+	{ expanded, isPartial }: ToolRenderResultOptions,
+	isError: boolean,
+	theme: Theme,
+	fleetStore: FleetStore,
+): Component {
+	// `subagent` carries no settled results when it announces background runs; its
+	// live state lives in FleetStore. Project those runs onto SingleResult so the
+	// existing single/parallel rendering below is reused unchanged. Falls back to
+	// the plain announcement text when every announced run has been pruned.
+	const rawDetails = result.details as SubagentDetails | undefined;
+	const liveResults = rawDetails && rawDetails.results.length === 0 && (rawDetails.liveRunIds?.length ?? 0) > 0
+		? liveFleetResults(rawDetails.liveRunIds as string[], fleetStore)
+		: [];
+	const details: SubagentDetails | undefined = rawDetails && liveResults.length > 0
+		? { ...rawDetails, results: liveResults }
+		: rawDetails;
+	const hasRunningResult = details?.results.some((item) => item.exitCode === -1) ?? false;
+	const hasFailedResult = details?.results.some((item) => item.exitCode !== -1 && isFailedResult(item)) ?? false;
+	const resultBackground = isPartial || hasRunningResult
+		? "toolPendingBg"
+		: isError || hasFailedResult
+			? "toolErrorBg"
+			: "toolSuccessBg";
+	const shell = (component: Component) =>
+		new OpencodeToolShell(
+			component,
+			(s) => theme.bg(resultBackground, s),
+			(s) => theme.fg("muted", s),
+		);
+	if (!details || details.results.length === 0) {
+		const text = result.content[0];
+		return shell(new Text(text?.type === "text" ? text.text : "(no output)", 0, 0));
+	}
+
+	const mdTheme = getMarkdownTheme();
+
+	const getToolCalls = (items: DisplayItem[]) =>
+		items.filter((item): item is Extract<DisplayItem, { type: "toolCall" }> => item.type === "toolCall");
+
+	const formatActivitySummary = (items: DisplayItem[]) => {
+		const calls = getToolCalls(items);
+		const counts = new Map<string, number>();
+		for (const call of calls) counts.set(call.name, (counts.get(call.name) ?? 0) + 1);
+		const breakdown = [...counts.entries()].map(([name, count]) => `${name} ${count}`).join(" · ");
+		return `${calls.length} call${calls.length === 1 ? "" : "s"}${breakdown ? ` · ${breakdown}` : ""}`;
+	};
+
+	const addSectionTitle = (container: Container, title: string, detail?: string) => {
+		container.addChild(new Spacer(1));
+		let text = theme.fg("muted", "── ");
+		text += theme.fg("toolTitle", theme.bold(title));
+		if (detail) text += theme.fg("dim", `  ${detail}`);
+		container.addChild(new Text(text, 0, 0));
+	};
+
+	const addCollapsedActivity = (container: Container, items: DisplayItem[], limit: number) => {
+		const calls = getToolCalls(items);
+		if (calls.length === 0) return;
+
+		addSectionTitle(container, "Activity", formatActivitySummary(calls));
+		const toShow = calls.slice(-limit);
+		const skipped = calls.length - toShow.length;
+		if (skipped > 0) {
+			container.addChild(new Text(theme.fg("dim", `… ${skipped} earlier calls`), 1, 0));
+		}
+		for (const call of toShow) {
+			container.addChild(
+				new Text(
+					theme.fg("muted", "› ") + formatToolCall(call.name, call.args, theme.fg.bind(theme)),
+					1,
+					0,
+				),
+			);
+		}
+		if (skipped > 0) {
+			container.addChild(new Text(theme.fg("muted", "Ctrl+O: inspect every call and result"), 1, 0));
+		}
+	};
+
+	const addExpandedItems = (container: Container, items: DisplayItem[]) => {
+		for (const item of items) {
+			if (item.type === "toolCall") {
+				container.addChild(
+					new Text(
+						theme.fg("accent", "▶ ") + formatToolCall(item.name, item.args, theme.fg.bind(theme), true),
+						1,
+						0,
+					),
+				);
+			} else if (item.type === "toolResult") {
+				const label = `${item.isError ? "✗" : "✓"} ${item.name} result`;
+				container.addChild(new Text(theme.fg(item.isError ? "error" : "success", label), 2, 0));
+				container.addChild(new Text(theme.fg("toolOutput", item.text), 3, 0));
+			}
+		}
+	};
+
+	if (details.mode === "single" && details.results.length === 1) {
+		const r = details.results[0];
+		const isRunning = r.exitCode === -1;
+		const isStopped = !isRunning && isStoppedResult(r);
+		const isError = !isRunning && isFailedResult(r);
+		const icon = isRunning
+			? theme.fg("warning", "●")
+			: isStopped
+				? theme.fg("warning", "■")
+				: isError
+					? theme.fg("error", "✗")
+					: theme.fg("success", "✓");
+		const displayItems = getDisplayItems(r.messages, expanded);
+		const finalOutput = getFinalOutput(r.messages);
+
+		if (expanded) {
+			const container = new Container();
+			let header = `${icon} ${theme.fg("toolTitle", theme.bold(r.agent))}${theme.fg("muted", ` (${r.agentSource})`)}`;
+			if (isRunning) header += theme.fg("warning", "  running");
+			if (isStopped) header += theme.fg("warning", "  stopped");
+			else if (isError && r.stopReason) header += ` ${theme.fg("error", `[${r.stopReason}]`)}`;
+			const usageStr = formatUsageStats(r.usage, r.model, r.thinkingLevel);
+			if (usageStr) header += theme.fg("dim", `  ${usageStr}`);
+			container.addChild(new Text(header, 0, 0));
+			if (isError && !isStopped && r.errorMessage)
+				container.addChild(new Text(theme.fg("error", `Error: ${r.errorMessage}`), 0, 0));
+			addSectionTitle(container, "Task");
+			container.addChild(new Text(theme.fg("dim", r.task), 1, 0));
+			if (displayItems.length === 0 && !finalOutput) {
+				container.addChild(new Text(theme.fg("muted", isRunning ? "starting…" : "(no output)"), 0, 0));
+			} else {
+				if (getToolCalls(displayItems).length > 0) {
+					addSectionTitle(container, "Activity", formatActivitySummary(displayItems));
+				}
+				addExpandedItems(container, displayItems);
+				if (finalOutput) {
+					addSectionTitle(container, isRunning ? "Progress" : "Result");
+					container.addChild(new Markdown(finalOutput.trim(), 1, 0, mdTheme));
+				}
+			}
+			return shell(container);
+		}
+
+		const container = new Container();
+		let header = `${icon} ${theme.fg("toolTitle", theme.bold(r.agent))}${theme.fg("muted", ` (${r.agentSource})`)}`;
+		if (isRunning) header += theme.fg("warning", "  running");
+		if (isStopped) header += theme.fg("warning", "  stopped");
+		else if (isError && r.stopReason) header += ` ${theme.fg("error", `[${r.stopReason}]`)}`;
+		const usageStr = formatUsageStats(r.usage, r.model, r.thinkingLevel);
+		if (usageStr) header += theme.fg("dim", `  ${usageStr}`);
+		container.addChild(new Text(header, 0, 0));
+		if (isError && !isStopped && r.errorMessage) {
+			container.addChild(new Text(theme.fg("error", `Error: ${r.errorMessage}`), 1, 0));
+			return shell(container);
+		}
+		if (displayItems.length === 0 && !finalOutput) {
+			container.addChild(new Text(theme.fg("muted", isRunning ? "starting…" : "(no output)"), 1, 0));
+			return shell(container);
+		}
+
+		addCollapsedActivity(container, displayItems, COLLAPSED_ITEM_COUNT);
+		if (getToolCalls(displayItems).length > 0) {
+			container.addChild(new Text(theme.fg("muted", "Ctrl+O: inspect every call and result"), 1, 0));
+		}
+		if (finalOutput) {
+			addSectionTitle(container, isRunning ? "Progress" : "Result");
+			container.addChild(new Markdown(finalOutput.trim(), 1, 0, mdTheme));
+		}
+		return shell(container);
+	}
+
+	const aggregateUsage = (results: SingleResult[]) => {
+		const total = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 };
+		for (const r of results) {
+			total.input += r.usage.input;
+			total.output += r.usage.output;
+			total.cacheRead += r.usage.cacheRead;
+			total.cacheWrite += r.usage.cacheWrite;
+			total.cost += r.usage.cost;
+			total.turns += r.usage.turns;
+		}
+		return total;
+	};
+
+	if (details.mode === "parallel") {
+		const running = details.results.filter((r) => r.exitCode === -1).length;
+		const successCount = details.results.filter((r) => r.exitCode !== -1 && !isFailedResult(r)).length;
+		const stoppedCount = details.results.filter(isStoppedResult).length;
+		const failCount = details.results.filter(
+			(r) => r.exitCode !== -1 && isFailedResult(r) && !isStoppedResult(r),
+		).length;
+		const isRunning = running > 0;
+		const icon = isRunning
+			? theme.fg("warning", "⏳")
+			: stoppedCount > 0
+				? theme.fg("warning", "■")
+				: failCount > 0
+					? theme.fg("warning", "◐")
+					: theme.fg("success", "✓");
+		const status = isRunning
+			? `${successCount + failCount + stoppedCount}/${details.results.length} done, ${running} running`
+			: `${successCount} completed${stoppedCount ? ` · ${stoppedCount} stopped` : ""}${failCount ? ` · ${failCount} failed` : ""}`;
+
+		if (expanded && !isRunning) {
+			const container = new Container();
+			container.addChild(
+				new Text(
+					`${icon} ${theme.fg("toolTitle", theme.bold("parallel "))}${theme.fg("accent", status)}`,
+					0,
+					0,
+				),
+			);
+
+			for (const r of details.results) {
+				const rIcon = isStoppedResult(r)
+					? theme.fg("warning", "■")
+					: isFailedResult(r)
+						? theme.fg("error", "✗")
+						: theme.fg("success", "✓");
+				const displayItems = getDisplayItems(r.messages, true);
+				const finalOutput = getFinalOutput(r.messages);
+
+				container.addChild(new Spacer(1));
+				container.addChild(
+					new Text(`${theme.fg("muted", "─── ") + theme.fg("accent", r.agent)} ${rIcon}`, 0, 0),
+				);
+				container.addChild(new Text(theme.fg("muted", "Task: ") + theme.fg("dim", r.task), 0, 0));
+
+				if (getToolCalls(displayItems).length > 0) {
+					addSectionTitle(container, "Activity", formatActivitySummary(displayItems));
+				}
+				addExpandedItems(container, displayItems);
+
+				if (finalOutput) {
+					addSectionTitle(container, "Result");
+					container.addChild(new Markdown(finalOutput.trim(), 1, 0, mdTheme));
+				}
+
+				const taskUsage = formatUsageStats(r.usage, r.model, r.thinkingLevel);
+				if (taskUsage) container.addChild(new Text(theme.fg("dim", taskUsage), 0, 0));
+			}
+
+			const usageStr = formatUsageStats(aggregateUsage(details.results));
+			if (usageStr) {
+				container.addChild(new Spacer(1));
+				container.addChild(new Text(theme.fg("dim", `Total: ${usageStr}`), 0, 0));
+			}
+			return shell(container);
+		}
+
+		const container = new Container();
+		container.addChild(
+			new Text(`${icon} ${theme.fg("toolTitle", theme.bold("parallel "))}${theme.fg("accent", status)}`, 0, 0),
+		);
+		for (const r of details.results) {
+			const rIcon =
+				r.exitCode === -1
+					? theme.fg("warning", "⏳")
+					: isStoppedResult(r)
+						? theme.fg("warning", "■")
+						: isFailedResult(r)
+							? theme.fg("error", "✗")
+							: theme.fg("success", "✓");
+			const displayItems = getDisplayItems(r.messages);
+			const finalOutput = getFinalOutput(r.messages);
+			container.addChild(new Spacer(1));
+			container.addChild(
+				new Text(`${theme.fg("muted", "── ")}${theme.fg("accent", r.agent)} ${rIcon}`, 0, 0),
+			);
+			addCollapsedActivity(container, displayItems, 5);
+			if (finalOutput) {
+				addSectionTitle(container, r.exitCode === -1 ? "Progress" : "Result");
+				container.addChild(new Markdown(finalOutput.trim(), 1, 0, mdTheme));
+			} else if (getToolCalls(displayItems).length === 0) {
+				container.addChild(
+					new Text(theme.fg("muted", r.exitCode === -1 ? "(running...)" : "(no output)"), 1, 0),
+				);
+			}
+		}
+		if (!isRunning) {
+			const usageStr = formatUsageStats(aggregateUsage(details.results));
+			if (usageStr) {
+				container.addChild(new Spacer(1));
+				container.addChild(new Text(theme.fg("dim", `Total: ${usageStr}`), 0, 0));
+			}
+		}
+		container.addChild(new Text(theme.fg("muted", "Ctrl+O: inspect every call and result"), 0, 0));
+		return shell(container);
+	}
+
+	const text = result.content[0];
+	return shell(new Text(text?.type === "text" ? text.text : "(no output)", 0, 0));
 }
 
 async function writePromptToTempFile(agentName: string, prompt: string): Promise<{ dir: string; filePath: string }> {
@@ -594,6 +1013,122 @@ function getPiInvocation(args: string[]): { command: string; args: string[] } {
 }
 
 const VALID_THINKING_LEVELS = new Set<ModelThinkingLevel>(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
+
+/**
+ * Start a subagent as a tracked background run.
+ *
+ * Shared by single and parallel modes. Resolves once the subprocess exists so
+ * the returned runId is immediately usable. The run is deliberately NOT bound to
+ * the parent's abort signal: a background run must outlive the tool call that
+ * started it, and is stopped through subagent_stop instead.
+ */
+async function startBackgroundRun(
+	backgroundRuns: BackgroundRunRegistry<SingleResult>,
+	start: (control: RunControlHooks) => Promise<SingleResult>,
+	describe: { agent: string; mode: "single" | "parallel"; task: string; agentScope: AgentScope; projectAgentsDir: string | null },
+	onSettled: () => void,
+): Promise<BackgroundRunRecord<SingleResult> | undefined> {
+	let registered: BackgroundRunRecord<SingleResult> | undefined;
+	let resolveSpawned: () => void = () => {};
+	const spawned = new Promise<void>((resolve) => {
+		resolveSpawned = resolve;
+	});
+
+	const promise = start({
+		controlSocketPath: createControlSocketPath(),
+		onSpawned: (handle) => {
+			registered = backgroundRuns.register({
+				runId: handle.runId,
+				agent: describe.agent,
+				mode: describe.mode,
+				task: describe.task,
+				agentScope: describe.agentScope,
+				projectAgentsDir: describe.projectAgentsDir,
+				status: "running",
+				startedAt: Date.now(),
+				stop: handle.stop,
+				live: handle.live,
+				controlSocketPath: handle.controlSocketPath,
+			});
+			resolveSpawned();
+		},
+	});
+
+	void promise.then(
+		(result) => {
+			const status: Exclude<BackgroundRunStatus, "running"> = isStoppedResult(result)
+				? "stopped"
+				: isFailedResult(result)
+					? "failed"
+					: "completed";
+			if (registered) backgroundRuns.settle(registered.runId, result, status);
+			onSettled();
+		},
+		() => {
+			if (registered) backgroundRuns.settle(registered.runId, undefined, "failed");
+			onSettled();
+		},
+	);
+
+	// The subprocess is spawned asynchronously; wait for onSpawned so the
+	// returned runId is usable immediately.
+	await Promise.race([spawned, new Promise((r) => setTimeout(r, 15000))]);
+	return registered;
+}
+
+/**
+ * Absolute path to the control-channel extension injected into subagents.
+ * Resolved relative to this file so the extension keeps working when the
+ * agent-team directory is installed elsewhere.
+ */
+const CONTROL_EXT_PATH = path.join(path.dirname(fileURLToPath(import.meta.url)), "control-ext.js");
+
+/**
+ * Create a Unix domain socket path for a subagent control channel.
+ *
+ * The path must stay short: macOS caps AF_UNIX paths at ~104 bytes, so the
+ * socket lives directly in the temp dir rather than inside a per-run subdir.
+ * Returns undefined on Windows, where AF_UNIX is not available.
+ */
+function createControlSocketPath(): string | undefined {
+	if (process.platform === "win32") return undefined;
+	const unique = `${process.pid}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+	return path.join(os.tmpdir(), `pi-subagent-ctl-${unique}.sock`);
+}
+
+/** Send one steering command to a running subagent's control socket. */
+async function sendControlCommand(
+	socketPath: string,
+	command: { type: "steer" | "followUp"; message: string },
+): Promise<{ ok: boolean; error?: string }> {
+	return await new Promise((resolve) => {
+		let settled = false;
+		const finish = (value: { ok: boolean; error?: string }) => {
+			if (settled) return;
+			settled = true;
+			resolve(value);
+		};
+		let socket: import("node:net").Socket;
+		try {
+			socket = net.connect(socketPath);
+		} catch (error) {
+			finish({ ok: false, error: error instanceof Error ? error.message : String(error) });
+			return;
+		}
+		socket.setTimeout(5000);
+		socket.on("connect", () => {
+			socket.write(`${JSON.stringify(command)}\n`, () => {
+				socket.end();
+				finish({ ok: true });
+			});
+		});
+		socket.on("timeout", () => {
+			socket.destroy();
+			finish({ ok: false, error: "timed out connecting to the subagent control channel" });
+		});
+		socket.on("error", (error) => finish({ ok: false, error: error.message }));
+	});
+}
 
 /** Resolve an exact agent model reference, preserving Pi's full-ID-first semantics. */
 function resolveAgentModel(modelRef: string, modelRegistry: ModelRegistry): { model: Model<any>; thinkingLevel?: ModelThinkingLevel } | undefined {
@@ -636,22 +1171,28 @@ function resolveAgentThinkingLevel(
 
 type OnUpdateCallback = (partial: AgentToolResult<SubagentDetails>) => void;
 
+/**
+ * Run one subagent to completion and return its result.
+ *
+ * Runs are never bound to a parent abort signal: every subagent is an
+ * independent background run that outlives the tool call which started it and is
+ * stopped explicitly through subagent_stop. Streaming progress reaches the UI
+ * through FleetStore, not through a per-call update callback.
+ */
 async function runSingleAgent(
 	defaultCwd: string,
 	agents: AgentConfig[],
-	mode: "single" | "parallel" | "chain",
+	mode: "single" | "parallel",
 	agentName: string,
 	task: string,
 	cwd: string | undefined,
-	step: number | undefined,
-	signal: AbortSignal | undefined,
-	onUpdate: OnUpdateCallback | undefined,
 	makeDetails: (results: SingleResult[]) => SubagentDetails,
 	fleetStore: FleetStore,
 	modelRegistry: ModelRegistry | undefined,
 	projectTrusted: boolean | undefined,
 	usageRootSessionId: string | undefined,
 	failbackParentSessionId: string | undefined,
+	control?: RunControlHooks,
 ): Promise<SingleResult> {
 	const configuredAgent = agents.find((a) => a.name === agentName);
 
@@ -665,7 +1206,6 @@ async function runSingleAgent(
 			messages: [],
 			stderr: `Unknown agent: "${agentName}". Available agents: ${available}.`,
 			usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
-			step,
 		};
 	}
 
@@ -685,6 +1225,10 @@ async function runSingleAgent(
 	if (agent.thinkingLevel) args.push("--thinking", agent.thinkingLevel);
 	if (agent.tools && agent.tools.length > 0) args.push("--tools", agent.tools.join(","));
 
+	// Control channel: only meaningful for runs the caller may steer, and only
+	// where AF_UNIX exists. The socket file is created by the child.
+	const controlSocketPath = control?.controlSocketPath;
+
 	let tmpPromptDir: string | null = null;
 	let tmpPromptPath: string | null = null;
 
@@ -698,14 +1242,12 @@ async function runSingleAgent(
 		usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
 		model: agent.model,
 		thinkingLevel: agent.thinkingLevel,
-		step,
 	};
 	let childProcess: ReturnType<typeof spawn> | null = null;
 	let childPid: number | undefined;
 	let forceKillTimer: ReturnType<typeof setTimeout> | undefined;
 	let terminationStarted = false;
 	let stopRequested = false;
-	let parentAborted = false;
 	let settled = false;
 
 	const clearForceKillTimerIfGroupGone = () => {
@@ -762,6 +1304,7 @@ async function runSingleAgent(
 	const fleetRun = fleetStore.add({
 		mode,
 		agent: currentResult.agent,
+		agentSource: currentResult.agentSource,
 		task: currentResult.task,
 		messages: currentResult.messages,
 		toolUpdates: {},
@@ -777,6 +1320,15 @@ async function runSingleAgent(
 	});
 	currentResult.runId = fleetRun.id;
 	currentResult.startedAt = fleetRun.startedAt;
+
+	// Announce the run as soon as the Fleet entry exists. Background callers use
+	// this to expose status/stop/logs before the subprocess has finished.
+	control?.onSpawned?.({
+		runId: fleetRun.id,
+		stop: () => fleetStore.stop(fleetRun.id),
+		live: { messages: currentResult.messages },
+		controlSocketPath: control.controlSocketPath,
+	});
 
 	const clearStreamingDeltas = () => {
 		fleetRun.streamingDeltas = [];
@@ -874,29 +1426,10 @@ async function runSingleAgent(
 		pushStreamingDelta({ index: contentIndex, type: kind, text: delta });
 	};
 
-	const abortFromParent = () => {
-		parentAborted = true;
-		if (!stopRequested) {
-			stopRequested = true;
-			fleetStore.markStopping(fleetRun);
-			terminateProcess();
-		}
-	};
-	if (signal) {
-		if (signal.aborted) abortFromParent();
-		else signal.addEventListener("abort", abortFromParent, { once: true });
-	}
-
 	const emitUpdate = () => {
 		fleetRun.model = currentResult.model;
 		fleetRun.thinkingLevel = currentResult.thinkingLevel;
 		fleetStore.touch();
-		if (onUpdate) {
-			onUpdate({
-				content: [{ type: "text", text: getFinalOutput(currentResult.messages) || "(running...)" }],
-				details: makeDetails([currentResult]),
-			});
-		}
 	};
 
 	try {
@@ -905,6 +1438,17 @@ async function runSingleAgent(
 			tmpPromptDir = tmp.dir;
 			tmpPromptPath = tmp.filePath;
 			args.push("--append-system-prompt", tmpPromptPath);
+		}
+
+		// Inject the control extension so the parent can steer this run. Added after
+		// the role's own flags so it is present even when the role restricts tools.
+		if (controlSocketPath) {
+			try {
+				await fs.promises.access(CONTROL_EXT_PATH);
+				args.push("-e", CONTROL_EXT_PATH);
+			} catch {
+				/* control extension missing: run without a control channel */
+			}
 		}
 
 		args.push(`Task: ${task}`);
@@ -925,6 +1469,7 @@ async function runSingleAgent(
 						? { MODEL_FAILBACK_SESSION_ID: failbackParentSessionId }
 						: {}),
 					...(usageRootSessionId ? { PI_USAGE_ROOT_SESSION_ID: usageRootSessionId } : {}),
+					...(controlSocketPath ? { SUBAGENT_CONTROL_SOCKET: controlSocketPath } : {}),
 					MODEL_FAILBACK_CHILD: "1",
 				},
 			});
@@ -1034,7 +1579,7 @@ async function runSingleAgent(
 				// Both message_end and the legacy tool_result_end event can carry a durable
 				// tool result. appendDurableMessage deduplicates them by toolCallId.
 				// Tool execution events below are Fleet-only transient state and cannot
-				// affect content, details, or chain {previous}.
+				// affect content or details.
 
 				if (event.type === "tool_result_end" && isRecord(event.message)) {
 					const msg = event.message as Message;
@@ -1086,13 +1631,12 @@ async function runSingleAgent(
 		currentResult.exitCode = stopRequested ? 130 : exitCode;
 		if (stopRequested) {
 			currentResult.stopReason = "stopped";
-			currentResult.errorMessage = parentAborted ? "Stopped with the parent operation" : "Stopped by user";
+			currentResult.errorMessage = "Stopped by user";
 		}
 		return currentResult;
 	} finally {
 		settled = true;
 		if (forceKillTimer && !stopRequested) clearTimeout(forceKillTimer);
-		if (signal) signal.removeEventListener("abort", abortFromParent);
 		currentResult.endedAt = Date.now();
 		let fleetStatus: Exclude<FleetRunStatus, "running">;
 		if (stopRequested) fleetStatus = "stopped";
@@ -1111,18 +1655,19 @@ async function runSingleAgent(
 			} catch {
 				/* ignore */
 			}
+		// Remove the control socket so a stale path cannot be reused by a later run.
+		if (controlSocketPath)
+			try {
+				fs.unlinkSync(controlSocketPath);
+			} catch {
+				/* never created, or already gone */
+			}
 	}
 }
 
 const TaskItem = Type.Object({
 	agent: Type.String({ description: "Name of the agent to invoke" }),
 	task: Type.String({ description: "Task to delegate to the agent" }),
-	cwd: Type.Optional(Type.String({ description: "Working directory for the agent process" })),
-});
-
-const ChainItem = Type.Object({
-	agent: Type.String({ description: "Name of the agent to invoke" }),
-	task: Type.String({ description: "Task with optional {previous} placeholder for prior output" }),
 	cwd: Type.Optional(Type.String({ description: "Working directory for the agent process" })),
 });
 
@@ -1135,14 +1680,45 @@ const SubagentParams = Type.Object({
 	agent: Type.Optional(Type.String({ description: "Name of the agent to invoke (for single mode)" })),
 	task: Type.Optional(Type.String({ description: "Task to delegate (for single mode)" })),
 	tasks: Type.Optional(Type.Array(TaskItem, { description: "Array of {agent, task} for parallel execution" })),
-	chain: Type.Optional(Type.Array(ChainItem, { description: "Array of {agent, task} for sequential execution" })),
 	agentScope: Type.Optional(AgentScopeSchema),
 	cwd: Type.Optional(Type.String({ description: "Working directory for the agent process (single mode)" })),
+});
+
+const StatusParams = Type.Object({
+	runId: Type.Optional(Type.String({ description: "Background run id; omit to list all tracked runs" })),
+});
+
+const StopParams = Type.Object({
+	runId: Type.String({ description: "Background run id to stop" }),
+});
+
+const LogsParams = Type.Object({
+	runId: Type.String({ description: "Background run id to read" }),
+	tail: Type.Optional(Type.Number({ description: "Return only the last N transcript entries (default: all)" })),
+});
+
+const SteerParams = Type.Object({
+	runId: Type.String({ description: "Background run id to steer" }),
+	message: Type.String({ description: "Instruction delivered to the running subagent at its next turn boundary" }),
+});
+
+const WaitParams = Type.Object({
+	runIds: Type.Optional(
+		Type.Array(Type.String(), {
+			description: "Run ids to wait for. Omit to wait for every currently running background subagent.",
+		}),
+	),
+	timeoutMs: Type.Optional(
+		Type.Number({ description: "Give up after this many milliseconds and report still-running runs (default 600000)." }),
+	),
 });
 
 export default function (pi: ExtensionAPI) {
 	const fleetStore = new FleetStore();
 	const fleetWebServer = new FleetWebServer(fleetStore);
+	// Background runs are tracked here so the main agent can inspect and stop them
+	// while they are still running. Settled runs stay queryable until pruned.
+	const backgroundRuns = new BackgroundRunRegistry<SingleResult>();
 	const restoreFleetHistory = (ctx: { sessionManager: { getBranch(): SessionEntry[] } }) => {
 		fleetStore.restore(collectRestoredFleetRuns(ctx.sessionManager.getBranch()));
 	};
@@ -1161,6 +1737,7 @@ export default function (pi: ExtensionAPI) {
 		for (const run of fleetStore.list()) {
 			if (run.status === "running") fleetStore.stop(run.id);
 		}
+		backgroundRuns.clear();
 		if (ctx.mode === "tui") ctx.ui.setWidget("agent-team-fleet", undefined);
 		fleetStore.clear();
 		await fleetWebServer.close();
@@ -1169,6 +1746,37 @@ export default function (pi: ExtensionAPI) {
 	pi.on("session_tree", (_event, ctx) => {
 		restoreFleetHistory(ctx);
 	});
+
+	// Remind the agent about finished runs it never collected.
+	//
+	// Two triggers, because a run can finish at either moment:
+	//   - while the agent is mid-turn: deferring keeps the result from interrupting
+	//     work in progress. By the time the turn ends the agent has usually already
+	//     collected it, and nothing is sent.
+	//   - while the agent is idle: nothing else will wake it, so the reminder goes
+	//     out immediately.
+	// The `notified` flag keeps a run from being reported twice and prevents the
+	// reminder from feeding itself in a loop.
+	const reportUncollectedResults = (): void => {
+		const pending = backgroundRuns.needsReminder();
+		if (pending.length === 0) return;
+		const lines = pending.map((record) => {
+			const output = record.result ? getResultOutput(record.result) : "(no result captured)";
+			const preview = output.length > 2000 ? `${output.slice(0, 2000)}…` : output;
+			return `### [${record.agent}] run ${record.runId} — ${record.status}\n\n${preview}`;
+		});
+		for (const record of pending) backgroundRuns.markNotified(record.runId);
+		const summary =
+			`${pending.length} background subagent result(s) are waiting to be collected. ` +
+			"Call subagent_wait to read the full result.";
+		try {
+			pi.sendUserMessage(`${summary}\n\n${lines.join("\n\n---\n\n")}`, { deliverAs: "followUp" });
+		} catch {
+			/* session already disposed (print/json mode); results stay queryable by runId */
+		}
+	};
+
+	pi.on("agent_settled", reportUncollectedResults);
 
 	pi.registerCommand("subagents", {
 		description: "Open the live subagent FleetView",
@@ -1185,14 +1793,17 @@ export default function (pi: ExtensionAPI) {
 		label: "Subagent",
 		description: [
 			"Delegate tasks to specialized subagents with isolated context.",
-			"Modes: single (agent + task), parallel (tasks array), chain (sequential with {previous} placeholder).",
+			"Returns one runId per subagent; the subagent's output is collected with subagent_wait.",
+			"Modes: single (agent + task), parallel (tasks array).",
+			"Runs are supervised with subagent_status, subagent_logs, subagent_steer, and subagent_stop.",
+			"For sequential work, call subagent again with the previous result.",
 			`Default agent scope is "both": user-level agents plus ${CONFIG_DIR_NAME}/agents from the current project.`,
 			`Project-level agents override user-level agents with the same name.`,
 		].join(" "),
 		parameters: SubagentParams,
 		renderShell: "self",
 
-		async execute(_toolCallId, params, signal, onUpdate, ctx) {
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			const agentScope: AgentScope = params.agentScope ?? "both";
 			// Retain the persisted root session across nested --no-session subagents.
 			const usageRootSessionId = process.env.PI_USAGE_ROOT_SESSION_ID ?? ctx.sessionManager.getSessionId();
@@ -1205,13 +1816,12 @@ export default function (pi: ExtensionAPI) {
 			const discovery = discoverAgents(ctx.cwd, agentScope);
 			const agents = discovery.agents;
 
-			const hasChain = (params.chain?.length ?? 0) > 0;
 			const hasTasks = (params.tasks?.length ?? 0) > 0;
 			const hasSingle = Boolean(params.agent && params.task);
-			const modeCount = Number(hasChain) + Number(hasTasks) + Number(hasSingle);
+			const modeCount = Number(hasTasks) + Number(hasSingle);
 
 			const makeDetails =
-				(mode: "single" | "parallel" | "chain") =>
+				(mode: "single" | "parallel") =>
 				(results: SingleResult[]): SubagentDetails => ({
 					mode,
 					agentScope,
@@ -1232,65 +1842,6 @@ export default function (pi: ExtensionAPI) {
 				};
 			}
 
-			if (params.chain && params.chain.length > 0) {
-				const results: SingleResult[] = [];
-				let previousOutput = "";
-
-				for (let i = 0; i < params.chain.length; i++) {
-					const step = params.chain[i];
-					const taskWithContext = step.task.replace(/\{previous\}/g, () => previousOutput);
-
-					// Create update callback that includes all previous results
-					const chainUpdate: OnUpdateCallback | undefined = onUpdate
-						? (partial) => {
-								// Combine completed results with current streaming result
-								const currentResult = partial.details?.results[0];
-								if (currentResult) {
-									const allResults = [...results, currentResult];
-									onUpdate({
-										content: partial.content,
-										details: makeDetails("chain")(allResults),
-									});
-								}
-							}
-						: undefined;
-
-					const result = await runSingleAgent(
-						ctx.cwd,
-						agents,
-						"chain",
-						step.agent,
-						taskWithContext,
-						step.cwd,
-						i + 1,
-						signal,
-						chainUpdate,
-						makeDetails("chain"),
-						fleetStore,
-						ctx.modelRegistry,
-						ctx.isProjectTrusted?.(),
-						usageRootSessionId,
-						failbackParentSessionId,
-					);
-					results.push(result);
-
-					const isError = isFailedResult(result);
-					if (isError) {
-						const errorMsg = getResultOutput(result);
-						return {
-							content: [{ type: "text", text: `Chain stopped at step ${i + 1} (${step.agent}): ${errorMsg}` }],
-							details: makeDetails("chain")(results),
-							isError: true,
-						};
-					}
-					previousOutput = getFinalOutput(result.messages);
-				}
-				return {
-					content: [{ type: "text", text: getFinalOutput(results[results.length - 1].messages) || "(no output)" }],
-					details: makeDetails("chain")(results),
-				};
-			}
-
 			if (params.tasks && params.tasks.length > 0) {
 				if (params.tasks.length > MAX_PARALLEL_TASKS)
 					return {
@@ -1303,115 +1854,115 @@ export default function (pi: ExtensionAPI) {
 						details: makeDetails("parallel")([]),
 					};
 
-				// Track all results for streaming updates
-				const allResults: SingleResult[] = new Array(params.tasks.length);
+				// Background is the default here too: every task becomes its own tracked
+				// run, so the caller can supervise or stop tasks individually. All tasks
+				// are started immediately; concurrency is bounded by the OS and by the
+				// caller's own judgement rather than by a hidden semaphore.
+				const started: BackgroundRunRecord<SingleResult>[] = [];
+				for (const t of params.tasks) {
+					const record = await startBackgroundRun(
+						backgroundRuns,
+						(control) =>
+							runSingleAgent(
+								ctx.cwd,
+								agents,
+								"parallel",
+								t.agent,
+								t.task,
+								t.cwd,
+									makeDetails("parallel"),
+								fleetStore,
+								ctx.modelRegistry,
+								ctx.isProjectTrusted?.(),
+								usageRootSessionId,
+								failbackParentSessionId,
+								control,
+							),
+						{ agent: t.agent, mode: "parallel", task: t.task, agentScope, projectAgentsDir: discovery.projectAgentsDir },
+						() => {
+							// A run finishing while the agent is idle has nothing else to wake it,
+							// so report immediately; mid-turn results wait for agent_settled.
+							// isIdle is absent from minimal hosts (and the harness).
+							if (ctx.isIdle?.() ?? false) reportUncollectedResults();
+						},
+					);
+					if (record) started.push(record);
+				}
 
-				// Initialize placeholder results
-				for (let i = 0; i < params.tasks.length; i++) {
-					allResults[i] = {
-						agent: params.tasks[i].agent,
-						agentSource: "unknown",
-						task: params.tasks[i].task,
-						exitCode: -1, // -1 = still running
-						messages: [],
-						stderr: "",
-						usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
+				if (started.length === 0) {
+					return {
+						content: [
+							{ type: "text", text: "Failed to start parallel subagents: no subprocess started in time." },
+						],
+						details: makeDetails("parallel")([]),
+						isError: true,
 					};
 				}
 
-				const emitParallelUpdate = () => {
-					if (onUpdate) {
-						const running = allResults.filter((r) => r.exitCode === -1).length;
-						const done = allResults.filter((r) => r.exitCode !== -1).length;
-						onUpdate({
-							content: [
-								{ type: "text", text: `Parallel: ${done}/${allResults.length} done, ${running} running...` },
-							],
-							details: makeDetails("parallel")([...allResults]),
-						});
-					}
-				};
-
-				const results = await mapWithConcurrencyLimit(params.tasks, MAX_CONCURRENCY, async (t, index) => {
-					const result = await runSingleAgent(
-						ctx.cwd,
-						agents,
-						"parallel",
-						t.agent,
-						t.task,
-						t.cwd,
-						undefined,
-						signal,
-						// Per-task update callback
-						(partial) => {
-							if (partial.details?.results[0]) {
-								allResults[index] = partial.details.results[0];
-								emitParallelUpdate();
-							}
-						},
-						makeDetails("parallel"),
-						fleetStore,
-						ctx.modelRegistry,
-						ctx.isProjectTrusted?.(),
-						usageRootSessionId,
-						failbackParentSessionId,
-					);
-					allResults[index] = result;
-					emitParallelUpdate();
-					return result;
-				});
-
-				const successCount = results.filter((r) => !isFailedResult(r)).length;
-				const summaries = results.map((r) => {
-					const output = truncateParallelOutput(getResultOutput(r));
-					const status = isStoppedResult(r)
-						? "stopped"
-						: isFailedResult(r)
-							? `failed${r.stopReason && r.stopReason !== "end" ? ` (${r.stopReason})` : ""}`
-							: "completed";
-					return `### [${r.agent}] ${status}\n\n${output}`;
-				});
+				const listing = started.map((r) => `  runId: ${r.runId} — ${r.agent}`).join("\n");
 				return {
 					content: [
 						{
 							type: "text",
-							text: `Parallel: ${successCount}/${results.length} succeeded\n\n${summaries.join("\n\n---\n\n")}`,
+							text:
+								`${started.length} background subagent(s) started:\n${listing}\n\n` +
+								"Call subagent_wait (with no arguments) to collect all of their results. " +
+								"Do not finish the turn before collecting results you depend on.",
 						},
 					],
-					details: makeDetails("parallel")(results),
+					details: { ...makeDetails("parallel")([]), liveRunIds: started.map((r) => r.runId) },
 				};
 			}
 
 			if (params.agent && params.task) {
-				const result = await runSingleAgent(
-					ctx.cwd,
-					agents,
-					"single",
-					params.agent,
-					params.task,
-					params.cwd,
-					undefined,
-					signal,
-					onUpdate,
-					makeDetails("single"),
-					fleetStore,
-					ctx.modelRegistry,
-					ctx.isProjectTrusted?.(),
-					usageRootSessionId,
-					failbackParentSessionId,
+				// Every subagent is a background run: register it as soon as the
+				// subprocess exists and return immediately so the caller can supervise it.
+				const record = await startBackgroundRun(
+					backgroundRuns,
+					(control) =>
+						runSingleAgent(
+							ctx.cwd,
+							agents,
+							"single",
+							params.agent as string,
+							params.task as string,
+							params.cwd,
+							makeDetails("single"),
+							fleetStore,
+							ctx.modelRegistry,
+							ctx.isProjectTrusted?.(),
+							usageRootSessionId,
+							failbackParentSessionId,
+							control,
+						),
+					{ agent: params.agent as string, mode: "single", task: params.task as string, agentScope, projectAgentsDir: discovery.projectAgentsDir },
+					() => {
+						// A run finishing while the agent is idle has nothing else to wake it,
+						// so report immediately; mid-turn results wait for agent_settled.
+						// isIdle is absent from minimal hosts (and the harness).
+						if (ctx.isIdle?.() ?? false) reportUncollectedResults();
+					},
 				);
-				const isError = isFailedResult(result);
-				if (isError) {
-					const errorMsg = getResultOutput(result);
+				if (!record) {
 					return {
-						content: [{ type: "text", text: `Agent ${result.stopReason || "failed"}: ${errorMsg}` }],
-						details: makeDetails("single")([result]),
+						content: [
+							{ type: "text", text: "Failed to start background subagent: the subprocess did not start in time." },
+						],
+						details: makeDetails("single")([]),
 						isError: true,
 					};
 				}
 				return {
-					content: [{ type: "text", text: getFinalOutput(result.messages) || "(no output)" }],
-					details: makeDetails("single")([result]),
+					content: [
+						{
+							type: "text",
+							text:
+								`Background subagent started (runId: ${record.runId}, agent: ${params.agent}). ` +
+								"Call subagent_wait to collect its result, or subagent_status / subagent_logs / subagent_steer / subagent_stop to supervise it. " +
+								"Do not finish the turn before collecting a result you depend on.",
+						},
+					],
+					details: { ...makeDetails("single")([]), liveRunIds: [record.runId] },
 				};
 			}
 
@@ -1424,28 +1975,6 @@ export default function (pi: ExtensionAPI) {
 
 		renderCall(args, theme, _context) {
 			const scope: AgentScope = args.agentScope ?? "both";
-			if (args.chain && args.chain.length > 0) {
-				let text =
-					theme.fg("toolTitle", theme.bold("subagent ")) +
-					theme.fg("accent", `chain (${args.chain.length} steps)`) +
-					theme.fg("muted", ` [${scope}]`);
-				for (let i = 0; i < args.chain.length; i++) {
-					const step = args.chain[i];
-					// Clean up {previous} placeholder for display
-					const cleanTask = step.task.replace(/\{previous\}/g, "").trim();
-					text +=
-						"\n  " +
-						theme.fg("muted", `${i + 1}.`) +
-						" " +
-						theme.fg("accent", step.agent) +
-						theme.fg("dim", ` ${cleanTask}`);
-				}
-				return new OpencodeToolShell(
-					new Text(text, 0, 0),
-					(s) => theme.bg("toolPendingBg", s),
-					(s) => theme.fg("muted", s),
-				);
-			}
 			if (args.tasks && args.tasks.length > 0) {
 				let text =
 					theme.fg("toolTitle", theme.bold("subagent ")) +
@@ -1474,390 +2003,312 @@ export default function (pi: ExtensionAPI) {
 			);
 		},
 
-		renderResult(result, { expanded, isPartial }, theme, context) {
-			const details = result.details as SubagentDetails | undefined;
-			const hasRunningResult = details?.results.some((item) => item.exitCode === -1) ?? false;
-			const hasFailedResult = details?.results.some((item) => item.exitCode !== -1 && isFailedResult(item)) ?? false;
-			const resultBackground = isPartial || hasRunningResult
-				? "toolPendingBg"
-				: context.isError || hasFailedResult
-					? "toolErrorBg"
-					: "toolSuccessBg";
-			const shell = (component: Component) =>
-				new OpencodeToolShell(
-					component,
-					(s) => theme.bg(resultBackground, s),
-					(s) => theme.fg("muted", s),
-				);
-			if (!details || details.results.length === 0) {
-				const text = result.content[0];
-				return shell(new Text(text?.type === "text" ? text.text : "(no output)", 0, 0));
+		renderResult: (result, options, theme, context) =>
+			renderSubagentResult(result, options, context.isError, theme, fleetStore),
+	});
+
+	// ---------------------------------------------------------------------
+	// Background run control tools
+	//
+	// These let the main agent inspect and stop subagents it started with
+	// `background: true`. Stop goes through the same FleetStore control port and
+	// SIGTERM/SIGKILL escalation as the user-facing overlay, so semantics match.
+	// ---------------------------------------------------------------------
+
+	const describeRun = (record: ReturnType<typeof backgroundRuns.list>[number]): string => {
+		const elapsed = Math.max(0, (record.endedAt ?? Date.now()) - record.startedAt);
+		const seconds = (elapsed / 1000).toFixed(1);
+		const lines = [
+			`runId: ${record.runId}`,
+			`agent: ${record.agent}`,
+			`status: ${record.status}`,
+			`elapsed: ${seconds}s`,
+		];
+		if (record.result) {
+			const usage = record.result.usage;
+			lines.push(`turns: ${usage.turns}`);
+			if (record.result.model) lines.push(`model: ${record.result.model}`);
+			if (usage.cost > 0) lines.push(`cost: $${usage.cost.toFixed(4)}`);
+			if (record.result.stopReason) lines.push(`stopReason: ${record.result.stopReason}`);
+		}
+		lines.push(`task: ${record.task.length > 120 ? `${record.task.slice(0, 120)}...` : record.task}`);
+		return lines.join("\n");
+	};
+
+	pi.registerTool({
+		name: "subagent_status",
+		label: "Subagent Status",
+		description:
+			"Report background subagent runs started with subagent({ background: true }). " +
+			"Omit runId to list every tracked run; pass a runId for a single run's status.",
+		parameters: StatusParams,
+
+		async execute(_toolCallId, params) {
+			if (params.runId) {
+				const record = backgroundRuns.get(params.runId);
+				if (!record) {
+					return {
+						content: [{ type: "text", text: `No background run with id "${params.runId}".` }],
+						isError: true,
+					};
+				}
+				return { content: [{ type: "text", text: describeRun(record) }] };
 			}
 
-			const mdTheme = getMarkdownTheme();
-
-			const getToolCalls = (items: DisplayItem[]) =>
-				items.filter((item): item is Extract<DisplayItem, { type: "toolCall" }> => item.type === "toolCall");
-
-			const formatActivitySummary = (items: DisplayItem[]) => {
-				const calls = getToolCalls(items);
-				const counts = new Map<string, number>();
-				for (const call of calls) counts.set(call.name, (counts.get(call.name) ?? 0) + 1);
-				const breakdown = [...counts.entries()].map(([name, count]) => `${name} ${count}`).join(" · ");
-				return `${calls.length} call${calls.length === 1 ? "" : "s"}${breakdown ? ` · ${breakdown}` : ""}`;
+			const records = backgroundRuns.list();
+			if (records.length === 0) {
+				return { content: [{ type: "text", text: "No background subagent runs are tracked in this session." }] };
+			}
+			const running = records.filter((record) => record.status === "running").length;
+			const body = records.map(describeRun).join("\n\n");
+			return {
+				content: [{ type: "text", text: `${records.length} run(s), ${running} running:\n\n${body}` }],
 			};
+		},
+	});
 
-			const addSectionTitle = (container: Container, title: string, detail?: string) => {
-				container.addChild(new Spacer(1));
-				let text = theme.fg("muted", "── ");
-				text += theme.fg("toolTitle", theme.bold(title));
-				if (detail) text += theme.fg("dim", `  ${detail}`);
-				container.addChild(new Text(text, 0, 0));
-			};
+	pi.registerTool({
+		name: "subagent_logs",
+		label: "Subagent Logs",
+		description:
+			"Read the transcript of a background subagent run. Returns the final report for settled runs " +
+			"and the messages collected so far for running ones.",
+		parameters: LogsParams,
 
-			const addCollapsedActivity = (container: Container, items: DisplayItem[], limit: number) => {
-				const calls = getToolCalls(items);
-				if (calls.length === 0) return;
-
-				addSectionTitle(container, "Activity", formatActivitySummary(calls));
-				const toShow = calls.slice(-limit);
-				const skipped = calls.length - toShow.length;
-				if (skipped > 0) {
-					container.addChild(new Text(theme.fg("dim", `… ${skipped} earlier calls`), 1, 0));
-				}
-				for (const call of toShow) {
-					container.addChild(
-						new Text(
-							theme.fg("muted", "› ") + formatToolCall(call.name, call.args, theme.fg.bind(theme)),
-							1,
-							0,
-						),
-					);
-				}
-				if (skipped > 0) {
-					container.addChild(new Text(theme.fg("muted", "Ctrl+O: inspect every call and result"), 1, 0));
-				}
-			};
-
-			const addExpandedItems = (container: Container, items: DisplayItem[]) => {
-				for (const item of items) {
-					if (item.type === "toolCall") {
-						container.addChild(
-							new Text(
-								theme.fg("accent", "▶ ") + formatToolCall(item.name, item.args, theme.fg.bind(theme), true),
-								1,
-								0,
-							),
-						);
-					} else if (item.type === "toolResult") {
-						const label = `${item.isError ? "✗" : "✓"} ${item.name} result`;
-						container.addChild(new Text(theme.fg(item.isError ? "error" : "success", label), 2, 0));
-						container.addChild(new Text(theme.fg("toolOutput", item.text), 3, 0));
-					}
-				}
-			};
-
-			if (details.mode === "single" && details.results.length === 1) {
-				const r = details.results[0];
-				const isRunning = r.exitCode === -1;
-				const isStopped = !isRunning && isStoppedResult(r);
-				const isError = !isRunning && isFailedResult(r);
-				const icon = isRunning
-					? theme.fg("warning", "●")
-					: isStopped
-						? theme.fg("warning", "■")
-						: isError
-							? theme.fg("error", "✗")
-							: theme.fg("success", "✓");
-				const displayItems = getDisplayItems(r.messages, expanded);
-				const finalOutput = getFinalOutput(r.messages);
-
-				if (expanded) {
-					const container = new Container();
-					let header = `${icon} ${theme.fg("toolTitle", theme.bold(r.agent))}${theme.fg("muted", ` (${r.agentSource})`)}`;
-					if (isRunning) header += theme.fg("warning", "  running");
-					if (isStopped) header += theme.fg("warning", "  stopped");
-					else if (isError && r.stopReason) header += ` ${theme.fg("error", `[${r.stopReason}]`)}`;
-					const usageStr = formatUsageStats(r.usage, r.model, r.thinkingLevel);
-					if (usageStr) header += theme.fg("dim", `  ${usageStr}`);
-					container.addChild(new Text(header, 0, 0));
-					if (isError && !isStopped && r.errorMessage)
-						container.addChild(new Text(theme.fg("error", `Error: ${r.errorMessage}`), 0, 0));
-					addSectionTitle(container, "Task");
-					container.addChild(new Text(theme.fg("dim", r.task), 1, 0));
-					if (displayItems.length === 0 && !finalOutput) {
-						container.addChild(new Text(theme.fg("muted", "(no output)"), 0, 0));
-					} else {
-						if (getToolCalls(displayItems).length > 0) {
-							addSectionTitle(container, "Activity", formatActivitySummary(displayItems));
-						}
-						addExpandedItems(container, displayItems);
-						if (finalOutput) {
-							addSectionTitle(container, isRunning ? "Progress" : "Result");
-							container.addChild(new Markdown(finalOutput.trim(), 1, 0, mdTheme));
-						}
-					}
-					return shell(container);
-				}
-
-				const container = new Container();
-				let header = `${icon} ${theme.fg("toolTitle", theme.bold(r.agent))}${theme.fg("muted", ` (${r.agentSource})`)}`;
-				if (isRunning) header += theme.fg("warning", "  running");
-				if (isStopped) header += theme.fg("warning", "  stopped");
-				else if (isError && r.stopReason) header += ` ${theme.fg("error", `[${r.stopReason}]`)}`;
-				const usageStr = formatUsageStats(r.usage, r.model, r.thinkingLevel);
-				if (usageStr) header += theme.fg("dim", `  ${usageStr}`);
-				container.addChild(new Text(header, 0, 0));
-				if (isError && !isStopped && r.errorMessage) {
-					container.addChild(new Text(theme.fg("error", `Error: ${r.errorMessage}`), 1, 0));
-					return shell(container);
-				}
-				if (displayItems.length === 0 && !finalOutput) {
-					container.addChild(new Text(theme.fg("muted", "(no output)"), 1, 0));
-					return shell(container);
-				}
-
-				addCollapsedActivity(container, displayItems, COLLAPSED_ITEM_COUNT);
-				if (getToolCalls(displayItems).length > 0) {
-					container.addChild(new Text(theme.fg("muted", "Ctrl+O: inspect every call and result"), 1, 0));
-				}
-				if (finalOutput) {
-					addSectionTitle(container, isRunning ? "Progress" : "Result");
-					container.addChild(new Markdown(finalOutput.trim(), 1, 0, mdTheme));
-				}
-				return shell(container);
+		async execute(_toolCallId, params) {
+			const record = backgroundRuns.get(params.runId);
+			if (!record) {
+				return {
+					content: [{ type: "text", text: `No background run with id "${params.runId}".` }],
+					isError: true,
+				};
 			}
 
-			const aggregateUsage = (results: SingleResult[]) => {
-				const total = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 };
-				for (const r of results) {
-					total.input += r.usage.input;
-					total.output += r.usage.output;
-					total.cacheRead += r.usage.cacheRead;
-					total.cacheWrite += r.usage.cacheWrite;
-					total.cost += r.usage.cost;
-					total.turns += r.usage.turns;
-				}
-				return total;
+			// Settled runs report through the final result; running ones read the live
+			// transcript the data-flow layer is still appending to.
+			const messages = (record.result?.messages ?? record.live?.messages ?? []) as Message[];
+			if (messages.length === 0) {
+				return {
+					content: [
+						{ type: "text", text: `Run ${record.runId} (${record.status}) has no transcript entries yet.` },
+					],
+				};
+			}
+
+			const items = getDisplayItems(messages, true);
+			const requested = params.tail && params.tail > 0 ? Math.floor(params.tail) : items.length;
+			const shown = items.slice(Math.max(0, items.length - requested));
+			const rendered = shown.map((item) => {
+				if (item.type === "text") return item.text;
+				if (item.type === "toolCall") return `[tool call] ${item.name}`;
+				return `[tool result] ${item.name}${item.isError ? " (error)" : ""}\n${item.text}`;
+			});
+			const header = `Run ${record.runId} (${record.agent}, ${record.status}), showing ${shown.length}/${items.length} entries:`;
+			return { content: [{ type: "text", text: `${header}\n\n${rendered.join("\n\n")}` }] };
+		},
+	});
+
+	pi.registerTool({
+		name: "subagent_stop",
+		label: "Subagent Stop",
+		description:
+			"Stop a running background subagent. Uses the same SIGTERM/SIGKILL escalation as the Fleet overlay. " +
+			"Messages collected so far are preserved and the run is marked stopped.",
+		parameters: StopParams,
+
+		async execute(_toolCallId, params) {
+			const record = backgroundRuns.get(params.runId);
+			if (!record) {
+				return {
+					content: [{ type: "text", text: `No background run with id "${params.runId}".` }],
+					isError: true,
+				};
+			}
+			if (record.status !== "running") {
+				return {
+					content: [
+						{ type: "text", text: `Run ${record.runId} is already ${record.status}; nothing to stop.` },
+					],
+				};
+			}
+			const stopped = record.stop();
+			return {
+				content: [
+					{
+						type: "text",
+						text: stopped
+							? `Stop requested for run ${record.runId}. The subagent will be marked stopped once it exits.`
+							: `Run ${record.runId} could not be stopped (it may have just finished).`,
+					},
+				],
 			};
+		},
+	});
 
-			if (details.mode === "chain") {
-				const successCount = details.results.filter((r) => r.exitCode === 0).length;
-				const runningCount = details.results.filter((r) => r.exitCode === -1).length;
-				const stoppedCount = details.results.filter(isStoppedResult).length;
-				const icon =
-					runningCount > 0
-						? theme.fg("warning", "●")
-						: stoppedCount > 0
-							? theme.fg("warning", "■")
-							: successCount === details.results.length
-								? theme.fg("success", "✓")
-								: theme.fg("error", "✗");
+	pi.registerTool({
+		name: "subagent_steer",
+		label: "Subagent Steer",
+		description: [
+			"Send an instruction to a running background subagent.",
+			"Delivered at the subagent's next turn boundary (after it finishes its current tool calls,",
+			"before its next model call) — it redirects the work, it does not interrupt generation.",
+			"Use subagent_stop when you need an immediate stop.",
+		].join(" "),
+		parameters: SteerParams,
 
-				if (expanded) {
-					const container = new Container();
-					container.addChild(
-						new Text(
-							icon +
-								" " +
-								theme.fg("toolTitle", theme.bold("chain ")) +
-								theme.fg("accent", `${successCount}/${details.results.length} steps`),
-							0,
-							0,
-						),
-					);
-
-					for (const r of details.results) {
-						const rIcon =
-							r.exitCode === -1
-								? theme.fg("warning", "●")
-								: isStoppedResult(r)
-									? theme.fg("warning", "■")
-									: r.exitCode === 0
-										? theme.fg("success", "✓")
-										: theme.fg("error", "✗");
-						const displayItems = getDisplayItems(r.messages, true);
-						const finalOutput = getFinalOutput(r.messages);
-
-						container.addChild(new Spacer(1));
-						container.addChild(
-							new Text(
-								`${theme.fg("muted", `── Step ${r.step} · `) + theme.fg("accent", r.agent)} ${rIcon}`,
-								0,
-								0,
-							),
-						);
-						container.addChild(new Text(theme.fg("muted", "Task: ") + theme.fg("dim", r.task), 0, 0));
-
-						if (getToolCalls(displayItems).length > 0) {
-							addSectionTitle(container, "Activity", formatActivitySummary(displayItems));
-						}
-						addExpandedItems(container, displayItems);
-
-						if (finalOutput) {
-							addSectionTitle(container, r.exitCode === -1 ? "Progress" : "Result");
-							container.addChild(new Markdown(finalOutput.trim(), 1, 0, mdTheme));
-						}
-
-						const stepUsage = formatUsageStats(r.usage, r.model, r.thinkingLevel);
-						if (stepUsage) container.addChild(new Text(theme.fg("dim", stepUsage), 0, 0));
-					}
-
-					const usageStr = formatUsageStats(aggregateUsage(details.results));
-					if (usageStr) {
-						container.addChild(new Spacer(1));
-						container.addChild(new Text(theme.fg("dim", `Total: ${usageStr}`), 0, 0));
-					}
-					return shell(container);
-				}
-
-				const container = new Container();
-				const header =
-					icon +
-					" " +
-					theme.fg("toolTitle", theme.bold("chain ")) +
-					theme.fg("accent", `${successCount}/${details.results.length} steps`);
-				container.addChild(new Text(header, 0, 0));
-				for (const r of details.results) {
-					const rIcon =
-						r.exitCode === -1
-							? theme.fg("warning", "●")
-							: isStoppedResult(r)
-								? theme.fg("warning", "■")
-								: r.exitCode === 0
-									? theme.fg("success", "✓")
-									: theme.fg("error", "✗");
-					const displayItems = getDisplayItems(r.messages);
-					const finalOutput = getFinalOutput(r.messages);
-					container.addChild(new Spacer(1));
-					container.addChild(
-						new Text(`${theme.fg("muted", `── Step ${r.step} · `)}${theme.fg("accent", r.agent)} ${rIcon}`, 0, 0),
-					);
-					addCollapsedActivity(container, displayItems, 5);
-					if (finalOutput) {
-						addSectionTitle(container, r.exitCode === -1 ? "Progress" : "Result");
-						container.addChild(new Markdown(finalOutput.trim(), 1, 0, mdTheme));
-					} else if (getToolCalls(displayItems).length === 0) {
-						container.addChild(new Text(theme.fg("muted", "(no output)"), 1, 0));
-					}
-				}
-				const usageStr = formatUsageStats(aggregateUsage(details.results));
-				if (usageStr) {
-					container.addChild(new Spacer(1));
-					container.addChild(new Text(theme.fg("dim", `Total: ${usageStr}`), 0, 0));
-				}
-				container.addChild(new Text(theme.fg("muted", "Ctrl+O: inspect every call and result"), 0, 0));
-				return shell(container);
+		async execute(_toolCallId, params) {
+			const record = backgroundRuns.get(params.runId);
+			if (!record) {
+				return {
+					content: [{ type: "text", text: `No background run with id "${params.runId}".` }],
+					isError: true,
+				};
+			}
+			if (record.status !== "running") {
+				return {
+					content: [
+						{
+							type: "text",
+							text: `Run ${record.runId} is ${record.status}; it can no longer be steered.`,
+						},
+					],
+					isError: true,
+				};
+			}
+			if (!record.controlSocketPath) {
+				return {
+					content: [
+						{
+							type: "text",
+							text:
+								`Run ${record.runId} has no control channel` +
+								(process.platform === "win32" ? " on Windows." : " (the subagent may have exited).") +
+								" Use subagent_status / subagent_logs instead.",
+						},
+					],
+					isError: true,
+				};
 			}
 
-			if (details.mode === "parallel") {
-				const running = details.results.filter((r) => r.exitCode === -1).length;
-				const successCount = details.results.filter((r) => r.exitCode !== -1 && !isFailedResult(r)).length;
-				const stoppedCount = details.results.filter(isStoppedResult).length;
-				const failCount = details.results.filter(
-					(r) => r.exitCode !== -1 && isFailedResult(r) && !isStoppedResult(r),
-				).length;
-				const isRunning = running > 0;
-				const icon = isRunning
-					? theme.fg("warning", "⏳")
-					: stoppedCount > 0
-						? theme.fg("warning", "■")
-						: failCount > 0
-							? theme.fg("warning", "◐")
-							: theme.fg("success", "✓");
-				const status = isRunning
-					? `${successCount + failCount + stoppedCount}/${details.results.length} done, ${running} running`
-					: `${successCount} completed${stoppedCount ? ` · ${stoppedCount} stopped` : ""}${failCount ? ` · ${failCount} failed` : ""}`;
+			const sent = await sendControlCommand(record.controlSocketPath, {
+				type: "steer",
+				message: params.message,
+			});
+			if (!sent.ok) {
+				return {
+					content: [
+						{
+							type: "text",
+							text: `Could not steer run ${record.runId}: ${sent.error ?? "unknown error"}.`,
+						},
+					],
+					isError: true,
+				};
+			}
+			return {
+				content: [
+					{
+						type: "text",
+						text:
+							`Steering message queued for run ${record.runId}. ` +
+							"It is delivered at the subagent's next turn boundary.",
+					},
+				],
+			};
+		},
+	});
 
-				if (expanded && !isRunning) {
-					const container = new Container();
-					container.addChild(
-						new Text(
-							`${icon} ${theme.fg("toolTitle", theme.bold("parallel "))}${theme.fg("accent", status)}`,
-							0,
-							0,
-						),
-					);
+	pi.registerTool({
+		name: "subagent_wait",
+		label: "Subagent Wait",
+		description: [
+			"Wait for background subagents to finish and return their results.",
+			"This is the reliable way to collect results: the follow-up notification is best-effort and is",
+			"lost when the session ends first, whereas subagent_wait reads the result directly.",
+			"Waits for the given runIds, or for every running background subagent when omitted.",
+		].join(" "),
+		parameters: WaitParams,
+		renderShell: "self",
 
-					for (const r of details.results) {
-						const rIcon = isStoppedResult(r)
-							? theme.fg("warning", "■")
-							: isFailedResult(r)
-								? theme.fg("error", "✗")
-								: theme.fg("success", "✓");
-						const displayItems = getDisplayItems(r.messages, true);
-						const finalOutput = getFinalOutput(r.messages);
+		// subagent_wait carries the settled results in `details`, so this is where the
+		// transcript shows what the subagent actually did (tool calls, output, usage).
+		renderResult: (result, options, theme, context) =>
+			renderSubagentResult(result, options, context.isError, theme, fleetStore),
 
-						container.addChild(new Spacer(1));
-						container.addChild(
-							new Text(`${theme.fg("muted", "─── ") + theme.fg("accent", r.agent)} ${rIcon}`, 0, 0),
-						);
-						container.addChild(new Text(theme.fg("muted", "Task: ") + theme.fg("dim", r.task), 0, 0));
+		async execute(_toolCallId, params) {
+			// Explicitly requested ids are resolved even when the run already settled
+			// (that is the common case: wait is how the caller collects a result).
+			// Without ids, act on everything still outstanding so a finished-but-
+			// uncollected result is not silently dropped.
+			const requested = params.runIds?.length
+				? params.runIds.map((id) => backgroundRuns.get(id)).filter((r): r is NonNullable<typeof r> => Boolean(r))
+				: backgroundRuns.outstanding();
 
-						if (getToolCalls(displayItems).length > 0) {
-							addSectionTitle(container, "Activity", formatActivitySummary(displayItems));
-						}
-						addExpandedItems(container, displayItems);
-
-						if (finalOutput) {
-							addSectionTitle(container, "Result");
-							container.addChild(new Markdown(finalOutput.trim(), 1, 0, mdTheme));
-						}
-
-						const taskUsage = formatUsageStats(r.usage, r.model, r.thinkingLevel);
-						if (taskUsage) container.addChild(new Text(theme.fg("dim", taskUsage), 0, 0));
-					}
-
-					const usageStr = formatUsageStats(aggregateUsage(details.results));
-					if (usageStr) {
-						container.addChild(new Spacer(1));
-						container.addChild(new Text(theme.fg("dim", `Total: ${usageStr}`), 0, 0));
-					}
-					return shell(container);
-				}
-
-				const container = new Container();
-				container.addChild(
-					new Text(`${icon} ${theme.fg("toolTitle", theme.bold("parallel "))}${theme.fg("accent", status)}`, 0, 0),
-				);
-				for (const r of details.results) {
-					const rIcon =
-						r.exitCode === -1
-							? theme.fg("warning", "⏳")
-							: isStoppedResult(r)
-								? theme.fg("warning", "■")
-								: isFailedResult(r)
-									? theme.fg("error", "✗")
-									: theme.fg("success", "✓");
-					const displayItems = getDisplayItems(r.messages);
-					const finalOutput = getFinalOutput(r.messages);
-					container.addChild(new Spacer(1));
-					container.addChild(
-						new Text(`${theme.fg("muted", "── ")}${theme.fg("accent", r.agent)} ${rIcon}`, 0, 0),
-					);
-					addCollapsedActivity(container, displayItems, 5);
-					if (finalOutput) {
-						addSectionTitle(container, r.exitCode === -1 ? "Progress" : "Result");
-						container.addChild(new Markdown(finalOutput.trim(), 1, 0, mdTheme));
-					} else if (getToolCalls(displayItems).length === 0) {
-						container.addChild(
-							new Text(theme.fg("muted", r.exitCode === -1 ? "(running...)" : "(no output)"), 1, 0),
-						);
-					}
-				}
-				if (!isRunning) {
-					const usageStr = formatUsageStats(aggregateUsage(details.results));
-					if (usageStr) {
-						container.addChild(new Spacer(1));
-						container.addChild(new Text(theme.fg("dim", `Total: ${usageStr}`), 0, 0));
-					}
-				}
-				container.addChild(new Text(theme.fg("muted", "Ctrl+O: inspect every call and result"), 0, 0));
-				return shell(container);
+			if (requested.length === 0) {
+				const missing = params.runIds?.filter((id) => !backgroundRuns.get(id)) ?? [];
+				return {
+					content: [
+						{
+							type: "text",
+							text: missing.length
+								? `No such run(s): ${missing.join(", ")}.`
+								: "No background subagent result is outstanding.",
+						},
+					],
+				};
 			}
 
-			const text = result.content[0];
-			return shell(new Text(text?.type === "text" ? text.text : "(no output)", 0, 0));
+			const timeoutMs = params.timeoutMs && params.timeoutMs > 0 ? params.timeoutMs : 600_000;
+			let timedOut = false;
+			await Promise.race([
+				Promise.allSettled(requested.map((record) => record.settled)),
+				new Promise<void>((resolve) => {
+					const timer = setTimeout(() => {
+						timedOut = true;
+						resolve();
+					}, timeoutMs);
+					// Do not keep the process alive purely for the timeout.
+					timer.unref?.();
+				}),
+			]);
+
+			const sections = requested.map((record) => {
+				const settled = backgroundRuns.get(record.runId) ?? record;
+				const status = settled.status;
+				if (status === "running") {
+					return `### [${settled.agent}] run ${settled.runId} — still running after ${Math.round(timeoutMs / 1000)}s\n\nNo result yet. Use subagent_status or subagent_logs to inspect progress.`;
+				}
+				const output = settled.result ? getResultOutput(settled.result) : "(no result captured)";
+				return `### [${settled.agent}] run ${settled.runId} — ${status}\n\n${output}`;
+			});
+
+			const finished = requested.filter((r) => backgroundRuns.get(r.runId)?.status !== "running").length;
+			// Mark delivered results as collected so they leave the outstanding set.
+			for (const record of requested) {
+				if (backgroundRuns.get(record.runId)?.status !== "running") backgroundRuns.markCollected(record.runId);
+			}
+			const header = timedOut
+				? `Waited ${Math.round(timeoutMs / 1000)}s: ${finished}/${requested.length} finished, ${requested.length - finished} still running.`
+				: `${finished}/${requested.length} background subagent(s) finished.`;
+			// Carry the settled results in `details` so the TUI transcript and Fleet
+			// history restore can render the full record (tool calls, usage, diffs).
+			// Only settled runs have a result object to contribute. Scope metadata is
+			// taken from the runs themselves so details stay self-describing.
+			const settledRecords = requested.filter((record) => backgroundRuns.get(record.runId)?.result);
+			const settledResults = settledRecords.map((record) => backgroundRuns.get(record.runId)?.result as SingleResult);
+			const first = settledRecords[0];
+			const details: SubagentDetails | undefined = first
+				? {
+						mode: settledResults.length > 1 ? "parallel" : "single",
+						agentScope: first.agentScope,
+						projectAgentsDir: first.projectAgentsDir,
+						results: settledResults,
+					}
+				: undefined;
+			return {
+				content: [{ type: "text", text: `${header}\n\n${sections.join("\n\n---\n\n")}` }],
+				details,
+			};
 		},
 	});
 }

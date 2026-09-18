@@ -61,14 +61,23 @@ export interface FleetRun {
 	usage: FleetUsage;
 	model?: string;
 	thinkingLevel?: string;
+	/** Agent scope the run came from; restored runs may not know it. */
+	agentSource?: "user" | "project" | "unknown";
 	status: FleetRunStatus;
 	stopping?: boolean;
 	startedAt: number;
 	endedAt?: number;
+	/**
+	 * True only for runs started in this session. Restored history has no live
+	 * process behind it, and its `id` is re-assigned on restore, so it must never
+	 * satisfy a runId lookup — an old transcript's runId would otherwise resolve
+	 * to an unrelated run whose id happens to collide.
+	 */
+	live: boolean;
 	stop: () => boolean;
 }
 
-export type RestoredFleetRun = Omit<FleetRun, "id" | "stop" | "status" | "toolUpdates" | "streamingParts" | "streamingReset" | "streamingDeltas"> & {
+export type RestoredFleetRun = Omit<FleetRun, "id" | "stop" | "status" | "toolUpdates" | "streamingParts" | "streamingReset" | "streamingDeltas" | "live"> & {
 	status: Exclude<FleetRunStatus, "running">;
 	toolUpdates?: Record<string, FleetToolUpdate>;
 };
@@ -86,7 +95,7 @@ export class FleetStore {
 	private listeners = new Set<FleetListener>();
 	private nextId = 1;
 
-	add(run: Omit<FleetRun, "id" | "status" | "startedAt" | "streamingParts" | "streamingReset" | "streamingDeltas">): FleetRun {
+	add(run: Omit<FleetRun, "id" | "status" | "startedAt" | "streamingParts" | "streamingReset" | "streamingDeltas" | "live">): FleetRun {
 		const entry: FleetRun = {
 			...run,
 			streamingParts: [],
@@ -95,6 +104,7 @@ export class FleetStore {
 			id: String(this.nextId++),
 			status: "running",
 			startedAt: Date.now(),
+			live: true,
 		};
 		this.runs.push(entry);
 		this.prune();
@@ -111,6 +121,8 @@ export class FleetStore {
 			streamingParts: [],
 			streamingReset: 0,
 			streamingDeltas: [],
+			// Restored runs have no live process; see the `live` field docs.
+			live: false,
 			stop: () => false,
 		}));
 		this.runs = [...restoredRuns, ...activeRuns];

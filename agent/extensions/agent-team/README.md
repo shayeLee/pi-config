@@ -122,7 +122,7 @@ pi --mode json -p --no-session
 
 子进程工作目录按以下顺序确定：
 
-1. 当前任务或 chain step 上显式提供的 `cwd`。
+1. 当前任务上显式提供的 `cwd`。
 2. 主代理调用工具时的 `ctx.cwd`。
 
 ## JSON 事件采集
@@ -166,7 +166,7 @@ Pi JSON 模式按行输出事件。扩展解析每一行，并主要采集：
 }
 ```
 
-扩展启动一个子进程。主代理收到该子代理最后一条 assistant 文本；完整消息记录保存在 `details.results[0]`。
+立即返回一个 `runId`。用 `subagent_wait` 收取结果，完整消息记录保存在它返回的 `details.results[0]`。
 
 ### Parallel
 
@@ -184,34 +184,19 @@ Pi JSON 模式按行输出事件。扩展解析每一行，并主要采集：
 关键行为：
 
 - 一次最多接收 8 个任务。
-- 最多同时运行 4 个子进程。
-- 最终结果保持输入任务的顺序，而不是完成顺序。
-- 主代理收到每个任务的状态和最终 assistant 文本。
-- 每个任务返回给主代理的文本上限为 50 KiB；完整文本仍保存在 `details` 中。
+- 每个任务都是**独立的后台 run**，各自有 `runId`，可单独 supervise / stop。
+- 立即返回全部 `runId`；用无参 `subagent_wait` 一次收齐全部结果。
+- 任务立即全部启动，不受固定的并发上限约束。
 - 单个任务失败不会阻止其他并行任务完成。
 
-### Chain
+### 顺序执行
 
-输入：
+需要顺序执行时，由主代理自己调度：先跑一个子代理，用 `subagent_wait` 拿到结果，
+再把该结果写进下一个子代理的 `task` 里。
 
-```json
-{
-  "chain": [
-    { "agent": "worker", "task": "调查问题" },
-    { "agent": "reviewer", "task": "根据以下结果复核：\n{previous}" }
-  ]
-}
-```
+这样每一步的输入与验证都是显式的，主代理可以在任意一步改方向、停止或放弃后续步骤。
 
-关键行为：
-
-- 每一步都启动新的无会话 Pi 子进程。
-- 步骤按顺序执行。
-- `{previous}` 只代表紧邻上一步的最终 assistant 文本，不包含其完整消息、工具结果或 `details`。
-- `{previous}` 是可选占位符；未写入占位符时，该步骤不会收到上一步文本。
-- 上一步文本通过函数替换按字面量注入，因此 `$$`、`$&`、``$` ``、`$'` 等 JavaScript replacement 特殊序列不会被改写。
-- 任一步被当前失败判定识别为失败时，chain 立即停止。
-- chain 完成后，主代理只收到最后一步的最终 assistant 文本；所有步骤记录保存在 `details.results` 中。
+> 历史兼容：旧 session 中记录的 chain 结果仍可被恢复与渲染（只读）。
 
 ## 主代理可见结果
 
@@ -237,7 +222,7 @@ TUI 使用独立的轻量展示，不铺满工具成功/失败背景色。折叠
 - `Result` 使用 Markdown 渲染子代理最终结论；
 - 流式执行期间显示 `running` / `Progress`，不会提前显示成功状态。
 
-按 `Ctrl+O` 可展开完整调用轨迹，查看保存于 `details` 的每次工具调用、对应结果和各步骤消息。Single、Parallel 和 Chain 使用相同的分区与状态语义。
+按 `Ctrl+O` 可展开完整调用轨迹，查看保存于 `details` 的每次工具调用、对应结果和各步骤消息。Single 和 Parallel 使用相同的分区与状态语义。
 
 `renderCall` 和 `renderResult` 只控制 Pi TUI 展示，不改变主代理实际收到的 `content`，也不自动改变 pi-web 等其他宿主的渲染方式。
 
@@ -263,17 +248,87 @@ TUI 会在编辑器下方显示当前 session 的 FleetView：
 
 进入对话详情时会临时启用终端 mouse tracking，返回列表或关闭浮层时恢复；agent 列表不响应触摸板滑动。Warp 需要先在 `Settings → Features` 开启 `Enable Mouse Reporting` 和 `Scroll Reporting`；按住 `Shift` 滚动或选择时，事件交还给 Warp。
 
-停止操作针对单个子进程：在 POSIX 平台向独立进程组发送 `SIGTERM`，5 秒后仍有成员则发送 `SIGKILL`；已退出组长的后代仍会被该进程组信号覆盖。Windows 使用 `taskkill /T` 尝试终止进程树；这属于 best-effort，若根进程已先退出，后代可能无法被可靠发现或终止。已采集的消息和部分输出会保留，终态标记为 `stopped`，与正常完成和失败分开显示。Parallel 中停止一个任务不会终止其他任务；Chain 中停止当前步骤会结束整条 chain，不再启动后续步骤。
+停止操作针对单个子进程：在 POSIX 平台向独立进程组发送 `SIGTERM`，5 秒后仍有成员则发送 `SIGKILL`；已退出组长的后代仍会被该进程组信号覆盖。Windows 使用 `taskkill /T` 尝试终止进程树；这属于 best-effort，若根进程已先退出，后代可能无法被可靠发现或终止。已采集的消息和部分输出会保留，终态标记为 `stopped`，与正常完成和失败分开显示。Parallel 中停止一个任务不会终止其他任务。
 
-FleetView、对话浮层和运行注册表只消费现有的 JSON 事件与 `SingleResult` 引用，不改变主代理收到的 `content`、结构化 `details` 或 `{previous}` 传递规则。当前子进程仍使用一次性的 `--no-session` print 模式，不支持运行中 steer。
+FleetView、对话浮层和运行注册表只消费现有的 JSON 事件与 `SingleResult` 引用，不改变主代理收到的 `content` 或结构化 `details`。
+
+## 后台子代理与运行中 steer
+
+每个 `subagent` 调用立即返回一个 `runId`，子代理继续在后台执行。
+
+⚠️ **子代理的输出不在 `subagent` 的返回值里**，用 `subagent_wait` 收取。
+
+⚠️ **不要在自己依赖其结果的子代理仍在运行时结束回合**：回合结束后 session 可能被销毁，
+提醒会丢失（结果本身仍可由 `subagent_wait` 取回）。
+
+```json
+{ "agent": "worker", "task": "..." }
+```
+
+`single` 与 `parallel` 行为一致：都是后台启动、都通过 `subagent_wait` 收口。
+
+### 控制工具
+
+| 工具 | 作用 |
+| --- | --- |
+| `subagent_wait` | **收取结果**。传入 `runIds` 等待指定 run；不传则等待所有「仍在运行或结果尚未被收取」的 run（包括 parallel 的全部任务）。带 `timeoutMs`（默认 10 分钟）。 |
+| `subagent_status` | 列出全部后台 run，或查询单个 run 的状态（running / completed / failed / stopped / interrupted）。 |
+| `subagent_logs` | 读取 run 的消息记录：已结束的 run 返回最终报告，运行中的 run 返回目前已采集的消息。可用 `tail` 限制条数。 |
+| `subagent_stop` | 停止运行中的 run。复用与浮层相同的终止链（SIGTERM → 5 秒 → SIGKILL），已采集的消息保留，终态为 `stopped`。 |
+| `subagent_steer` | 向运行中的 run 发送指令，**在下一个回合边界投递**（当前 assistant 回合执行完工具调用后、下一次 LLM 调用前）。 |
+
+典型流程：先发起一个或多个子代理 → 期间可以继续工作或再发起 → 用 `subagent_wait` 收齐结果后再下结论。
+
+### 未被收取的结果提醒
+
+子代理结束后，如果其结果一直没被收取，扩展会发一条 `followUp` 提醒主代理去 `subagent_wait`。
+提醒有两个触发时机，因为 run 可能在任一时点结束：
+
+- **回合进行中结束**：不打断当前工作，等到回合结束（`agent_settled`）再检查。此时主代理通常已经用 `subagent_wait` 收取了，于是**什么也不发**；只有真正漏收的 run 才会被提醒。
+- **回合已空闲时结束**：没有别的东西会唤醒主代理，立即提醒。
+
+所以**正常使用（用 `subagent_wait` 收口）不会有任何提醒消息**；提醒只在遗漏时出现，且同一个 run 只提醒一次。
+
+提醒本身是尽力而为的：
+
+- **TUI 交互模式**：session 长驻，提醒能送达；
+- **`-p` / `--mode json` 非交互模式**：回合结束后 pi 会 dispose session（abort agent + 使扩展 ctx 失效）并退出，提醒会因 ctx 失效而失败。
+
+提醒失败不会报错，结果也不会丢：始终可以用 `subagent_wait` / `subagent_logs` / `subagent_status` 按 `runId` 取回。
+**依赖结果时用 `subagent_wait`，不要依赖提醒。**
+
+### steer 的语义边界
+
+`steer` 是**改方向**，不是**急停**：
+
+- 指令在子代理当前回合结束后才生效，不会中断正在进行的生成或工具调用；
+- 对 worker / reviewer 这类多轮工具调用的子代理足够及时（每个回合边界都会检查）；
+- 若子代理是「一次长生成」，steer 必须等它生成完才生效。
+
+需要**立即停止**时用 `subagent_stop`。
+
+### 实现说明
+
+后台 run 通过 `SUBAGENT_CONTROL_SOCKET`（Unix domain socket）接收 steer 指令：子进程内
+注入的 `control-ext.js` 监听该 socket，收到命令后调用 `pi.sendUserMessage(msg, { deliverAs: "steer" })`。
+
+继续使用 `--mode json` 而非 RPC 模式，原因是 JSON 模式下 `ctx.hasUI === false`：RPC 模式下
+`hasUI` 为 `true`，扩展的对话框请求若无人应答，会让子进程在启动阶段静默 `exit 0`
+（事件循环排空触发 `beforeExit`），极难排查。
+
+`control-ext.js` 在 `agent_settled` 时关闭 socket listener——`net.Server` 会让 Node 事件循环
+常驻，不关闭会导致子进程永不退出、父进程永久挂起。
+
+后台 run **不绑定**父代理的 abort signal：父回合结束不应误杀后台子代理，停止只通过
+`subagent_stop`。Windows 无 AF_UNIX，`subagent_steer` 会明确返回「无控制通道」，其余工具正常。当前子进程仍使用一次性的 `--no-session` print 模式，不支持运行中 steer。
 
 ## 自动化测试
 
 `harness/` 下的独立 Node harness（全程不调用真实模型）守护核心原则的两层，外加角色发现的覆盖规则：
 
 - `harness/run.mjs`（数据流）：加载真实 `index.ts`，用临时 fake `pi` 可执行文件驱动子代理，
-  断言数据流产物语义——`tool_result_end` 兼容与去重、transient 事件隔离、chain `{previous}`
-  不泄漏中间过程，以及停止流程（AbortSignal 中止 → SIGTERM → 5 秒后 SIGKILL 升级、
+  断言数据流产物语义——`tool_result_end` 兼容与去重、transient 事件隔离、parallel 每任务一个
+  后台 run、`subagent_wait` 收口、停止流程（AbortSignal 中止 → SIGTERM → 5 秒后 SIGKILL 升级、
   `exitCode 130` / `stopped` 状态、组长退出后同组后代仍被进程组信号终止）。
 - `harness/presentation.mjs`（展示层）：加载 `fleet-store.ts` / `fleet-view.ts` /
   `fleet-web.ts`，断言展示层作为只读消费者的行为——静态依赖边界（数据流层只从
@@ -286,6 +341,13 @@ FleetView、对话浮层和运行注册表只消费现有的 JSON 事件与 `Sin
 node agent/extensions/agent-team/harness/run.mjs
 node agent/extensions/agent-team/harness/presentation.mjs
 node agent/extensions/agent-team/harness/overrides.mjs
+
+# 机制验证：JSON 模式下的 socket 侧信道 steer（mock 模式无需凭证）
+python3 agent/extensions/agent-team/harness/steer-spike.py
+python3 agent/extensions/agent-team/harness/steer-spike.py --real
+
+# 真实模型端到端：background + status/logs/stop + steer
+python3 agent/extensions/agent-team/harness/background-e2e.py
 ```
 
 ## 真实 Pi 冒烟清单（剩余手测项）
