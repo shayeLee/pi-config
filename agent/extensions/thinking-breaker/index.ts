@@ -44,9 +44,12 @@ type AgentMessageLike = MessageEndEvent["message"];
 import {
 	TailWindow,
 	capKeptPrefix,
+	detectLineCollapse,
 	detectTailPeriod,
 	shouldBreak,
+	shouldBreakCollapse,
 	stripAllLoopTail,
+	type CollapseHit,
 	type TailPeriod,
 } from "./detect.ts";
 import { ESCALATE_EVENT, type EscalateReply, type EscalateRequest } from "./escalate.ts";
@@ -80,8 +83,18 @@ interface ProbeConfig {
 	enforceMinRepeats: number;
 	/** 熔断所需的最小思考长度；太短的思考不值得动手。 */
 	enforceMinChars: number;
-	/** 复读单元长度上限，与观测阈值保持一致。 */
+	/** 复读单元长度上限（探针 A）。 */
 	enforceMaxPeriod: number;
+	/** 复读单元长度下限（探针 A）：period < 8 视为未命中，逐字复读交由探针 B。 */
+	enforceMinPeriod: number;
+	/** 探针 B 的尾部窗口字符数（词表塌缩）。 */
+	enforceCollapseWindowChars: number;
+	/** 探针 B：非空行数下限。 */
+	enforceCollapseMinLines: number;
+	/** 探针 B：不同行数上限。 */
+	enforceCollapseMaxDistinct: number;
+	/** 探针 B：重复行占非空行的最低比例。 */
+	enforceCollapseMinRepeatRatio: number;
 	/** 流式检测的节流间隔（ms）。一次事故有 10 万个 delta，绝不能逐个检测。 */
 	enforceCheckIntervalMs: number;
 	/** 熔断后回灌给下一个模型的思考前缀上限（字符）。 */
@@ -102,7 +115,12 @@ const DEFAULT_CONFIG: ProbeConfig = {
 	enforce: false,
 	enforceMinRepeats: 10,
 	enforceMinChars: 20_000,
-	enforceMaxPeriod: 200,
+	enforceMaxPeriod: 600,
+	enforceMinPeriod: 8,
+	enforceCollapseWindowChars: 1500,
+	enforceCollapseMinLines: 40,
+	enforceCollapseMaxDistinct: 12,
+	enforceCollapseMinRepeatRatio: 0.75,
 	enforceCheckIntervalMs: 750,
 	enforceKeepPrefixChars: 4_000,
 	enforceEscalateAfter: 2,
@@ -130,6 +148,23 @@ function loadConfig(raw: unknown): ProbeConfig {
 		enforceMinRepeats: num(r.enforceMinRepeats, DEFAULT_CONFIG.enforceMinRepeats),
 		enforceMinChars: num(r.enforceMinChars, DEFAULT_CONFIG.enforceMinChars),
 		enforceMaxPeriod: num(r.enforceMaxPeriod, DEFAULT_CONFIG.enforceMaxPeriod),
+		enforceMinPeriod: num(r.enforceMinPeriod, DEFAULT_CONFIG.enforceMinPeriod),
+		enforceCollapseWindowChars: num(
+			r.enforceCollapseWindowChars,
+			DEFAULT_CONFIG.enforceCollapseWindowChars,
+		),
+		enforceCollapseMinLines: num(
+			r.enforceCollapseMinLines,
+			DEFAULT_CONFIG.enforceCollapseMinLines,
+		),
+		enforceCollapseMaxDistinct: num(
+			r.enforceCollapseMaxDistinct,
+			DEFAULT_CONFIG.enforceCollapseMaxDistinct,
+		),
+		enforceCollapseMinRepeatRatio: num(
+			r.enforceCollapseMinRepeatRatio,
+			DEFAULT_CONFIG.enforceCollapseMinRepeatRatio,
+		),
 		enforceCheckIntervalMs: num(r.enforceCheckIntervalMs, DEFAULT_CONFIG.enforceCheckIntervalMs),
 		enforceKeepPrefixChars: num(r.enforceKeepPrefixChars, DEFAULT_CONFIG.enforceKeepPrefixChars),
 		enforceEscalateAfter: num(r.enforceEscalateAfter, DEFAULT_CONFIG.enforceEscalateAfter),
@@ -294,12 +329,33 @@ function shorten(value: string, max = 4000): string {
 }
 
 /**
- * dry-run 判定：只依靠“思考原文的尾部周期复读”，不看思考时长/ token 量。
+ * 观测/落盘用的尾部周期参数。与熔断判定同源（`enforceMaxPeriod` / `minPeriod`），
+ * 否则会出现“日志说没命中，实际熔断却命中了”的日志与判定不一致。
+ */
+function tailDetectOptions(config: ProbeConfig): {
+	windowChars: number;
+	maxPeriod: number;
+	minPeriod: number;
+} {
+	return {
+		windowChars: config.enforceMaxPeriod * 10,
+		maxPeriod: config.enforceMaxPeriod,
+		minPeriod: config.enforceMinPeriod,
+	};
+}
+
+/** dry-run / `/breaker` 展示用的判定结果：与熔断同源的两个探针。 */
+type RepetitionVerdict =
+	| { kind: "tail"; period: number; repeats: number; tailChars: number }
+	| { kind: "collapse"; lines: number; distinct: number; repeatRatio: number };
+
+/**
+ * dry-run 判定：两个探针并联，任一命中即返回（与 `maybeBreak` 同一套参数）。
  * 返回 null 表示无异常。
  *
  * 判定纪律：
  *   - 必须真的拿到思考原文（否则无从判断，宁可不动）；
- *   - 只接受尾部连续重复，不靠全篇词频（全篇词频对模板化枚举有误报）。
+ *   - 只接受**尾部**信号，不靠全篇词频（全篇词频对模板化枚举有误报）。
  *
  * 这里不再看 deltaMode：传入的是 message_end 里 provider 给出的**权威全文**，
  * 不是拼接 delta 得到的，增量/累计与它无关。旧代码沿用 delta 时代的门槛，
@@ -308,11 +364,66 @@ function shorten(value: string, max = 4000): string {
 function evaluateRepetition(
 	thinkingText: string,
 	minRepeats: number,
-): { kind: "tail"; period: number; repeats: number; tailChars: number } | null {
+	config: ProbeConfig,
+): RepetitionVerdict | null {
 	if (thinkingText.length === 0) return null;
-	const tail = detectTailPeriod(thinkingText);
-	if (!tail || tail.repeats < minRepeats) return null;
-	return { kind: "tail", ...tail };
+	const tail = detectTailPeriod(thinkingText, tailDetectOptions(config));
+	if (tail && tail.repeats >= minRepeats) return { kind: "tail", ...tail };
+	// 周期探针未命中（或重复次数不够）时再看词表塌缩：它管的是“无精确周期”的
+	// 行级复读，是另一条独立信号。
+	const collapse = detectLineCollapse(thinkingText, collapseOptions(config));
+	if (collapse) return { kind: "collapse", ...collapse };
+	return null;
+}
+
+/**
+ * 探针命中：并联两个探针，任一命中即熔断。
+ *
+ *   - `"period"`   —— 尾部精确周期复读（探针 A，`detectTailPeriod`）
+ *   - `"collapse"` —— 尾部窗口词表塌缩（探针 B，`detectLineCollapse`）
+ *
+ * 用判别联合而不是可选字段：notify 文案、escalate 的 `evidence`、落盘的 `break`
+ * 都要能区分是哪一种命中，并只读该种命中真实存在的数值。
+ */
+type BreakHit = ({ kind: "period" } & TailPeriod) | ({ kind: "collapse" } & CollapseHit);
+
+/** 判别联合收窄：周期型命中才有 `period` / `repeats`。 */
+function isPeriodHit(hit: BreakHit): hit is { kind: "period" } & TailPeriod {
+	return hit.kind === "period";
+}
+
+/** 从配置取探针 B 的参数。dry-run / 落盘也走同一组值，保证日志与判定一致。 */
+function collapseOptions(config: ProbeConfig): {
+	windowChars: number;
+	minLines: number;
+	maxDistinct: number;
+	minRepeatRatio: number;
+} {
+	return {
+		windowChars: config.enforceCollapseWindowChars,
+		minLines: config.enforceCollapseMinLines,
+		maxDistinct: config.enforceCollapseMaxDistinct,
+		minRepeatRatio: config.enforceCollapseMinRepeatRatio,
+	};
+}
+
+/**
+ * 尾部缓冲区大小 = 两个探针需求的较大值。
+ *
+ * 缓冲区是**共享**的：探针 A 的窗口是 `enforceMaxPeriod * 10`，探针 B 的窗口是
+ * `enforceCollapseWindowChars`，两者都从同一个 `TailWindow` 的尾部取文本。若只
+ * 按探针 A 定尺寸，用户把 `enforceMaxPeriod` 调小（如 100 → 1000 字符）而
+ * `enforceCollapseWindowChars` 仍是 1500 时，探针 B 就永远只能看到 1000 字符，
+ * 形同被饿死。取较大值即解耦这两个配置。
+ *
+ * 注意：缓冲区变大**不会**放宽探针 A 的周期搜索范围 —— `maybeBreak` 仍向
+ * `shouldBreak` 传自己的 `maxPeriod: enforceMaxPeriod`，只是可用的尾部文本更长。
+ */
+function tailWindowChars(sizes: {
+	enforceMaxPeriod: number;
+	enforceCollapseWindowChars: number;
+}): number {
+	return Math.max(sizes.enforceMaxPeriod * 10, sizes.enforceCollapseWindowChars);
 }
 // ---------------------------------------------------------------- 流式累加器
 
@@ -343,7 +454,7 @@ interface StreamStats {
 	/** 上次检测的时间戳，用于节流。 */
 	lastCheckAt: number;
 	/** 命中后打上标记，供 message_end 识别“这次 abort 是我们自己干的”。 */
-	abortHit: TailPeriod | null;
+	abortHit: BreakHit | null;
 	/** 命中时的已产出字符数。 */
 	abortChars: number;
 	/** 命中时的连续命中次数。 */
@@ -527,6 +638,10 @@ export default function thinkingBreaker(pi: ExtensionAPI) {
 	 *   - 节流：每 `enforceCheckIntervalMs` 才跑一次周期性检测
 	 *     （一次事故有 10 万个 delta，逐个检测是 O(n²)）
 	 *   - 窗口内容取自 partial 权威全文，不存在增量/累计的歧义
+	 *
+	 * 两个探针**并联**（命中任一即熔断）：
+	 *   - A：尾部精确周期（`shouldBreak`），管小周期变体轮换；
+	 *   - B：尾部词表塌缩（`shouldBreakCollapse`），管无精确周期的行级复读。
 	 */
 	const maybeBreak = (ctx: ExtensionContext): void => {
 		if (!enforceEnabled) return;
@@ -538,30 +653,56 @@ export default function thinkingBreaker(pi: ExtensionAPI) {
 		if (now - stats.lastCheckAt < config.enforceCheckIntervalMs) return;
 		stats.lastCheckAt = now;
 
+		// 探针 A：尾部周期。缓冲区尺寸取两个探针需求的较大值（见 tailWindowChars），
+		// 因此传给探针 A 的 `windowChars` 就是该共享缓冲区尺寸；但周期搜索范围仍由
+		// 它自己的 `maxPeriod` 封顶（`detectTailPeriod` 内部取 min），缓冲区变大只
+		// 提供更多可用尾部文本，不会放宽周期上限。
+		const windowChars = tailWindowChars(config);
 		const decision = shouldBreak(stats.window.tail, stats.window.totalChars, {
 			minRepeats: config.enforceMinRepeats,
 			minChars: config.enforceMinChars,
 			maxPeriod: config.enforceMaxPeriod,
-			windowChars: config.enforceMaxPeriod * 10,
+			windowChars,
+			minPeriod: config.enforceMinPeriod,
 		});
-		if (!decision) return;
+		// 探针 B：尾部词表塌缩。它自带 `windowChars` 截断，因此共享缓冲区只需
+		// 保证不短于该值（tailWindowChars 取了二者的较大值）。
+		const collapse = shouldBreakCollapse(stats.window.tail, stats.window.totalChars, {
+			minChars: config.enforceMinChars,
+			...collapseOptions(config),
+		});
+		const hit: BreakHit | null = decision
+			? { kind: "period", ...decision.hit }
+			: collapse
+				? { kind: "collapse", ...collapse.hit }
+				: null;
+		if (!hit) return;
 
 		const key = `${stats.provider}/${stats.model}`;
 		const strikes = (strikesByModel.get(key) ?? 0) + 1;
 		strikesByModel.set(key, strikes);
-		stats.abortHit = decision.hit;
-		stats.abortChars = decision.chars;
+		stats.abortHit = hit;
+		stats.abortChars = stats.window.totalChars;
 		stats.abortStrikes = strikes;
 
 		// 先打标记再 abort：message_end 会紧跟在 abort 后面触发，
 		// 标记必须在那之前就位，否则会被误认为“用户按了 Esc”。
+		const detail = isPeriodHit(hit)
+			? `尾部连续重复 ${hit.repeats} 次（单元 ${hit.period} 字符）`
+			: `尾部词表塌缩（不同行 ${hit.distinct} / 非空行 ${hit.lines}，重复行占比 ${hit.repeatRatio.toFixed(2)}）`;
 		ctx.ui.notify(
-			`🔁 [thinking-breaker] ${key} 思考尾部连续重复 ${decision.hit.repeats} 次` +
-				`（单元 ${decision.hit.period} 字符，已产出 ${decision.chars} 字符），已中止本轮`,
+			`🔁 [thinking-breaker] ${key} 思考${detail}，` +
+				`已产出 ${stats.abortChars} 字符，已中止本轮`,
 			"warning",
 		);
 		ctx.abort();
 	};
+
+	/** 命中的人读描述：周期型给次数+单元长度，塌缩型给行数/占比。 */
+	const hitSummary = (hit: BreakHit): string =>
+		isPeriodHit(hit)
+			? `连续 ${hit.repeats} 次（单元 ${hit.period} 字符）`
+			: `词表塌缩（不同行 ${hit.distinct} / 非空行 ${hit.lines}，重复行占比 ${hit.repeatRatio.toFixed(2)}）`;
 
 	/**
 	 * 续跑指令。
@@ -569,9 +710,9 @@ export default function thinkingBreaker(pi: ExtensionAPI) {
 	 * 不说“你刚才复读了”——那会让模型开始解释自己的行为，又浪费一轮。直接给一个
 	 * 动作要求，并保留任务上下文。
 	 */
-	const continuationText = (modelKey: string, repeats: number) =>
+	const continuationText = (modelKey: string, summary: string) =>
 		`[thinking-breaker] 上一个模型(${modelKey})在思考中反复重复同一段内容` +
-		`（连续 ${repeats} 次）而被中止，未产出任何结果。` +
+		`（${summary}）而被中止，未产出任何结果。` +
 		`请基于已有的工具结果直接继续当前任务，不要重复已完成的步骤，也不要解释这次中止。`;
 
 	/**
@@ -590,7 +731,8 @@ export default function thinkingBreaker(pi: ExtensionAPI) {
 		strippedChars: number,
 	): Promise<void> => {
 		const key = `${stats.provider}/${stats.model}`;
-		const repeats = stats.abortHit?.repeats ?? 0;
+		const hit = stats.abortHit;
+		const summary = hit ? hitSummary(hit) : "反复重复";
 		const shouldEscalate = config.enforceEscalateAfter > 0 && stats.abortStrikes >= config.enforceEscalateAfter;
 
 		if (shouldEscalate) {
@@ -602,7 +744,7 @@ export default function thinkingBreaker(pi: ExtensionAPI) {
 		}
 
 		try {
-			pi.sendUserMessage(continuationText(key, repeats), { deliverAs: "steer" });
+			pi.sendUserMessage(continuationText(key, summary), { deliverAs: "steer" });
 		} catch {
 			ctx.ui.notify("[thinking-breaker] 自动续跑失败，请手动继续", "error");
 		}
@@ -638,14 +780,24 @@ export default function thinkingBreaker(pi: ExtensionAPI) {
 				key,
 				reason: "thinking_loop",
 				note:
-					`思考尾部连续重复 ${hit.repeats} 次（单元 ${hit.period} 字符，` +
-					`已产出 ${stats.abortChars} 字符，剥掉 ${strippedChars} 字符）`,
-				evidence: {
-					period: hit.period,
-					repeats: hit.repeats,
-					chars: stats.abortChars,
-					strikes: stats.abortStrikes,
-				},
+					`思考${hitSummary(hit)}，` +
+					`已产出 ${stats.abortChars} 字符，剥掉 ${strippedChars} 字符`,
+				evidence: isPeriodHit(hit)
+					? {
+							kind: "period",
+							period: hit.period,
+							repeats: hit.repeats,
+							chars: stats.abortChars,
+							strikes: stats.abortStrikes,
+						}
+					: {
+							kind: "collapse",
+							distinct: hit.distinct,
+							lineCount: hit.lines,
+							repeatRatio: hit.repeatRatio,
+							chars: stats.abortChars,
+							strikes: stats.abortStrikes,
+						},
 				accept: (reply: EscalateReply) => {
 					if (settled) return;
 					settled = true;
@@ -709,7 +861,7 @@ export default function thinkingBreaker(pi: ExtensionAPI) {
 			if ((message as { role?: unknown }).role !== "assistant") return;
 			const provider = String((message as { provider?: unknown }).provider ?? ctx.model?.provider ?? "unknown");
 			const model = String((message as { model?: unknown }).model ?? ctx.model?.id ?? "unknown");
-			current = newStreamStats(provider, model, config.enforceMaxPeriod * 10);
+			current = newStreamStats(provider, model, tailWindowChars(config));
 			current.turnIndex = currentTurn;
 		});
 	});
@@ -842,8 +994,36 @@ export default function thinkingBreaker(pi: ExtensionAPI) {
 
 			const tokenRepeat = analyzeTokenRepeat(thinking.text);
 			const lineRepeat = analyzeLineRepeat(thinking.text);
-			const tailPeriod = detectTailPeriod(thinking.text);
-			const verdict = evaluateRepetition(thinking.text, config.alertMinRepeats);
+			// 观测/落盘与熔断判定同源：参数取自 enforce 配置，不再用 DEFAULT_TAIL_OPTIONS，
+			// 否则会出现“日志说未命中、实际却熔断了”的不一致。
+			const tailPeriod = detectTailPeriod(thinking.text, tailDetectOptions(config));
+			const collapse = detectLineCollapse(thinking.text, collapseOptions(config));
+			const verdict = evaluateRepetition(thinking.text, config.alertMinRepeats, config);
+
+			/**
+			 * 熔断台账：区分哪个探针命中。周期型保留原有字段（`hitPeriod` /
+			 * `hitRepeats`，旧账本与回归测试按这些读），塌缩型另给 distinct / lineCount /
+			 * repeatRatio；`hitKind` 总是存在，便于读日志时一眼分辨。
+			 */
+			const breakRecord = (): Record<string, unknown> => {
+				const hit = stats.abortHit;
+				const base = {
+					charsAtHit: stats.abortChars,
+					strikes: stats.abortStrikes,
+					strippedChars,
+					savedMs: Date.now() - stats.startedAt,
+				};
+				if (!hit) return { ...base, hitKind: "none" };
+				return isPeriodHit(hit)
+					? { ...base, hitKind: "period", hitPeriod: hit.period, hitRepeats: hit.repeats }
+					: {
+							...base,
+							hitKind: "collapse",
+							hitDistinct: hit.distinct,
+							hitLineCount: hit.lines,
+							hitRepeatRatio: hit.repeatRatio,
+						};
+			};
 
 			// —— 熔断收尾 ——
 			// 我们自己在流式过程中 abort 的消息（stats.abortHit 非空）需要：
@@ -914,19 +1094,12 @@ export default function thinkingBreaker(pi: ExtensionAPI) {
 					token: tokenRepeat,
 					line: lineRepeat,
 					tail: tailPeriod,
+					/** 探针 B（词表塌缩）的尾部窗口观测值。 */
+					collapse,
 				},
 				verdict,
 				/** 熔断台账：仅在真的动手时有值。 */
-				break: enforced
-					? {
-							hitPeriod: stats.abortHit?.period,
-							hitRepeats: stats.abortHit?.repeats,
-							charsAtHit: stats.abortChars,
-							strikes: stats.abortStrikes,
-							strippedChars,
-							savedMs: Date.now() - stats.startedAt,
-						}
-					: undefined,
+				break: enforced ? breakRecord() : undefined,
 			};
 
 			await appendJsonl(ledgerPath(new Date()), record, config.maxFileBytes);
@@ -958,14 +1131,22 @@ export default function thinkingBreaker(pi: ExtensionAPI) {
 			// dry-run：只提示，不 abort / 不 block / 不改消息。
 			if (config.dryRunAlert && verdict) {
 				alertCount += 1;
-				const unit = thinking.text.slice(-verdict.period).replace(/\s+/g, " ").trim().slice(0, 40);
+				// 两种命中的描述必须分开构造：塌缩型没有 `period`，
+				// 若沿用 `thinking.text.slice(-verdict.period)` 会切片 undefined 而崩溃。
+				const detail =
+					verdict.kind === "tail"
+						? `尾部连续重复 ${verdict.repeats} 次（单元 “${thinking.text
+								.slice(-verdict.period)
+								.replace(/\s+/g, " ")
+								.trim()
+								.slice(0, 40)}”，共 ${verdict.tailChars} 字符）`
+						: `尾部词表塌缩（不同行 ${verdict.distinct} / 非空行 ${verdict.lines}，重复行占比 ${verdict.repeatRatio.toFixed(2)}）`;
 				// 文案必须区分两种模式：熔断开着却说“仅观测”会把排查带偏。
 				const suffix = enforceEnabled
 					? "本轮未熔断（可能未达字符/重复阈值，或已产出工具调用）。详情: /breaker"
 					: "本次仅观测，未拦截。详情: /breaker";
 				ctx.ui.notify(
-					`🔁 [thinking-breaker${enforceEnabled ? "" : " dry-run"}] ${stats.provider}/${stats.model} 思考尾部连续重复 ` +
-						`${verdict.repeats} 次（单元 “${unit}”，共 ${verdict.tailChars} 字符）。\n` +
+					`🔁 [thinking-breaker${enforceEnabled ? "" : " dry-run"}] ${stats.provider}/${stats.model} 思考${detail}。\n` +
 						suffix,
 					"warning",
 				);
@@ -1045,8 +1226,9 @@ export default function thinkingBreaker(pi: ExtensionAPI) {
 			);
 			lines.push(
 				`熔断: ${enforceEnabled ? "开" : "关（/breaker enforce on 开启）"}` +
-					`（阈值 ${config.enforceMinRepeats} 次 / ${config.enforceMinChars} 字符，` +
-					`第 ${config.enforceEscalateAfter} 次命中换模型）`,
+					`（探针A: 连续 ${config.enforceMinRepeats} 次 / 单元 ${config.enforceMinPeriod}-${config.enforceMaxPeriod} 字符 · ` +
+					`探针B: ${config.enforceCollapseWindowChars} 字符窗口内不同行 ≤${config.enforceCollapseMaxDistinct} / 非空行 ≥${config.enforceCollapseMinLines}，` +
+					`${config.enforceMinChars} 字符起判，第 ${config.enforceEscalateAfter} 次命中换模型）`,
 			);
 			if (breakStats.count > 0) {
 				lines.push(
@@ -1101,6 +1283,7 @@ export default function thinkingBreaker(pi: ExtensionAPI) {
 					redacted: number;
 					modes: Set<string>;
 					maxTailRepeats: number;
+					collapseHits: number;
 					providers: Map<string, number>;
 				}
 			>();
@@ -1120,6 +1303,7 @@ export default function thinkingBreaker(pi: ExtensionAPI) {
 						redacted: 0,
 						modes: new Set<string>(),
 						maxTailRepeats: 0,
+						collapseHits: 0,
 						providers: new Map<string, number>(),
 					};
 				row.n += 1;
@@ -1129,6 +1313,7 @@ export default function thinkingBreaker(pi: ExtensionAPI) {
 				const usage = (record.usage ?? {}) as Record<string, unknown>;
 				const repeat = (record.repeat ?? {}) as Record<string, unknown>;
 				const tail = (repeat.tail ?? undefined) as { repeats?: number } | undefined;
+				const collapse = (repeat.collapse ?? undefined) as { distinct?: number } | undefined;
 
 				if (typeof stream.thinkingDelta === "number" && stream.thinkingDelta > 0) row.withDelta += 1;
 				// 分母只用“真的思考了”的消息：无思考的快速工具调用会把捕获率算成假的低值。
@@ -1146,6 +1331,8 @@ export default function thinkingBreaker(pi: ExtensionAPI) {
 				if (tail && typeof tail.repeats === "number") {
 					row.maxTailRepeats = Math.max(row.maxTailRepeats, tail.repeats);
 				}
+				// 词表塌缩命中数（观测口径，与熔断的探针 B 同源）。
+				if (collapse) row.collapseHits += 1;
 				byModel.set(model, row);
 			}
 
@@ -1162,6 +1349,7 @@ export default function thinkingBreaker(pi: ExtensionAPI) {
 				if (row.alerts > 0) flags.push(`dry-run命中×${row.alerts}`);
 				if (row.redacted > 0) flags.push(`redacted×${row.redacted}`);
 				if (row.maxTailRepeats >= config.alertMinRepeats) flags.push(`尾部复读×${row.maxTailRepeats}`);
+				if (row.collapseHits > 0) flags.push(`词表塌缩×${row.collapseHits}`);
 				const providerList = [...row.providers.entries()]
 					.sort((a, b) => b[1] - a[1])
 					.map(([p, c]) => `${p}×${c}`)

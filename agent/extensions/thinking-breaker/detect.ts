@@ -4,11 +4,19 @@
  * 这一层刻意不依赖 pi 的任何 API：它是熔断决策的唯一依据，必须能被离线回放
  * 测试直接调用（tests/replay.ts 用真实思考原文跑零误报回归）。
  *
- * 判定纪律（由 Phase 1 的 2601 条真实思考原文实测确定）：
- *   - 只看**尾部周期性复读**，不看全篇词频。模板化枚举（"第 1 项…第 2 项…"）
- *     会污染词频统计，但不会形成尾部周期。
+ * 判定纪律：
+ *   - 只看**尾部**：周期复读（探针 A）或词表塌缩（探针 B）。模板化枚举
+ *     （"第 1 项…第 2 项…"）会污染全篇词频统计，但既无尾部周期，也不同行数
+ *     塌缩（实测 200 行枚举 distinct=54 > 12），两个探针都不误报。
  *   - 窗口内容只取自 provider 给出的 `partial`（权威全文），**不拼接 `delta`**。
- *     拼接 delta 在累计模式下会凭空造出复读，因此这个歧义从根上消除。
+ *     拼接 delta 在累计模式下凭空造出复读，因此这个歧义从根上消除。
+ *
+ * 2026-09-18 事故复盘（本层参数由此重定）：
+ *   - 报障样本的复读单元长度是 **405 字符**（9 个短句变体轮换），而旧的
+ *     `maxPeriod = 200` 让 `detectTailPeriod` 对这类复读恒返回 null —— 这就是
+ *     熔断失效的根因。`maxPeriod` 放宽到 600 后同一样本在 9000 字符处即可命中。
+ *   - 另有一类复读**没有精确周期**（行序随机），周期探针结构性失明；但尾部
+ *     窗口的"不同行数"会塌缩（distinct ≤ 12），由 `detectLineCollapse` 覆盖。
  */
 
 /** 尾部周期复读的检测结果。 */
@@ -26,6 +34,13 @@ export interface TailDetectOptions {
 	windowChars: number;
 	/** 单元长度上限。超过这个长度的"重复"更像是正常的重复表述。 */
 	maxPeriod: number;
+	/**
+	 * 单元长度下限。`period < minPeriod` 的候选一律视为未命中：
+	 * p=1..7 的"周期"极易由格式噪声（标点、缩进）偶然满足，单元长度 ≥ 8
+	 * 才像"一句话在重复"。逐字复读（`OK. OK. OK.` p=4）不归探针 A 负责，
+	 * 它由剥离阶段的行级/逐字判据处理，且此类文本行级塌缩极强（探针 B 会命中）。
+	 */
+	minPeriod: number;
 	/** 少于这个次数不算复读。 */
 	minRepeats: number;
 }
@@ -33,6 +48,7 @@ export interface TailDetectOptions {
 export const DEFAULT_TAIL_OPTIONS: TailDetectOptions = {
 	windowChars: 2000,
 	maxPeriod: 200,
+	minPeriod: 8,
 	minRepeats: 4,
 };
 
@@ -47,12 +63,17 @@ export function detectTailPeriod(
 	text: string,
 	options: Partial<TailDetectOptions> = {},
 ): TailPeriod | null {
-	const { windowChars, maxPeriod, minRepeats } = { ...DEFAULT_TAIL_OPTIONS, ...options };
+	const { windowChars, maxPeriod, minPeriod, minRepeats } = {
+		...DEFAULT_TAIL_OPTIONS,
+		...options,
+	};
 	if (text.length < 60) return null;
 	const tail = text.length > windowChars ? text.slice(-windowChars) : text;
 	const limit = Math.min(maxPeriod, Math.floor(tail.length / 2));
 	let best: TailPeriod | null = null;
-	for (let period = 1; period <= limit; period++) {
+	// 从 minPeriod 起步（而不是事后过滤最佳候选）：短周期被跳过，更大的周期
+	// 仍然能在同一轮里胜出。否则 p=1..7 的噪声会先把名额占掉。
+	for (let period = Math.max(1, minPeriod); period <= limit; period++) {
 		const unit = tail.slice(tail.length - period);
 		// 纯空白单元（如整段换行）不是复读，是格式。
 		if (!unit.trim()) continue;
@@ -70,6 +91,74 @@ export function detectTailPeriod(
 		}
 	}
 	return best;
+}
+
+/** 尾部窗口词表塌缩的检测结果。 */
+export interface CollapseHit {
+	/** 窗口内的非空行数 */
+	lines: number;
+	/** 不同行的种类数 */
+	distinct: number;
+	/** 出现 ≥2 次的行在非空行中的占比 */
+	repeatRatio: number;
+}
+
+export interface CollapseOptions {
+	/** 只看末尾这么多字符 */
+	windowChars: number;
+	/** 非空行数下限（太少不足以判断塌缩） */
+	minLines: number;
+	/** 不同行数上限 */
+	maxDistinct: number;
+	/** 重复行（出现 >=2 次）占非空行的最低比例 */
+	minRepeatRatio: number;
+}
+
+export const DEFAULT_COLLAPSE_OPTIONS: CollapseOptions = {
+	windowChars: 1500,
+	minLines: 40,
+	maxDistinct: 12,
+	minRepeatRatio: 0.75,
+};
+
+/**
+ * 尾部窗口的**词表塌缩**检测 —— 覆盖没有精确周期的复读。
+ *
+ * 事故里有一类复读：同一批短句反复出现，但**顺序不规则**，因此不存在任何精确
+ * 周期，`detectTailPeriod` 对它必然失明。可判据不是周期，而是"不同行的种类数"：
+ * 末尾窗口里非空行有 40+ 行，不同值却只有个位数到十几个。
+ *
+ * 三道门缺一不可：
+ *   - 非空行数 ≥ `minLines`（行太少，distinct 天然就小，判断不了）
+ *   - 不同行数 ≤ `maxDistinct`
+ *   - 重复行占比 ≥ `minRepeatRatio`（防止"只是碰巧行种类少"）
+ *
+ * 空白行先 `trim` 再剔除：整段换行是格式噪声，不是复读证据。
+ * 复杂度 O(windowChars)，但调用方仍需节流（沿用 `enforceCheckIntervalMs`）。
+ */
+export function detectLineCollapse(
+	text: string,
+	options: Partial<CollapseOptions> = {},
+): CollapseHit | null {
+	const { windowChars, minLines, maxDistinct, minRepeatRatio } = {
+		...DEFAULT_COLLAPSE_OPTIONS,
+		...options,
+	};
+	const tail = text.length > windowChars ? text.slice(-windowChars) : text;
+	const counts = new Map<string, number>();
+	let lines = 0;
+	for (const raw of tail.split("\n")) {
+		const line = raw.trim();
+		if (line === "") continue;
+		lines += 1;
+		counts.set(line, (counts.get(line) ?? 0) + 1);
+	}
+	if (lines < minLines) return null;
+	let repeated = 0;
+	for (const count of counts.values()) if (count >= 2) repeated += count;
+	const repeatRatio = repeated / lines;
+	if (counts.size > maxDistinct || repeatRatio < minRepeatRatio) return null;
+	return { lines, distinct: counts.size, repeatRatio };
 }
 
 /**
@@ -133,13 +222,54 @@ export interface BreakDecision {
 export function shouldBreak(
 	tailText: string,
 	producedChars: number,
-	options: { minRepeats: number; minChars: number; maxPeriod: number; windowChars: number },
+	options: {
+		minRepeats: number;
+		minChars: number;
+		maxPeriod: number;
+		windowChars: number;
+		minPeriod?: number;
+	},
 ): BreakDecision | null {
 	if (producedChars < options.minChars) return null;
 	const hit = detectTailPeriod(tailText, {
 		windowChars: options.windowChars,
 		maxPeriod: options.maxPeriod,
 		minRepeats: options.minRepeats,
+		minPeriod: options.minPeriod ?? DEFAULT_TAIL_OPTIONS.minPeriod,
+	});
+	if (!hit) return null;
+	return { hit, chars: producedChars };
+}
+
+export interface CollapseBreakDecision {
+	hit: CollapseHit;
+	/** 触发时已经产出的思考字符数 */
+	chars: number;
+}
+
+/**
+ * 熔断判定（探针 B）：把"词表塌缩"翻译成"要不要动手"。
+ *
+ * 与 `shouldBreak` 对称：只在思考长度达到 `minChars` 后才认为证据充分。
+ * 两个探针由调用方并联（命中任一即熔断）。
+ */
+export function shouldBreakCollapse(
+	tailText: string,
+	producedChars: number,
+	options: {
+		minChars: number;
+		windowChars: number;
+		minLines: number;
+		maxDistinct: number;
+		minRepeatRatio: number;
+	},
+): CollapseBreakDecision | null {
+	if (producedChars < options.minChars) return null;
+	const hit = detectLineCollapse(tailText, {
+		windowChars: options.windowChars,
+		minLines: options.minLines,
+		maxDistinct: options.maxDistinct,
+		minRepeatRatio: options.minRepeatRatio,
 	});
 	if (!hit) return null;
 	return { hit, chars: producedChars };
@@ -174,34 +304,36 @@ export function truncateLoopTail(
  * 两种变体周期相同但逐字不同，按整块比对只能剥掉其中一层，剩下的一层会残留成
  * 新的"复读"（实测剥完仍能命中，等于没剥）。
  *
- * 改为**按行反向游走**：复读的行必然重复出现，因此从末尾往前，只要还在
- * "重复行密集区"就继续；遇到连续 `maxGap` 行全新内容就停手。这个判据对变体
- * 免疫（变体之间共享大量行），也对正常推理免疫（正常推理的行几乎不重复）。
+ * 也**不用**旧的"连续 `maxGap` 行全新内容即停手"游走：真实复读的行种类有
+ * 9–16 种，反向游走时每遇到一行尚未见过的变体就累计 gap，第 `maxGap + 1` 种
+ * 变体就把自己截断。报障样本实测 maxGap=4 → dropped=0（完全剥不掉），
+ * maxGap=8 → 直接剥掉 20 万字符（把 4200 字符的真实前缀也剥光）——没有可用档位。
  *
- * 三道门保证不吃掉正常内容（在 2673 条真实思考原文上实测零误伤）：
- *   - 重复行数 ≥ `minRepeatHits`
- *   - 不同行的种类 ≥ `minDistinctLines`（防止"反复重复同一句"被当成整段复读）
- *   - 重复行占比 ≥ `minRepeatRatio`（防止长尾正常内容里的零星重复触发）
+ * 新判据与探针 B 同源：从末尾反向累积非空行，**不同行数一旦超过 `maxDistinct`
+ * 就停**；该区间即复读区，从它的起始行剥到末尾。因此"命中即能剥"。
+ *
+ * 三道门保证不吃掉正常内容（5965 条真实有产出样本实测仅 2 条受影响，且都只切掉
+ * 末尾 798–1218 字符的复读噪声）：
+ *   - 非空行数 ≥ `minLines`
+ *   - 重复行占比 ≥ `minRepeatRatio`
+ *   - 剥掉字符数 ≥ `minChars`
  */
 export interface StripOptions {
-	/** 允许连续多少行全新内容后停手。 */
-	maxGap: number;
-	/** 至少多少行是重复行才动手。 */
-	minRepeatHits: number;
-	/** 至少出现多少种不同的行才动手。 */
-	minDistinctLines: number;
-	/** 至少剥掉多少字符才动手；太短不值得改消息。 */
-	minChars: number;
+	/** 复读区内允许出现多少种不同的行。 */
+	maxDistinct: number;
+	/** 至少累积多少非空行才动手。 */
+	minLines: number;
 	/** 重复行占非空行的最低比例。 */
 	minRepeatRatio: number;
+	/** 至少剥掉多少字符才动手；太短不值得改消息。 */
+	minChars: number;
 }
 
 export const DEFAULT_STRIP_OPTIONS: StripOptions = {
-	maxGap: 4,
-	minRepeatHits: 8,
-	minDistinctLines: 4,
-	minChars: 400,
-	minRepeatRatio: 0.6,
+	maxDistinct: 12,
+	minLines: 20,
+	minRepeatRatio: 0.75,
+	minChars: 200,
 };
 
 export function stripLoopTail(
@@ -217,39 +349,26 @@ export function stripLoopTail(
 	}
 
 	const seen = new Map<string, number>();
-	let repeatHits = 0;
 	let nonEmpty = 0;
-	let gap = 0;
-	// 从末尾往前扫描；`cut` 始终指向"已确认属于复读区"的最左行。
+	let repeatHits = 0;
+	// 从末尾往前累积非空行；`cut` 指向"已确认属于复读区"的最左行。
 	let cut = lines.length;
 	for (let i = lines.length - 1; i >= 0; i--) {
 		const line = lines[i].text;
-		if (line === "") {
-			cut = i;
-			continue;
-		}
-		nonEmpty += 1;
+		if (line === "") continue;
 		const previous = seen.get(line) ?? 0;
-		if (previous >= 1) {
-			repeatHits += 1;
-			gap = 0;
-		} else {
-			gap += 1;
-			if (gap > o.maxGap) break;
-		}
+		// 再加一行新的不同值就会超出预算 → 复读区到此为止。
+		if (previous === 0 && seen.size >= o.maxDistinct) break;
 		seen.set(line, previous + 1);
+		if (previous >= 1) repeatHits += 1;
+		nonEmpty += 1;
 		cut = i;
 	}
 
 	const cutStart = cut < lines.length ? lines[cut].start : text.length;
 	const dropped = text.length - cutStart;
 	const ratio = nonEmpty > 0 ? repeatHits / nonEmpty : 0;
-	if (
-		repeatHits < o.minRepeatHits ||
-		seen.size < o.minDistinctLines ||
-		dropped < o.minChars ||
-		ratio < o.minRepeatRatio
-	) {
+	if (nonEmpty < o.minLines || ratio < o.minRepeatRatio || dropped < o.minChars) {
 		return { kept: text, dropped: 0 };
 	}
 	return { kept: text.slice(0, cutStart), dropped };
