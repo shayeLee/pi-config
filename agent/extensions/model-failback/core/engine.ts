@@ -34,12 +34,22 @@ interface ThinkingBreakerEscalateRequest {
   readonly key: string;
   readonly reason: string;
   readonly note: string;
-  readonly evidence: {
-    readonly period: number;
-    readonly repeats: number;
-    readonly chars: number;
-    readonly strikes: number;
-  };
+  readonly evidence:
+    | {
+        readonly kind?: "period";
+        readonly period: number;
+        readonly repeats: number;
+        readonly chars: number;
+        readonly strikes: number;
+      }
+    | {
+        readonly kind: "collapse";
+        readonly distinct: number;
+        readonly lineCount: number;
+        readonly repeatRatio: number;
+        readonly chars: number;
+        readonly strikes: number;
+      };
   readonly accept: (reply: ThinkingBreakerEscalateReply) => void;
 }
 

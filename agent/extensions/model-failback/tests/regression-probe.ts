@@ -2071,7 +2071,16 @@ async function runRegressionTests(): Promise<TestResult[]> {
       version: number;
       reason: string;
       note: string;
-      evidence: { period: number; repeats: number; chars: number; strikes: number };
+      evidence:
+        | { kind?: "period"; period: number; repeats: number; chars: number; strikes: number }
+        | {
+            kind: "collapse";
+            distinct: number;
+            lineCount: number;
+            repeatRatio: number;
+            chars: number;
+            strikes: number;
+          };
     }> = {},
   ): Promise<{ ok: boolean; switchedTo?: string; message?: string } | undefined> => {
     let reply: { ok: boolean; switchedTo?: string; message?: string } | undefined;
@@ -2112,6 +2121,49 @@ async function runRegressionTests(): Promise<TestResult[]> {
     const called = harness.pi.setModelCalls as Array<{ provider: string; id: string }>;
     expect(called.length === 1, `expected one setModel call, got ${called.length}`);
     expect(called[0].provider === "modelscope", `wrong provider: ${called[0].provider}`);
+    // ban 必须落盘且带冷却期，否则同会话会无限连跳。
+    const record = harness.bans.get("workbuddy/deepseek-v4.1-flash");
+    expect(record?.reason === "thinking_loop", `wrong ban reason: ${record?.reason}`);
+    expect(typeof record?.resetsAt === "number", "behavior ban has no cooldown");
+    expect(
+      harness.pi.entries.some((entry) => entry.type === "model-failback-ban"),
+      "ban entry was not appended",
+    );
+    // 接手方必须自己发续跑：abort 已经结束了原 agent run。
+    expect(harness.pi.userMessages.length === 1, `continuation was not steered (${harness.pi.userMessages.length})`);
+    expect(
+      String(harness.pi.userMessages[0].content).includes("反复复读"),
+      "continuation does not explain the loop",
+    );
+    expect(
+      harness.notifications.some(({ message }) => message.includes("反复复读思考")),
+      "escalation notification was not emitted",
+    );
+  }));
+
+  results.push(await runTest("engine escalates a vocabulary-collapse claim like a period loop", async () => {
+    const harness = engineHarness(
+      { chains: [["workbuddy/deepseek-v4.1-flash", "modelscope/Qwen/Qwen3.8-Flash-Next"]], fallbacks: {} },
+      [
+        { provider: "workbuddy", id: "deepseek-v4.1-flash" },
+        { provider: "modelscope", id: "Qwen/Qwen3.8-Flash-Next" },
+      ],
+      { provider: "workbuddy", id: "deepseek-v4.1-flash" },
+    );
+    await harness.emitSessionStart();
+    // 第二种探针（词汇坍缩）只是证据形状不同；换模型/ban/续跑必须与周期探针完全一致。
+    const reply = await emitEscalate(harness, {
+      evidence: { kind: "collapse", distinct: 3, lineCount: 120, repeatRatio: 0.97, chars: 8_400, strikes: 2 },
+    });
+    expect(reply?.ok === true, `collapse escalation was refused: ${reply?.message ?? "no reply"}`);
+    expect(reply?.switchedTo === "modelscope/Qwen/Qwen3.8-Flash-Next", `wrong target: ${reply?.switchedTo}`);
+    const called = harness.pi.setModelCalls as Array<{ provider: string; id: string }>;
+    expect(called.length === 1, `expected one setModel call, got ${called.length}`);
+    expect(called[0].provider === "modelscope", `wrong provider: ${called[0].provider}`);
+    expect(
+      harness.state.chain.includes("modelscope/Qwen/Qwen3.8-Flash-Next"),
+      "collapse escalation did not extend the failback chain",
+    );
     // ban 必须落盘且带冷却期，否则同会话会无限连跳。
     const record = harness.bans.get("workbuddy/deepseek-v4.1-flash");
     expect(record?.reason === "thinking_loop", `wrong ban reason: ${record?.reason}`);
