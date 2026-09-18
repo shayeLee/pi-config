@@ -20,6 +20,10 @@
 
 发现代理时，从 `~/.pi/agent/agents` 加载用户级代理，并从工作目录向上查找到的最近 `.pi/agents` 加载项目级代理。使用 `agentScope: "both"` 时同时加载两者，同名代理以项目级为准。
 
+> `subagent` returns one `runId` per subagent and does not include the subagent's output. Collect results with `subagent_wait`: with no arguments it waits for every outstanding run, including all tasks of a parallel call, and explicit runIds wait for specific runs.
+
+`subagent` 为每个子代理返回一个 `runId`，不包含子代理的输出。用 `subagent_wait` 收取结果：不带参数时等待所有尚未收取的 run（包括并行调用的全部任务），传入明确的 runId 则等待指定的 run。
+
 > The Architect should first reduce ambiguity enough to define the objective, expected outcome, affected area, and major constraints and only then delegate.
 
 Architect 应先将歧义降低到足以明确目标、预期结果、受影响范围和主要约束，然后再进行委派。
@@ -41,9 +45,19 @@ Architect 应先将歧义降低到足以明确目标、预期结果、受影响�
 
 根 Architect 应审查委派结果和验证证据，并据此作出最终判断。
 
-> Parallelize independent, non-conflicting delegations; sequence delegations that may interfere with each other or depend on earlier results.
+- > Start independent, non-conflicting work in parallel. Sequence work that may interfere or depends on earlier results: collect the previous result before starting the next subagent.
 
-并行执行相互独立且不冲突的委派；可能相互干扰或依赖先前结果的委派应按顺序执行。
+  并行开展相互独立且不冲突的工作；可能相互干扰或依赖先前结果的工作应按顺序进行：先收取上一个结果，再启动下一个子代理。
+- > Supervise long or risky runs instead of waiting blindly: `subagent_status` for progress, `subagent_logs` for the transcript so far, `subagent_steer` to redirect a run going the wrong way, `subagent_stop` to terminate one that is no longer needed.
+
+  对耗时较长或有风险的 run 应主动监督，而不是盲目等待：`subagent_status` 查看进度，`subagent_logs` 查看目前已采集的记录，`subagent_steer` 纠正跑偏的 run，`subagent_stop` 终止不再需要的 run。
+- > Each task of a parallel call is a separate run with its own runId, so tasks can be supervised or stopped individually.
+
+  并行调用的每个任务都是独立的 run，各有自己的 runId，因此可以逐个监督或停止。
+
+> Typical flow: start one or more subagents, keep working or start more, then `subagent_wait` to collect results before forming your conclusion.
+
+典型流程：先启动一个或多个子代理，期间继续工作或再启动更多子代理，然后用 `subagent_wait` 收齐结果后再形成结论。
 
 > Repository Search
 
