@@ -11,9 +11,9 @@
  * 判定依据腾讯官方 CodeBuddy CLI 的业务错误码枚举(dist-server 中的
  * `UsageLimitExceeded=14001` 等)与它的归类表:
  *
- *   quota / quota_balance_exhausted  ← 14001 14002 14012 14013 14014 14018 14019
+ *   quota / quota_balance_exhausted  ← 14001 14002 14012 14013 14014 14018
  *   quota / quota_request_limit      ← 14003,以及 6005-6008(本 handler 直接切备用链)
- *   quota / quota_token_limit        ← 6003 6004
+ *   quota / quota_token_limit        ← 6000-6004(CraftRate 的 TPS/TPM/TPH/TPD token 配额)
  *   quota / quota_active_session     ← 10105
  *   quota / quota_web_search         ← 15001
  *   quota / quota_not_activated      ← 14016 14017
@@ -22,17 +22,50 @@
  *   model_service / model_behavior   ← 11141
  *   429 兜底                          → quota_balance_exhausted
  *
+ * 6003(CraftRateTPHLimit)/6004(CraftRateTPDLimit)虽然与 6005-6008 同属 CraftRate 限流族,
+ * 但官方归类是 `quota_token_limit`(按 TPS/TPM/TPH/TPD 计)。关键在于它们是**按模型**
+ * 限定的免费档额度窗口,而不是账户级余额:
+ *  - 官方 `isCraftDailyQuotaBusinessCode` 集合为 `{6004, 6008}`,即这两个码是**日粒度**
+ *    窗口,且它在 `isRequestLevelRetryableError` 里被**显式排除在重试之外** ——
+ *    官方自己也认为日粒度窗口不该交给退避重试,而应换模型继续。
+ *    注意 `isTransientRateLimitBusinessCode` 覆盖的是 6000-6003 / 6005-6007 +
+ *    14003,**不含** 6004/6008(日配额被单独摘出来);
+ *  - 官方 `ModelRateLimitCap` 配置给出 freeId/paidId 双档(实测 WorkBuddy 国际版为
+ *    freeId=deepseek-v4.1-flash 记 x0.00 credits、paidId=deepseek-v4.1-flash-sg 记 x0.03 credits,
+ *    且 allowPaidSwitch=true);
+ *  - 真实错误文案自己就给出了官方逃生路径:
+ *
+ *      429 {"message":"usage exceeds frequency limit, but don't worry, your usage will reset at
+ *      2026-09-19 09:43:30 UTC+8, alternatively, you can switch to the other models to continue
+ *      using it.","code":"6004"}
+ *
+ * 所以这两码必须按**限流窗口**处理(scope 用 "any",允许逐跳链里的付费档),
+ * 而不是像 14001 那样按账户级终态把整个 provider 跳过;文案里的 `reset at … UTC+8`
+ * 直接解析成 resetsAt,到期由 autoRestore 切回免费档。
+ * 6000-6002(秒/分钟级 token 窗口)不在此列:它们不在 `isCraftDailyQuotaBusinessCode`
+ * 里,官方仍当可重试错误处理,保持交给 pi 退避重试。
+ *
+ * 注意:文案里的 UTC 偏移是该码**唯一**的精确恢复时间来源,所以 `resetsAt` 严格依赖
+ * `parseCraftResetAt` —— 它宁可返回 undefined 也不猜时区。解析不到时退回
+ * `workbuddyRateLimitCooldownMs`,那只是**冷却期估计**,不是真实窗口恢复时刻,
+ * 因此它可能偏短(6003 是小时窗口、6004 是日窗口)。`autoRestore` 会在该时刻
+ * 提前切回源模型;若窗口其实仍开着,只是一次额外试探,不会造成停机。
+ *
  * 本 handler 覆盖两类需要换模型的终态:
- *  1. **额度耗尽** —— 余额耗尽、用户/企业额度耗尽、token 预算耗尽,
+ *  1. **账户额度耗尽** —— 余额耗尽、用户/企业额度耗尽、token 预算耗尽,
  *     以及无 code 时带额度语义的 429 兜底。账户级,`scope: "cross-provider"`
  *     (同 provider 换模型无效);
- *  2. **瞬时限流** —— 14003 / 6005-6008 与无 code 的裸 429。这类错误 pi 会退避
- *     重试(默认 3 次,1s/2s/4s),但 WorkBuddy 单请求就要数分钟,7 秒总退避远
- *     小于限流窗口,重试耗尽后 pi 只会把错误交还用户、任务中断。因此按配置
- *     **直接切备用链**(`scope: "any"`,逐跳按用户配的链走,同 provider 的另一
- *     部署也可能有独立配额):带一个 `workbuddyRateLimitCooldownMs`(默认 60s)的
- *     resetsAt,到期自动解 ban,模型重新可用。把该值配成 <=0 即关闭此逃逸,
- *     回到"全部交给 pi 重试"的旧行为。
+ *  2. **模型级限流窗口** —— 14003 / 6003-6008 与无 code 的裸 429。这类错误 pi 会
+ *     退避重试(默认 3 次,1s/2s/4s),但 WorkBuddy 单请求就要数分钟,7 秒总退避
+ *     远小于限流窗口,重试耗尽后 pi 只会把错误交还用户、任务中断。因此按配置
+ *     **直接切备用链**(`scope: "any"`,逐跳按用户配的链走 —— 限流窗口按模型
+ *     计算,同 provider 的另一档位/部署有独立配额,例如 CraftRate 的 free/paid
+ *     双档):带 resetsAt 到期自动解 ban,模型重新可用。6003/6004 优先用错误
+ *     文案里的官方重置时刻,解析不到才退回 `workbuddyRateLimitCooldownMs`
+ *     (默认 60s)。把该值配成 <=0 即关闭此逃逸,回到"全部交给 pi 重试"的旧行为。
+ *     注意这是**免费档额度窗口**,不是账户余额:文案「usage exceeds frequency limit」
+ *     与官方 `ModelRateLimitCap.freeId/paidId` 双档都表明该模型限额用尽后
+ *     切付费档/其它模型正是厂商设计路径,不得据此劝用户充值或跳过整个 provider。
  *
  * **不触发**的情形:
  *  - 14015 / 11140 / 11142 **鉴权**、14016/14017 **未开通**、11141 **模型行为错误**;
@@ -121,17 +154,24 @@ function extractFirstJsonObject(text: string): Record<string, unknown> | undefin
   return undefined;
 }
 
-/** 账户/计划额度耗尽 —— 换同 provider 模型无效,只能跨 provider。 */
+/**
+ * 账户/计划额度耗尽 —— 换同 provider 模型无效,只能跨 provider。
+ * 只放官方 `quota_balance_exhausted` 一族:余额/企业额度/用户额度耗尽。
+ * **不放 CraftRate 的 6003/6004** —— 那是按模型计的 token 窗口,
+ * 换个模型(含同 provider 付费档)就能继续,见上方文件头说明。
+ *
+ * 注意:官方当前制品里**不存在 14019**(`UsageLimitNoTokenBudget` 的 rg 计数为 0,
+ * `UsageLimit*` 枚举只有 14001/14012/14013/14014/14015/14016/14017/14018),
+ * 保留它只为兼容早期版本/文档里出现过的 code,不影响现行判定。
+ */
 const BALANCE_EXHAUSTED_CODES = new Set([
   "14001", // UsageLimitExceeded
-  "14002", // ConversationChatTooMany(同一额度的并发表现)
+  "14002", // ConversationChatTooMany(官方 lookupBizCode 归为 quota_balance_exhausted)
   "14012", // UsageLimitExceededEnterprise
   "14013", // UsageLimitExceededTencent
   "14014", // UsageLimitEnterpriseExhausted
   "14018", // UsageLimitUserExhausted
-  "14019", // UsageLimitNoTokenBudget
-  "6003", // CraftRateTPHLimit(每小时 token 配额)
-  "6004", // CraftRateTPDLimit(每日 token 配额)
+  "14019", // UsageLimitNoTokenBudget(当前制品已无此码,legacy 兼容)
 ]);
 
 /**
@@ -142,6 +182,80 @@ const RATE_LIMIT_CODES = new Set([
   "14003", // RateLimitError
   "6005", "6006", "6007", "6008", // CraftRate RPS/RPM/RPH/RPD
 ]);
+
+/**
+ * CraftRate 的 **日粒度 token 配额窗口** (6004=TPD) 与其它长期窗口。
+ *
+ * 官方 `isCraftDailyQuotaBusinessCode` 把 6004 与 6008(RPD) 一并列出,并把它们
+ * 排除在短退避重试之外 —— 这两个是**日**窗口,60 秒冷却远不足以覆盖,
+ * 因此必须优先采用文案里的官方重置时刻。
+ */
+export const CRAFT_DAILY_QUOTA_CODES: ReadonlySet<string> = new Set(["6004", "6008"]);
+
+/** 官方日窗口的重置时刻上界:超过这个幅度说明解析出了错误的时间,宁可未知。 */
+export const CRAFT_DAILY_RESET_MAX_MS = 3 * 24 * 60 * 60_000;
+
+/**
+ * CraftRate 的 token 配额窗口(6003=TPH / 6004=TPD):per-model 的免费档窗口,
+ * 厂商给出的逃生路径就是切到其它模型(付费档/其它 provider),
+ * 因此按限流处理,但优先用错误文案里的官方重置时刻。
+ */
+const CRAFT_TOKEN_WINDOW_CODES = new Map([
+  ["6003", "每小时 token 限额"], // CraftRateTPHLimit
+  ["6004", "每日 token 限额"], // CraftRateTPDLimit
+]);
+
+/**
+ * 解析 CraftRate 配额文案里的官方重置时刻,形如
+ * `your usage will reset at 2026-09-19 09:43:30 UTC+8` → epoch ms。
+ *
+ * 解析纪律(任何一条不满足即返回 undefined,由冷却期兜底):
+ *  - **必须带 UTC/GMT 标记**:`UTC+8` / `UTC+08:00` / `GMT+0800` / 裸 `UTC`(按 UTC+0
+ *    解释)。完全没有时区标记时无法确定 epoch,猜本地时区会给出错误的
+ *    `autoRestore` 时刻,所以直接拒绝;
+ *  - **各字段必须真实存在**:月/日/时/分/秒有范围校验,并进行 round-trip 比对,
+ *    避免 `2026-02-31`、`25:70`、`UTC+99` 被 `Date.UTC` 悄悄规范化成另一个时刻;
+ *  - **必须是未来时刻**;
+ *  - **必须是单个、无冲突的时间**:同时出现多个不同时刻时拒绝解析。
+ *
+ * 只接受 UTC/GMT 偏移,不接受 `CST`/`IST` 这类有歧义的缩写。
+ */
+export function parseCraftResetAt(text: string, now = Date.now()): number | undefined {
+  const pattern =
+    /resets?\s+at\s+(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})(?::(\d{2}))?\s*(?:UTC|GMT)\s*(?:([+-])\s*(\d{1,2})(?::?(\d{2}))?)?/gi;
+  const matches = [...text.matchAll(pattern)];
+  if (matches.length === 0) return undefined;
+
+  const resolved = new Set<number>();
+  for (const match of matches) {
+    const [, year, month, day, hour, minute, second, sign, offsetHour, offsetMinute] = match;
+    const parts = [year, month, day, hour, minute, second, offsetHour, offsetMinute]
+      .map((part) => (part === undefined ? undefined : Number(part)));
+    const [y, mo, d, h, mi, s, oh, om] = parts;
+    // 范围校验:拦下会被 Date.UTC 归一化的非法日历/时钟值。
+    if (mo! < 1 || mo! > 12 || d! < 1 || d! > 31) return undefined;
+    if (h! > 23 || mi! > 59 || (s ?? 0) > 59) return undefined;
+    if (oh !== undefined && (oh > 14 || (om ?? 0) > 59)) return undefined;
+
+    const localMs = Date.UTC(y!, mo! - 1, d!, h!, mi!, s ?? 0);
+    if (!Number.isFinite(localMs)) return undefined;
+    // round-trip:非法日期(如 2 月 31 日)会被 Date.UTC 规范化,必须拒绝。
+    const probe = new Date(localMs);
+    if (
+      probe.getUTCFullYear() !== y || probe.getUTCMonth() !== mo! - 1 ||
+      probe.getUTCDate() !== d || probe.getUTCHours() !== h ||
+      probe.getUTCMinutes() !== mi || probe.getUTCSeconds() !== (s ?? 0)
+    ) return undefined;
+
+    // 无偏移按 UTC 解释(官方文案里裸 UTC 即 UTC+0);带偏移才做平移。
+    const offsetMinutes = oh === undefined ? 0 : (oh * 60 + (om ?? 0)) * (sign === "-" ? -1 : 1);
+    const resetsAt = localMs - offsetMinutes * 60_000;
+    if (resetsAt > now) resolved.add(resetsAt);
+  }
+
+  // 多个互相冲突的恢复时刻无法判定哪个生效:拒绝解析,交给冷却期。
+  return resolved.size === 1 ? [...resolved][0] : undefined;
+}
 
 /** 明确不是账户/限流终态的 code:鉴权/未开通/模型错误/上下文超长。 */
 const NON_TERMINAL_CODES = new Set([
@@ -288,14 +402,25 @@ export function createWorkbuddyHandler(
       // 瞬时限流:按配置直接切备用链,不再等 pi 退避重试耗尽。
       // scope 用 "any" —— 限流常是 per-model/endpoint 的,应按用户配的链逐跳尝试
       // (同 provider 的另一部署也可能有独立配额),而不是一律跳过同 provider。
-      if (RATE_LIMIT_CODES.has(code)) {
+      // 6003/6004/6008 属同一族,但优先用文案里的官方重置时刻(见文件头说明);
+      // 6008(RPD)与 6004(TPD)同为官方日配额,固定冷却期对日窗口明显偏短。
+      if (RATE_LIMIT_CODES.has(code) || CRAFT_TOKEN_WINDOW_CODES.has(code)) {
         const cooldownMs = getRateLimitCooldownMs();
         if (cooldownMs <= 0) return null;
+        const craftWindow = CRAFT_TOKEN_WINDOW_CODES.get(code);
+        const official = parseCraftResetAt(text);
+        // 日窗口不可能在 3 天后才恢复:超出上界说明解析出了错误的时间,丢弃。
+        const bounded = official !== undefined && CRAFT_DAILY_QUOTA_CODES.has(code) &&
+            official - Date.now() > CRAFT_DAILY_RESET_MAX_MS
+          ? undefined
+          : official;
         return {
           reason: "rate_limited",
           scope: "any",
-          resetsAt: Date.now() + cooldownMs,
-          note: `WorkBuddy 瞬时限流(${code}),已切换备用链`,
+          resetsAt: bounded ?? Date.now() + cooldownMs,
+          note: craftWindow !== undefined
+            ? `WorkBuddy 模型${craftWindow}已用尽(${code}),仅该模型受限,已切换备用链`
+            : `WorkBuddy 瞬时限流(${code}),已切换备用链`,
         };
       }
       // 未知 code 不做猜测:留给人工确认,避免误 ban 整个 provider。

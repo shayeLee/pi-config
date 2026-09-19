@@ -17,6 +17,7 @@ import {
   DEFAULT_RATE_LIMIT_COOLDOWN_MS,
   DEFAULT_TRANSIENT_OUTAGE_STREAK,
   DEFAULT_WAF_BLOCK_STREAK,
+  parseCraftResetAt,
   resetWorkbuddyOutages,
   setWorkbuddyRateLimitCooldownMs,
   setWorkbuddyTransientOutageStreak,
@@ -157,6 +158,16 @@ const GATEWAY_PAGE_502 =
 
 function waitForTimers(): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, 10));
+}
+
+/** 把 epoch ms 渲染成 WorkBuddy 错误文案里的 "… UTC+8" 本地时刻。 */
+function formatUtc8(ms: number): string {
+  const shifted = new Date(ms + 8 * 3_600_000);
+  const pad = (value: number) => String(value).padStart(2, "0");
+  return (
+    `${shifted.getUTCFullYear()}-${pad(shifted.getUTCMonth() + 1)}-${pad(shifted.getUTCDate())} ` +
+    `${pad(shifted.getUTCHours())}:${pad(shifted.getUTCMinutes())}:${pad(shifted.getUTCSeconds())} UTC+8`
+  );
 }
 
 function engineHarness(
@@ -1120,8 +1131,10 @@ async function runRegressionTests(): Promise<TestResult[]> {
   }));
 
   results.push(await runTest("workbuddy balance-exhausted codes are cross-provider terminals", () => {
-    // 这些 code 来自腾讯官方 CodeBuddy CLI 的业务错误码枚举。
-    const codes = ["14001", "14002", "14012", "14013", "14014", "14018", "14019", "6003", "6004"];
+    // 这些 code 来自腾讯官方 CodeBuddy CLI 的业务错误码枚举,且官方归类为
+    // quota_balance_exhausted(账户级余额/额度耗尽)。CraftRate 的 6003/6004
+    // 不在此列:它们是 per-model 的免费档 token 窗口,见下面的用例。
+    const codes = ["14001", "14002", "14012", "14013", "14014", "14018", "14019"];
     for (const code of codes) {
       const verdict = workbuddyHandler.inspect(
         assistantFailure(
@@ -1134,6 +1147,144 @@ async function runRegressionTests(): Promise<TestResult[]> {
       expect(verdict.reason === "quota_exhausted", `unexpected reason for ${code}: ${verdict.reason}`);
       expect(verdict.scope === "cross-provider", `unexpected scope for ${code}: ${verdict.scope}`);
     }
+  }));
+
+  results.push(await runTest("workbuddy CraftRate token windows are per-model rate limits with an official reset time", () => {
+    // 真实事故样本(workbuddy/deepseek-v4.1-flash, stopReason=error 的原样 errorMessage)。
+    const realSample =
+      '429: {"message":"usage exceeds frequency limit, but don\'t worry, your usage will reset at ' +
+      '2026-09-19 09:43:30 UTC+8, alternatively, you can switch to the other models to continue using it.",' +
+      '"type":"invalid_request_error","code":"6004"}';
+
+    // 官方文案里的 UTC+8 时刻必须解析成确定的 epoch,而不是猜本地时区。
+    expect(
+      parseCraftResetAt(realSample, Date.UTC(2026, 7, 1)) === Date.UTC(2026, 8, 19, 1, 43, 30),
+      "the UTC+8 reset time must be converted to the exact epoch",
+    );
+    // 已经过去的时刻视为未知(窗口已恢复),交给冷却期兜底。
+    expect(
+      parseCraftResetAt(realSample, Date.UTC(2026, 8, 19, 1, 43, 31)) === undefined,
+      "an expired reset time must not be reported",
+    );
+    // 不带 UTC 偏移时无法确定 epoch:宁可未知,也不拿本地时区猜。
+    expect(
+      parseCraftResetAt('reset at 2026-09-19 09:43:30', Date.UTC(2026, 7, 1)) === undefined,
+      "a reset time without an explicit UTC offset must stay unknown",
+    );
+
+    // 宽松但显式的偏移写法要能识别(官方目前只见 UTC+8,但不应当因为写法微变就丢恢复时间)。
+    const epoch = Date.UTC(2026, 8, 19, 1, 43, 30);
+    const before = Date.UTC(2026, 7, 1);
+    for (const sample of [
+      "reset at 2026-09-19 09:43:30 UTC+8",
+      "your usage will reset at 2026-09-19 09:43:30 UTC+08:00",
+      "resets at 2026-09-19 09:43:30 GMT+0800",
+      "reset at 2026-09-19 01:43:30 UTC",
+      "reset at 2026-09-19T09:43:30 UTC+08",
+    ]) {
+      expect(
+        parseCraftResetAt(sample, before) === epoch,
+        `explicit UTC offset must be honored: ${sample}`,
+      );
+    }
+
+    // 非法或自相矛盾的时刻一律拒绝,绝不返回被 Date.UTC 规范化出来的“附近”时刻。
+    for (const sample of [
+      "reset at 2026-02-31 09:43:30 UTC+8",
+      "reset at 2026-09-19 25:70:00 UTC+8",
+      "reset at 2026-09-19 09:43:30 UTC+99",
+      "reset at 2026-09-19 09:43:30 UTC+08:99",
+      "reset at 2026-09-19 09:43:30 CST",
+      "reset at 2026-09-19 09:43:30 UTC+8 and reset at 2026-09-20 09:43:30 UTC+8",
+    ]) {
+      expect(
+        parseCraftResetAt(sample, before) === undefined,
+        `must not parse an invalid or conflicting stamp: ${sample}`,
+      );
+    }
+
+    setWorkbuddyRateLimitCooldownMs(DEFAULT_RATE_LIMIT_COOLDOWN_MS);
+    const resetAt = Math.floor((Date.now() + 2 * 3_600_000) / 1_000) * 1_000;
+    for (const code of ["6003", "6004"]) {
+      const verdict = workbuddyHandler.inspect(
+        assistantFailure(
+          "workbuddy",
+          "deepseek-v4.1-flash",
+          `429: {"message":"usage exceeds frequency limit, but don't worry, your usage will reset at ` +
+            `${formatUtc8(resetAt)}, alternatively, you can switch to the other models to continue using it.",` +
+            `"type":"invalid_request_error","code":"${code}"}`,
+        ),
+      );
+      expect(verdict, `workbuddy code ${code} was not detected`);
+      // 按模型计的免费档窗口,不是账户余额:同 provider 的付费档/其它部署有独立配额。
+      expect(verdict.reason === "rate_limited", `unexpected reason for ${code}: ${verdict.reason}`);
+      expect(verdict.scope === "any", `code ${code} must allow the same-provider paid line`);
+      expect(
+        verdict.resetsAt === resetAt,
+        `code ${code} must use the official reset time, got ${verdict.resetsAt}`,
+      );
+      expect(
+        !/账户额度耗尽/.test(verdict.note ?? ""),
+        `code ${code} must not tell the user the account is out of quota: ${verdict.note}`,
+      );
+    }
+
+    // 文案里没有重置时刻时退回配置的冷却期,仍然带到期自动解 ban 的 resetsAt。
+    const withoutReset = workbuddyHandler.inspect(
+      assistantFailure(
+        "workbuddy",
+        "deepseek-v4.1-flash",
+        '429: {"message":"usage exceeds frequency limit","type":"invalid_request_error","code":"6004"}',
+      ),
+    );
+    expect(withoutReset, "a 6004 without a reset time must still switch the chain");
+    expect(
+      typeof withoutReset!.resetsAt === "number" &&
+        withoutReset!.resetsAt! <= Date.now() + DEFAULT_RATE_LIMIT_COOLDOWN_MS + 1_000,
+      "a 6004 without a reset time must fall back to the configured cooldown",
+    );
+
+    // 6008(RPD)与 6004(TPD)同为官方日配额,固定 60s 冷却对日窗口明显偏短,
+    // 因此同样必须优先采用文案里的官方重置时刻。
+    const dailyReset = Math.floor((Date.now() + 4 * 3_600_000) / 1_000) * 1_000;
+    const rpd = workbuddyHandler.inspect(
+      assistantFailure(
+        "workbuddy",
+        "deepseek-v4.1-flash",
+        `429: {"message":"usage exceeds frequency limit, your usage will reset at ${formatUtc8(dailyReset)}",` +
+          '"type":"invalid_request_error","code":"6008"}',
+      ),
+    );
+    expect(rpd, "workbuddy code 6008 was not detected");
+    expect(rpd.reason === "rate_limited", `unexpected reason for 6008: ${rpd.reason}`);
+    expect(rpd.scope === "any", `unexpected scope for 6008: ${rpd.scope}`);
+    expect(
+      rpd.resetsAt === dailyReset,
+      `6008 must use the official daily reset time, got ${rpd.resetsAt}`,
+    );
+
+    // 日窗口不可能在数天后才恢复:超出上界说明解析出了错误时间,退回冷却期而不是给出假承诺。
+    const absurd = workbuddyHandler.inspect(
+      assistantFailure(
+        "workbuddy",
+        "deepseek-v4.1-flash",
+        `429: {"message":"usage exceeds frequency limit, your usage will reset at ${formatUtc8(Date.now() + 30 * 24 * 3_600_000)}",` +
+          '"type":"invalid_request_error","code":"6004"}',
+      ),
+    );
+    expect(absurd, "a 6004 with an out-of-range stamp must still switch the chain");
+    expect(
+      absurd!.resetsAt! <= Date.now() + DEFAULT_RATE_LIMIT_COOLDOWN_MS + 1_000,
+      "an out-of-range daily reset must fall back to the cooldown instead of a bogus deadline",
+    );
+
+    // 与其它瞬时限流一致:冷却配成 <=0 即关闭该逃逸(回到交给 pi 退避重试)。
+    setWorkbuddyRateLimitCooldownMs(0);
+    expect(
+      workbuddyHandler.inspect(assistantFailure("workbuddy", "deepseek-v4.1-flash", realSample)) === null,
+      "a disabled escape must keep 6003/6004 on pi retry",
+    );
+    setWorkbuddyRateLimitCooldownMs(DEFAULT_RATE_LIMIT_COOLDOWN_MS);
   }));
 
   results.push(await runTest("workbuddy rate-limit codes switch the chain with a cooldown", () => {
@@ -1537,6 +1688,105 @@ async function runRegressionTests(): Promise<TestResult[]> {
       called[0].provider === "workbuddy" && called[0].id === "deepseek-v4.1-flash-sg",
       `wrong fallback target: ${called[0].provider}/${called[0].id}`,
     );
+  }));
+
+  results.push(await runTest("engine hops to the same-provider paid line on a workbuddy 6004 and autoRestores", async () => {
+    // 真实事故:免费档 deepseek-v4.1-flash 的 CraftRate 窗口用尽(code 6004)。
+    // 官方 ModelRateLimitCap 给 freeId=deepseek-v4.1-flash / paidId=…-sg 双档且
+    // allowPaidSwitch=true,因此必须走到链上的付费档,而不是当成账户余额耗尽
+    // 把整个 provider 跳过;ban 要带官方重置时刻,autoRestore 才能切回免费档。
+    setWorkbuddyRateLimitCooldownMs(DEFAULT_RATE_LIMIT_COOLDOWN_MS);
+    const harness = engineHarness(
+      {
+        chains: [[
+          "workbuddy/deepseek-v4.1-flash",
+          "workbuddy/deepseek-v4.1-flash-sg",
+          "command-code/deepseek/deepseek-v4.1-flash",
+        ]],
+        fallbacks: {},
+        autoRestore: true,
+      },
+      [
+        { provider: "workbuddy", id: "deepseek-v4.1-flash" },
+        { provider: "workbuddy", id: "deepseek-v4.1-flash-sg" },
+        { provider: "command-code", id: "deepseek/deepseek-v4.1-flash" },
+      ],
+      { provider: "workbuddy", id: "deepseek-v4.1-flash" },
+    );
+
+    const resetAt = Math.floor((Date.now() + 2 * 3_600_000) / 1_000) * 1_000;
+    await harness.emit(
+      assistantFailure(
+        "workbuddy",
+        "deepseek-v4.1-flash",
+        '429: {"message":"usage exceeds frequency limit, but don\'t worry, your usage will reset at ' +
+          `${formatUtc8(resetAt)}, alternatively, you can switch to the other models to continue using it.",` +
+          '"type":"invalid_request_error","code":"6004"}',
+      ),
+    );
+
+    const called = harness.pi.setModelCalls as Array<{ provider: string; id: string }>;
+    expect(called.length === 1, `expected 1 switch, got ${called.length}`);
+    expect(
+      called[0].provider === "workbuddy" && called[0].id === "deepseek-v4.1-flash-sg",
+      `the free line must hop to its paid line: ${called[0].provider}/${called[0].id}`,
+    );
+
+    const ban = harness.bans.get("workbuddy/deepseek-v4.1-flash");
+    expect(ban, "a CraftRate token window must ban the exhausted model");
+    expect(ban!.reason === "rate_limited", `unexpected ban reason: ${ban!.reason}`);
+    expect(ban!.scope === "any", `unexpected ban scope: ${ban!.scope}`);
+    expect(ban!.resetsAt === resetAt, `the ban must carry the official reset time, got ${ban!.resetsAt}`);
+    expect(
+      !/账户额度耗尽/.test(ban!.note ?? ""),
+      `the ban note must not claim an account-level quota loss: ${ban!.note}`,
+    );
+    // autoRestore 依赖这次终态的 resetsAt,不能被丢弃。
+    expect(
+      harness.state.original?.model === "deepseek-v4.1-flash" && harness.state.resetsAt === resetAt,
+      "the restore snapshot must keep the official reset time",
+    );
+
+    // 到点后自动切回免费档。
+    (harness.ctx as { model: { provider: string; id: string } }).model = {
+      provider: "workbuddy",
+      id: "deepseek-v4.1-flash-sg",
+    };
+    harness.state.resetsAt = Date.now() - 1;
+    await harness.emitBeforeAgentStart();
+    const restored = harness.pi.setModelCalls as Array<{ provider: string; id: string }>;
+    expect(restored.length === 2, `autoRestore did not run, calls=${restored.length}`);
+    expect(
+      restored[1].provider === "workbuddy" && restored[1].id === "deepseek-v4.1-flash",
+      `autoRestore picked the wrong model: ${restored[1].provider}/${restored[1].id}`,
+    );
+  }));
+
+  results.push(await runTest("engine keeps workbuddy 6004 on pi retry when the escape is disabled", async () => {
+    // 与其它瞬时限流一致:冷却期 <=0 关闭逃逸后不得切模型/写 ban。
+    const harness = engineHarness(
+      {
+        chains: [["workbuddy/deepseek-v4.1-flash", "workbuddy/deepseek-v4.1-flash-sg"]],
+        fallbacks: {},
+        workbuddyRateLimitCooldownMs: 0,
+      },
+      [
+        { provider: "workbuddy", id: "deepseek-v4.1-flash" },
+        { provider: "workbuddy", id: "deepseek-v4.1-flash-sg" },
+      ],
+      { provider: "workbuddy", id: "deepseek-v4.1-flash" },
+    );
+
+    await harness.emit(
+      assistantFailure(
+        "workbuddy",
+        "deepseek-v4.1-flash",
+        '429: {"message":"usage exceeds frequency limit","type":"invalid_request_error","code":"6004"}',
+      ),
+    );
+
+    expect(harness.pi.setModelCalls.length === 0, "a disabled escape must not switch models");
+    expect(harness.bans.list().length === 0, "a disabled escape must not ban");
   }));
 
   results.push(await runTest("engine keeps a workbuddy 14003 on pi retry when the escape is disabled", async () => {

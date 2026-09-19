@@ -80,19 +80,44 @@ message_end(assistant, error)
 
 这个 provider 有个前提:WorkBuddy 原生错误是 `{code, msg}`,而 pi 的 openai-completions 路径只保留 OpenAI 形状 `{error:{message,...}}`,不改写时 `errorMessage` 会退化成 `"400 status code (no body)"`——业务码与文案全部丢失,TUI 和本扩展都看不见原因。`pi-workbuddy-connect` 扩展在 fetch 层把 `{code,msg}` 补成 `{error:{message,type,code}}`(`code` 保留为字符串,因为 pi 只透传 `error.error.code`),本 handler 才能读到 `"400: {\"message\":\"…\",\"code\":\"14001\"}"`。
 
-`quota_exhausted` / `cross-provider`,覆盖账户/计划额度耗尽:
+`quota_exhausted` / `cross-provider`,覆盖账户/计划额度耗尽(官方归类 `quota_balance_exhausted`):
 
 | code | 含义 |
 |---|---|
 | `14001` | UsageLimitExceeded |
 | `14002` | ConversationChatTooMany(同一额度的并发表现) |
 | `14012` / `14013` / `14014` | 企业/腾讯侧额度耗尽 |
-| `14018` / `14019` | 用户额度 / token 预算耗尽 |
-| `6003` / `6004` | 每小时 / 每日 token 配额 |
+| `14018` | 用户额度耗尽 |
+
+> `14019`(`UsageLimitNoTokenBudget`)只在早期文档/版本里出现:当前官方制品里该码与 `UsageLimitNoTokenBudget` 的检索计数均为 `0`,`UsageLimit*` 枚举只有 `14001/14012/14013/14014/14015/14016/14017/14018`。handler 保留它仅作 legacy 兼容,不影响现行判定。
 
 无业务码时按官方兜底把 `429` 视为额度耗尽,但要求文案里出现额度语义(`usage limit` / `quota` / `balance` / `insufficient credits`)。
 
-**瞬时限流(直接切链)**:`14003` 与 `6005`-`6008`、以及无 code 的裸 `429`。这些错误 pi 会退避重试(默认 3 次,1s/2s/4s,共约 7 秒),但 WorkBuddy 单请求就要数分钟,7 秒总退避远小于限流窗口 —— 重试耗尽后 pi 只会把错误交还用户、任务中断。因此**按配置直接切备用链**,不再等重试耗尽:判为 `rate_limited` + `scope: any`(逐跳按你配的链走 —— 限流常是 per-model/endpoint 的,同 provider 的另一部署也可能有独立配额),并带 `workbuddyRateLimitCooldownMs`(默认 60s)的 `resetsAt`,到期自动解 ban、模型重新可用。把该值配成 `<=0` 即关闭此逃逸,回到"全部交给 pi 退避重试"的旧行为。
+**限流 / 配额窗口(直接切链)**:`14003`、`6003`/`6004`、`6005`-`6008`、以及无 code 的裸 `429`。这些错误 pi 会退避重试(默认 3 次,1s/2s/4s,共约 7 秒),但 WorkBuddy 单请求就要数分钟,7 秒总退避远小于限流窗口 —— 重试耗尽后 pi 只会把错误交还用户、任务中断。因此**按配置直接切备用链**,不再等重试耗尽:判为 `rate_limited` + `scope: any`(逐跳按你配的链走 —— 限流窗口按模型计算,同 provider 的另一档位/其它部署有独立配额),并带 `resetsAt`,到期自动解 ban、模型重新可用。把 `workbuddyRateLimitCooldownMs` 配成 `<=0` 即关闭此逃逸,回到"全部交给 pi 退避重试"的旧行为。
+
+`6003`(CraftRateTPHLimit)/`6004`(CraftRateTPDLimit)虽然与 `6005`-`6008` 同属官方 `CraftRate*` 限流族(归类 `quota_token_limit`),但它们是**按模型的免费档 token 窗口**,不是账户级余额:
+
+- 官方 `isCraftDailyQuotaBusinessCode` 集合为 `{6004, 6008}`,且这两个码在 `isRequestLevelRetryableError` 里被**显式排除在重试之外** —— 官方自己也认为日粒度窗口不应交给退避重试,而应换模型继续;`6000`-`6002`(秒/分钟级)不在该集合里,仍交给 pi 退避重试。注意官方 `isTransientRateLimitBusinessCode` 覆盖的是 `6000`-`6003` / `6005`-`6007` 加 `14003`,**不含** `6004`/`6008`(日配额被单独摘出来);
+- 官方产品配置 `productFeaturesConfig.ModelRateLimitCap` 给出 freeId/paidId 双档(实测 WorkBuddy 国际版为 `freeId=deepseek-v4.1-flash` 记 `x0.00` credits、`paidId=deepseek-v4.1-flash-sg` 记 `x0.03` credits,且 `allowPaidSwitch=true`);
+- 真实错误文案自己就给出了官方逃生路径,形如:
+
+  ```
+  429: {"message":"usage exceeds frequency limit, but don't worry, your usage will reset at
+  2026-09-19 09:43:30 UTC+8, alternatively, you can switch to the other models to continue
+  using it.","type":"invalid_request_error","code":"6004"}
+  ```
+
+因此这两码按**限流窗口**处理:`scope: "any"`,用户链上的付费档(`workbuddy/deepseek-v4.1-flash-sg`)与其它 provider 都会被逐跳尝试,而不是像 `14001` 那样判成账户级终态把整个 provider 跳过;`resetsAt` 优先取文案里的官方重置时刻,这样 `/failback status` 与 `autoRestore` 都能拿到真实恢复时间。note 文案也明确写"仅该模型受限",不会误导用户去充值/升级账户。
+
+`6008`(CraftRateRPDLimit)与 `6004` 同为官方日配额,因此与它们共享同一条恢复时间路径:固定 60 秒冷却对日窗口明显偏短,解析到官方重置时刻时优先采用。
+
+**恢复时刻的解析纪律**(任何一条不满足即退回冷却期兜底,绝不给出猜测时刻):
+
+- **必须带显式 UTC/GMT 偏移**(`UTC+8` / `UTC+08:00` / `GMT+0800`)。缺偏移时无法确定 epoch,猜本地时区会让 `autoRestore` 在错误时刻切回;`CST`/`IST` 这类有歧义缩写一律不接受;
+- **各字段必须真实存在**:月/日/时/分/秒做范围校验并 round-trip 比对,避免 `2026-02-31`、`25:70`、`UTC+99` 被 `Date.UTC` 悄悄规范化成另一个时刻;
+- **必须是未来时刻**,且**日窗口不得超过 3 天**(超出说明解析出了错误时间,宁可退回冷却期也不给出假承诺);
+- **必须只有一个、无冲突的时刻**:同时出现多个不同时刻时拒绝解析;
+- 冷却期只是**估计**,不是真实窗口恢复时刻。`autoRestore` 会在该时刻提前切回源模型;若窗口其实仍开着,只是一次额外试探,不会造成停机。
 
 > 与 pi auto_retry 不会双重续跑:failback 排入的 steer 消息会被 auto_retry 的 `agent.continue()` 在 `runLoop` 开头 drain 掉,且此时模型已是切换后的目标模型 —— 恰好一次续跑。
 
@@ -171,7 +196,7 @@ WorkBuddy 的推理端点(apisix/openresty 网关)会以**纯 HTML 页面**返�
 | `banFileTtlMs` | `604800000` | 孤儿 session ban 文件的惰性清理 TTL(7 天);设为 `0` 或负数关闭 |
 | `autoRestore` | `false` | 配额恢复后自动切回原模型(每次 agent 启动时检查,不打断进行中的任务) |
 | `workbuddyTransientOutageStreak` | `3` | workbuddy:2 分钟内同一模型连续几次上游 5xx 网关页后允许一次跨 provider 逃逸;`<=0` 关闭 |
-| `workbuddyRateLimitCooldownMs` | `60000` | workbuddy:命中瞬时限流(`14003`/`6005`-`6008`/裸 `429`)时直接切备用链,并对源模型设这么久的冷却 ban;`<=0` 关闭(交给 pi 退避重试) |
+| `workbuddyRateLimitCooldownMs` | `60000` | workbuddy:命中限流/配额窗口(`14003`/`6003`/`6004`/`6005`-`6008`/裸 `429`)时直接切备用链,并对源模型设冷却 ban;`6003`/`6004`/`6008` 优先用错误文案里的官方重置时刻,解析不到才用该值;`<=0` 关闭(交给 pi 退避重试) |
 | `workbuddyWafStreak` | `1` | workbuddy:连续几次 WAF 拦截页后跨 provider 逃逸;默认 `1`(首次即逃逸,pi 不重试 403);`<=0` 关闭 |
 
 ### 链式语义
@@ -281,7 +306,7 @@ export const myProviderHandler: ProviderFailbackHandler = {
 - ModelScope `insufficient_quota` 与 `429 {"message":"insufficient balance"}`
 - Command Code 四类终态(`model_not_in_plan` / `quota_exhausted` / `usage_limit` / `spend_limit`)判定与 `scope` 语义,以及瞬时限流、5xx、`401`、`403 upgrade_required`、`unsupported_model`、`cmd_zdr_no_providers` 的离线排除用例
 - Command Code 解析纪律:换行后追加的 `metadata.raw` 与嵌套字段里的同名 token 不得把非终态错误升级为终态;终态 code 不被同层非终态 `type` 覆盖;`MODEL_NOT_IN_PLAN` 走 `scope:"any"` 时不会跳过同 provider 的可用模型
-- WorkBuddy 账户额度码(`14001` 等 9 个)判为终态、非终态码(限流/鉴权/未开通/模型错误/上下文超长/会话数/联网搜索)全部排除、未知 code 不猜测、无 code 的 `429` 需额度文案佐证;以及 workbuddy 链路的引擎级接续
+- WorkBuddy 账户额度码(`14001` 等 7 个)判为终态、非终态码(限流/鉴权/未开通/模型错误/上下文超长/会话数/联网搜索)全部排除、未知 code 不猜测、无 code 的 `429` 需额度文案佐证;以及 workbuddy 链路的引擎级接续- WorkBuddy CraftRate token 窗口(`6003`/`6004`)与日配额 `6008` 按 per-model 限流处理(真实 `6004` 文案的 `UTC+8` 重置时刻解析为精确 epoch;缺偏移、非法日期、已过期、多个冲突时刻、日窗口超出 3 天上界时都退回冷却期),引擎级会走到用户链上的同 provider 付费档而不是跳过整个 provider,ban 携带官方重置时刻从而让 `autoRestore` 能切回免费档;`<=0` 时与其它瞬时限流一样不切不 ban
 - WorkBuddy 上游网关故障的有界逃逸:单次 502/504 页保持瞬时、连续到阈值才逃逸、逃逸后计数复位、阈值 `<=0` 关闭、计数按模型隔离;带 JSON 体的响应与裸 5xx 状态行都不误判为网关页;以及引擎级的连续故障切换与 steering
 - WorkBuddy WAF 403 拦截页的即时逃逸:真实样本(含内联 `<script>` 的 HTML)首次即判 `waf_blocked` + `cross-provider` + 有界冷却,引擎级切换会跳过同 provider 的下一跳;带 JSON 体的 403、普通 403 HTML 页与裸 `403 status code (no body)` 都不触发;WAF 计数与 5xx 计数互不干扰,阈值 `<=0` 关闭后不再切换/ban/steering
 - `pi-workbuddy-connect` 的错误信封补全:`{code,msg}` → `{error:{message,type,code}}`,`code` 以字符串保留(实测真实 API 的 `11101` 与 mock 的 `14001` 均能活到 `errorMessage`)

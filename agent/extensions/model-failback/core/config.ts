@@ -29,8 +29,10 @@ export interface FailbackConfig {
    */
   workbuddyTransientOutageStreak?: number;
   /**
-   * workbuddy:命中瞬时限流(14003 / 6005-6008 / 无 code 的 429)时直接切备用链,
+   * workbuddy:命中瞬时限流(14003 / 6003-6008 / 无 code 的 429)时直接切备用链,
    * 并对该模型设这么久的冷却 ban。默认 60s;<=0 关闭(回到全部交给 pi 重试)。
+   * 6003/6004 是 per-model 的 CraftRate token 窗口,优先用错误文案里的官方
+   * 重置时刻,解析不到才用这个值。
    */
   workbuddyRateLimitCooldownMs?: number;
   /**
