@@ -28,10 +28,6 @@
 
 `subagent_wait` 会阻塞到这些 run 结束（或 `timeoutMs` 到期），所以它不适合用来看一眼进展。查看某个 run 的状态用 `subagent_status`，查看它目前产出的内容用 `subagent_logs`；两者都立即返回。
 
-> The Architect should first reduce ambiguity enough to define the objective, expected outcome, affected area, and major constraints and only then delegate.
-
-Architect 应先将歧义降低到足以明确目标、预期结果、受影响范围和主要约束，然后再进行委派。
-
 - > `lite`: a clear, local, reversible, low-risk change with a known target and a clear acceptance method.
 
   `lite`：目标明确、验收方式清晰，且改动局部、可逆、低风险。

@@ -10,8 +10,6 @@ For agent discovery, load user-level agents from `~/.pi/agent/agents` and projec
 `subagent` returns one `runId` per subagent and does not include the subagent's output. Collect results with `subagent_wait`: with no arguments it waits for every outstanding run, including all tasks of a parallel call, and explicit runIds wait for specific runs.
 `subagent_wait` blocks until those runs settle (or `timeoutMs` elapses), so it is the wrong tool for a quick look. Use `subagent_status` for a run's status and `subagent_logs` for what it has produced so far; both return immediately.
 
-The Architect should first reduce ambiguity enough to define the objective, expected outcome, affected area, and major constraints and only then delegate.
-
 - `lite`: a clear, local, reversible, low-risk change with a known target and a clear acceptance method.
 - `worker`: substantial or multi-step execution after the objective, scope, and approach are reasonably clear.
 - `reviewer`: requested reviews and validation that is substantial, risky, security-sensitive, or consequential to external parties. It is read-only and does not perform or apply changes.
