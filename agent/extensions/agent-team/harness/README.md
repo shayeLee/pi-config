@@ -68,6 +68,12 @@ node agent/extensions/agent-team/harness/overrides.mjs
 另外断言临时 agent 配置确实到达子进程（`--model`/`--tools`/追加系统提示词）、
 `cwd` 转发、扩展注册项（tool/command/shortcut/handler）齐全。
 
+TUI 渲染契约（`subagent` 行的 `renderResult`）另有断言：公告行只报告状态（agent、
+`running` / 终态、实时 usage），不渲染 `Activity` 与工具输出——同一 run 的工具轨迹由收口
+它的 `subagent_wait` 行渲染，两行都渲染会把同一 run 打印两遍；展开公告行只补充 Task。
+公告行在每次重绘时重读 FleetStore（构造时快照会冻结状态）。`subagent_wait` 行仍必须
+渲染工具调用、工具结果与最终输出（见 `run.mjs` 的 9m–9p 断言组）。
+
 ## presentation.mjs（展示层）
 
 0. **依赖边界（静态）**：数据流层 `index.ts` 只从 `fleet-store.ts` 取状态，从

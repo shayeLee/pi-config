@@ -216,7 +216,11 @@ Pi 工具结果包含两个用途不同的字段：
 
 ## TUI 展示
 
-TUI 使用独立的轻量展示，不铺满工具成功/失败背景色。折叠视图按 `Activity` 和 `Result` 分区：
+TUI 使用独立的轻量展示，不铺满工具成功/失败背景色。
+
+**同一 run 只在收口处展开一次**：`subagent` 行只报告状态（agent、来源、`running` / 终态图标、实时 usage），其工具调用与助手消息由收口该 run 的 `subagent_wait` 行渲染——否则同一 run 的 `Activity` 与 `Progress` 会在对话里出现两遍。所以在 `subagent_wait` 之前，`subagent` 行的工具活动是**故意不显示**的，不是丢失：`Ctrl+O` 展开该行可看到 Task，完整轨迹在 `subagent_wait` 行或 Fleet 浮层 / Web UI。
+
+`subagent_wait` 行的折叠视图按 `Activity` 和 `Result` 分区：
 
 - `Activity` 汇总工具调用数量与类型，并只列出最近的调用；
 - `Result` 使用 Markdown 渲染子代理最终结论；

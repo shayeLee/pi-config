@@ -360,8 +360,8 @@ interface SubagentDetails {
 	results: SingleResult[];
 	// Run ids of background runs announced by `subagent`. Their live state is read
 	// from FleetStore at render time (the store is already the single source of
-	// truth for in-flight runs), so the announced row can show progress before any
-	// durable result exists.
+	// truth for in-flight runs), so the announced row can show live status before
+	// any durable result exists.
 	liveRunIds?: string[];
 }
 
@@ -612,42 +612,15 @@ function summarizeMessage(message: unknown): string {
 }
 
 /**
- * Projects a live FleetRun onto the settled SingleResult shape the transcript
- * renderer already consumes. `subagent` announces runs before any durable
- * result exists, so reading FleetStore at render time is what makes the row
- * show progress live.
+ * Projects a live FleetRun onto the SingleResult shape the announcement row
+ * reads: agent, live status and live usage.
+ *
+ * The run's messages ride along untouched. The announcement row renders no tool
+ * calls and no prose (see `announceOnly`), so nothing synthetic is fabricated
+ * for it — a half-landed tool call must never make the two rows disagree about
+ * what the run did.
  */
 function fleetRunToSingleResult(run: FleetRun): SingleResult {
-	const messages = run.messages.slice();
-	// `getDisplayItems` only reads durable messages, so a tool call whose assistant
-	// message_end has not landed yet is invisible. toolUpdates entries are exactly
-	// the in-flight calls; add synthetic assistant toolCall messages for the ones
-	// the durable transcript does not carry already, so the Activity section can
-	// reuse its normal rendering.
-	const durableCallIds = new Set<string>();
-	for (const message of messages) {
-		if (message.role !== "assistant") continue;
-		for (const part of message.content) if (part.type === "toolCall") durableCallIds.add(part.id);
-	}
-	for (const [toolCallId, update] of Object.entries(run.toolUpdates)) {
-		if (update.phase !== "streaming" || durableCallIds.has(toolCallId)) continue;
-		messages.push({
-			role: "assistant",
-			content: [{ type: "toolCall", id: toolCallId, name: update.toolName, arguments: {} }],
-		} as unknown as Message);
-		// Pair the call with its streaming output so an expanded row shows what the
-		// subagent is producing right now, not just that some tool is running.
-		const streamed = fleetToolOutputText(update.content);
-		if (streamed) {
-			messages.push({
-				role: "toolResult",
-				toolName: update.toolName,
-				toolCallId,
-				content: [{ type: "text", text: streamed }],
-				isError: Boolean(update.isError),
-			} as unknown as Message);
-		}
-	}
 	const status = run.status;
 	return {
 		runId: run.id,
@@ -655,7 +628,7 @@ function fleetRunToSingleResult(run: FleetRun): SingleResult {
 		agentSource: run.agentSource ?? "unknown",
 		task: run.task,
 		exitCode: status === "running" ? -1 : status === "completed" ? 0 : 1,
-		messages,
+		messages: run.messages,
 		stderr: "",
 		usage: run.usage,
 		model: run.model,
@@ -710,15 +683,16 @@ class LiveSubagentRow implements Component {
 }
 
 /**
- * Renders a subagent tool result: header, tool-call activity and final output.
+ * Renders a subagent tool result.
  *
- * Shared by `subagent` and `subagent_wait`: `subagent` announces runs as they
- * start and carries no settled results, while `subagent_wait` carries the
- * settled ones. Both must render identically, so the logic lives here instead
- * of being duplicated per tool.
+ * Shared by `subagent` and `subagent_wait`, which render different things on
+ * purpose: `subagent` announces a run and shows only its live status, while
+ * `subagent_wait` carries the settled record and shows the tool-call activity
+ * and the final output. Rendering the activity in both rows would print the
+ * same run twice in the transcript.
  *
  * Returns a component that re-reads the announced runs on every render, so a
- * running `subagent` row keeps showing progress. The settled path is static and
+ * running `subagent` row keeps its status live. The settled path is static and
  * is built once.
  */
 function renderSubagentResult(
@@ -756,6 +730,11 @@ function buildSubagentResultComponent(
 	const details: SubagentDetails | undefined = rawDetails && liveResults.length > 0
 		? { ...rawDetails, results: liveResults }
 		: rawDetails;
+	// `subagent` announces a run and carries no settled record; `subagent_wait`
+	// renders that run's tool calls and prose when the caller collects it. Both
+	// rows describing the same run the same way would duplicate one transcript, so
+	// the announcement row is status only and leaves the detail to the wait row.
+	const announceOnly = liveResults.length > 0;
 	const hasRunningResult = details?.results.some((item) => item.exitCode === -1) ?? false;
 	const hasFailedResult = details?.results.some((item) => item.exitCode !== -1 && isFailedResult(item)) ?? false;
 	const resultBackground = isPartial || hasRunningResult
@@ -849,20 +828,32 @@ function buildSubagentResultComponent(
 				: isError
 					? theme.fg("error", "✗")
 					: theme.fg("success", "✓");
+		let header = `${icon} ${theme.fg("toolTitle", theme.bold(r.agent))}${theme.fg("muted", ` (${r.agentSource})`)}`;
+		if (isRunning) header += theme.fg("warning", "  running");
+		if (isStopped) header += theme.fg("warning", "  stopped");
+		else if (isError && r.stopReason) header += ` ${theme.fg("error", `[${r.stopReason}]`)}`;
+		const usageStr = formatUsageStats(r.usage, r.model, r.thinkingLevel);
+		if (usageStr) header += theme.fg("dim", `  ${usageStr}`);
+		const errorLine = Boolean(isError && !isStopped && r.errorMessage);
+
+		const container = new Container();
+		container.addChild(new Text(header, 0, 0));
+		if (errorLine) container.addChild(new Text(theme.fg("error", `Error: ${r.errorMessage}`), 0, 0));
+
+		if (announceOnly) {
+			// Status line only: expanding the row adds the task back, never the
+			// activity the `subagent_wait` row will report.
+			if (expanded) {
+				addSectionTitle(container, "Task");
+				container.addChild(new Text(theme.fg("dim", r.task), 1, 0));
+			}
+			return shell(container);
+		}
+
 		const displayItems = getDisplayItems(r.messages, expanded);
 		const finalOutput = getFinalOutput(r.messages);
 
 		if (expanded) {
-			const container = new Container();
-			let header = `${icon} ${theme.fg("toolTitle", theme.bold(r.agent))}${theme.fg("muted", ` (${r.agentSource})`)}`;
-			if (isRunning) header += theme.fg("warning", "  running");
-			if (isStopped) header += theme.fg("warning", "  stopped");
-			else if (isError && r.stopReason) header += ` ${theme.fg("error", `[${r.stopReason}]`)}`;
-			const usageStr = formatUsageStats(r.usage, r.model, r.thinkingLevel);
-			if (usageStr) header += theme.fg("dim", `  ${usageStr}`);
-			container.addChild(new Text(header, 0, 0));
-			if (isError && !isStopped && r.errorMessage)
-				container.addChild(new Text(theme.fg("error", `Error: ${r.errorMessage}`), 0, 0));
 			addSectionTitle(container, "Task");
 			container.addChild(new Text(theme.fg("dim", r.task), 1, 0));
 			if (displayItems.length === 0 && !finalOutput) {
@@ -880,18 +871,7 @@ function buildSubagentResultComponent(
 			return shell(container);
 		}
 
-		const container = new Container();
-		let header = `${icon} ${theme.fg("toolTitle", theme.bold(r.agent))}${theme.fg("muted", ` (${r.agentSource})`)}`;
-		if (isRunning) header += theme.fg("warning", "  running");
-		if (isStopped) header += theme.fg("warning", "  stopped");
-		else if (isError && r.stopReason) header += ` ${theme.fg("error", `[${r.stopReason}]`)}`;
-		const usageStr = formatUsageStats(r.usage, r.model, r.thinkingLevel);
-		if (usageStr) header += theme.fg("dim", `  ${usageStr}`);
-		container.addChild(new Text(header, 0, 0));
-		if (isError && !isStopped && r.errorMessage) {
-			container.addChild(new Text(theme.fg("error", `Error: ${r.errorMessage}`), 1, 0));
-			return shell(container);
-		}
+		if (errorLine) return shell(container);
 		if (displayItems.length === 0 && !finalOutput) {
 			container.addChild(new Text(theme.fg("muted", isRunning ? "starting…" : "(no output)"), 1, 0));
 			return shell(container);
@@ -939,6 +919,37 @@ function buildSubagentResultComponent(
 		const status = isRunning
 			? `${successCount + failCount + stoppedCount}/${details.results.length} done, ${running} running`
 			: `${successCount} completed${stoppedCount ? ` · ${stoppedCount} stopped` : ""}${failCount ? ` · ${failCount} failed` : ""}`;
+
+		if (announceOnly) {
+			// Same rule as the single branch: the announcement row carries the live
+			// per-run status, and `subagent_wait` carries the activity.
+			const container = new Container();
+			container.addChild(
+				new Text(
+					`${icon} ${theme.fg("toolTitle", theme.bold("parallel "))}${theme.fg("accent", status)}`,
+					0,
+					0,
+				),
+			);
+			for (const r of details.results) {
+				const rIcon =
+					r.exitCode === -1
+						? theme.fg("warning", "⏳")
+						: isStoppedResult(r)
+							? theme.fg("warning", "■")
+							: isFailedResult(r)
+								? theme.fg("error", "✗")
+								: theme.fg("success", "✓");
+				container.addChild(new Spacer(1));
+				let line = `${theme.fg("muted", "── ")}${theme.fg("accent", r.agent)} ${rIcon}`;
+				if (r.exitCode === -1) line += theme.fg("warning", "  running");
+				container.addChild(new Text(line, 0, 0));
+				if (expanded) {
+					container.addChild(new Text(theme.fg("muted", "Task: ") + theme.fg("dim", r.task), 0, 0));
+				}
+			}
+			return shell(container);
+		}
 
 		if (expanded && !isRunning) {
 			const container = new Container();

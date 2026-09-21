@@ -166,6 +166,11 @@ async function main() {
 	fs.chmodSync(fakePiPath, 0o755);
 
 	const logPath = path.join(tmpRoot, "fake-pi-log.jsonl");
+	// Theme helpers wrap content ("bg"/"fg" take a color then the text, "bold"
+	// takes the text), so echoing the last argument yields the visible text.
+	// Declared here because both the parallel and the single render assertions
+	// need it.
+	const fakeTheme = new Proxy({}, { get: () => (...args) => String(args[args.length - 1] ?? "") });
 	const savedEnv = {
 		PATH: process.env.PATH,
 		FAKE_PI_LOG: process.env.FAKE_PI_LOG,
@@ -369,6 +374,22 @@ async function main() {
 		check("parallel starts one run per task", parIds.length === 2, `ids=${parIds.join(",")}`);
 		check("parallel does not return task output inline", !parText.includes("FINAL-ANSWER-A"));
 		check("parallel lists every agent", parText.includes("worker"));
+		// The parallel announcement row follows the same rule as the single one:
+		// per-run status only, never the tool activity the wait row will render.
+		const parRowText = subagent
+			.renderResult(par, { expanded: false, isPartial: false }, fakeTheme, { isError: false })
+			.render(200)
+			.join("\n");
+		check(
+			"the parallel announcement row reports per-run running status",
+			parRowText.includes("running") && (parRowText.match(/worker/g) ?? []).length === 2,
+			parRowText.slice(0, 200),
+		);
+		check(
+			"the parallel announcement row does not render an Activity section",
+			!parRowText.includes("Activity") && !parRowText.includes("Ctrl+O"),
+			parRowText.slice(0, 200),
+		);
 
 		const parWait = await callTool(waitTool, { runIds: parIds, timeoutMs: 20000 });
 		const parWaitText = parWait.content[0]?.text ?? "";
@@ -935,15 +956,10 @@ async function main() {
 
 		// (9m) The transcript must show what the subagent actually did.
 		// `subagent` only announces runs (its details carry no results); the settled
-		// record arrives through `subagent_wait`. Both must render the tool-call
-		// activity, otherwise the run is invisible in the TUI even though the result
-		// is correct — a regression that output-only assertions cannot catch.
-		// Theme helpers wrap content ("bg"/"fg" take a color then the text, "bold"
-		// takes the text), so echoing the last argument yields the visible text.
-		const fakeTheme = new Proxy(
-			{},
-			{ get: () => (...args) => String(args[args.length - 1] ?? "") },
-		);
+		// record arrives through `subagent_wait`. The wait row is therefore what must
+		// render the tool-call activity, otherwise the run is invisible in the TUI
+		// even though the result is correct — a regression that output-only
+		// assertions cannot catch.
 		check(
 			"subagent_wait executes its own renderResult",
 			typeof waitTool.renderResult === "function",
@@ -1005,8 +1021,8 @@ async function main() {
 
 		// (9n) The `subagent` row must show a started run live. Its details carry no
 		// settled results, so the renderer reads the run's live FleetStore entry;
-		// otherwise the row degrades to plain announcement text and the user cannot
-		// see which tools the running subagent is calling.
+		// otherwise the row degrades to plain announcement text and the user sees no
+		// status for the run at all.
 		const renderSubagentRow = (result, expanded = false) => {
 			if (typeof subagent.renderResult !== "function") return "";
 			return subagent
@@ -1040,11 +1056,20 @@ async function main() {
 			liveRowText.includes("running"),
 			liveRowText.slice(0, 160),
 		);
+		// The `subagent` row announces the run; `subagent_wait` reports its activity
+		// when the caller collects it. Rendering the same tool calls in both rows
+		// would print one run twice, so the announcement row must stay status-only.
+		check(
+			"the announcement row does not render an Activity section",
+			!liveRowText.includes("Activity"),
+			liveRowText.slice(0, 160),
+		);
 		if (liveRunId) await callTool(stopTool, { runId: liveRunId });
 
-		// (9o) While a run is working, its row must show both the tool calls it has
-		// already made and the one executing right now. The in-flight call is not in
-		// the durable transcript, so this is the case that only a live view covers.
+		// (9o) While a run works, its announcement row must stay status-only: the
+		// tool calls it has made and the one executing right now belong to the
+		// `subagent_wait` row that collects the run. The Task stays reachable on
+		// expand, so nothing about the run is lost, only un-duplicated.
 		const workingRun = await subagent.execute(
 			"harness-call",
 			{ agent: "worker", task: "SCENARIO:tool_in_flight" },
@@ -1056,35 +1081,35 @@ async function main() {
 		let workingRowText = "";
 		for (let i = 0; i < 60; i++) {
 			workingRowText = renderSubagentRow(workingRun);
-			if (workingRowText.includes("bash") && workingRowText.includes("read")) break;
+			if (workingRowText.includes("turns")) break;
 			await new Promise((resolve) => setTimeout(resolve, 100));
 		}
-		check(
-			"a working run's row shows the tool it already called",
-			workingRowText.includes("read"),
-			workingRowText.slice(0, 220),
-		);
-		check(
-			"a working run's row shows the tool still executing",
-			workingRowText.includes("bash"),
-			workingRowText.slice(0, 220),
-		);
 		check(
 			"a working run's row is marked as running, not finished",
 			workingRowText.includes("running") && !workingRowText.includes("FINAL-ANSWER"),
 			workingRowText.slice(0, 220),
 		);
+		check(
+			"a working run's announcement row hides the tools the run called",
+			!workingRowText.includes("read") && !workingRowText.includes("bash"),
+			workingRowText.slice(0, 220),
+		);
+		check(
+			"a working run's announcement row hides in-flight tool output",
+			!workingRowText.includes("IN-FLIGHT-OUTPUT"),
+			workingRowText.slice(0, 220),
+		);
 		const workingExpanded = renderSubagentRow(workingRun, true);
 		check(
-			"an expanded working row shows the in-flight tool's streaming output",
-			workingExpanded.includes("IN-FLIGHT-OUTPUT"),
+			"expanding an announcement row adds the task, still not the activity",
+			workingExpanded.includes("SCENARIO:tool_in_flight") && !workingExpanded.includes("IN-FLIGHT-OUTPUT"),
 			workingExpanded.slice(-240),
 		);
 
 		// (9p) The row is CONSTRUCTED once, when the tool returns, and the TUI then
 		// repaints that same component tree. A component that snapshots FleetStore
-		// at construction shows nothing for the rest of the run; it must re-read
-		// state on every render instead.
+		// at construction would freeze its status for the rest of the run; it must
+		// re-read state on every render instead.
 		const frozenRun = await subagent.execute(
 			"harness-call",
 			{ agent: "worker", task: "SCENARIO:tool_in_flight" },
@@ -1099,33 +1124,34 @@ async function main() {
 		});
 		const firstFrame = frozenComponent.render(200).join("\n");
 		check(
-			"a just-started row shows no activity yet, and says it is starting",
-			!firstFrame.includes("read") && !firstFrame.includes("IN-FLIGHT-OUTPUT") && firstFrame.includes("starting"),
+			"a just-started row is running and shows no activity",
+			!firstFrame.includes("read") && !firstFrame.includes("IN-FLIGHT-OUTPUT") && firstFrame.includes("running"),
 			firstFrame.slice(0, 160),
 		);
 		// Let the run make progress, then repaint WITHOUT rebuilding the component.
+		// Live usage is the proof it re-read the store: the first frame had none.
 		let laterFrame = "";
 		for (let i = 0; i < 60; i++) {
 			await new Promise((resolve) => setTimeout(resolve, 100));
 			laterFrame = frozenComponent.render(200).join("\n");
-			if (laterFrame.includes("IN-FLIGHT-OUTPUT")) break;
+			if (laterFrame.includes("turns")) break;
 		}
 		check(
-			"repainting the same component shows the tool the run called meanwhile",
-			laterFrame.includes("read"),
+			"repainting the same component picks up the run's live usage",
+			!firstFrame.includes("turns") && laterFrame.includes("turns"),
 			laterFrame.slice(0, 220),
 		);
 		check(
-			"repainting the same component shows in-flight streaming output",
-			laterFrame.includes("IN-FLIGHT-OUTPUT"),
+			"repainting the same component still shows no activity",
+			!laterFrame.includes("read") && !laterFrame.includes("IN-FLIGHT-OUTPUT"),
 			laterFrame.slice(0, 220),
 		);
 		if (frozenRunId) await callTool(stopTool, { runId: frozenRunId });
 		if (workingRunId) await callTool(stopTool, { runId: workingRunId });
 
-		// After the run settles, its durable messages hold the tool calls. Reading
-		// the announced row without collecting through subagent_wait must surface
-		// them, so an uncollected run is still legible in the transcript.
+		// After the run settles, the announcement row reports the terminal status;
+		// the tool calls stay with the `subagent_wait` row. An uncollected run is
+		// therefore still legible in the transcript without being printed twice.
 		const settledLiveRun = await subagent.execute(
 			"harness-call",
 			{ agent: "worker", task: "SCENARIO:tool_calls" },
@@ -1141,8 +1167,13 @@ async function main() {
 		}
 		const settledLiveRowText = renderSubagentRow(settledLiveRun);
 		check(
-			"the uncollected subagent row shows a tool the run called",
-			settledLiveRowText.includes("bash"),
+			"the settled, uncollected announcement row shows the terminal status",
+			settledLiveRowText.includes("✓") && settledLiveRowText.includes("worker"),
+			settledLiveRowText.slice(0, 200),
+		);
+		check(
+			"the settled announcement row does not duplicate the activity",
+			!settledLiveRowText.includes("bash") && !settledLiveRowText.includes("Activity"),
 			settledLiveRowText.slice(0, 200),
 		);
 
