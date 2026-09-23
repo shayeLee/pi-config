@@ -1225,6 +1225,29 @@ async function main() {
 				(steerSent.content[0]?.text ?? "").slice(0, 100),
 			);
 
+			// The queued instruction is what the reader needs to verify, and it lives in
+			// the tool-call args rather than in `content`. Without a renderResult the
+			// transcript row would show only the status line, so the steered content has
+			// to be asserted through the renderer, not through the tool result alone.
+			check("subagent_steer exposes its own renderResult", typeof steerTool.renderResult === "function");
+			const steerArgs = { runId: steerRunId, message: "CHANGE-DIRECTION-NOW" };
+			const renderSteer = (result, expanded) =>
+				steerTool
+					.renderResult(result, { expanded, isPartial: false }, fakeTheme, { args: steerArgs, isError: false })
+					.render(200)
+					.join("\n");
+			const steerRendered = renderSteer(steerSent, false);
+			check(
+				"subagent_steer renders the steered message in the transcript",
+				steerRendered.includes("CHANGE-DIRECTION-NOW"),
+				steerRendered.slice(0, 160),
+			);
+			check(
+				"subagent_steer still renders the queued status alongside it",
+				steerRendered.includes("Steering message queued"),
+				steerRendered.slice(0, 160),
+			);
+
 			let delivered;
 			for (let i = 0; i < 100; i++) {
 				delivered = readFakeLog().find((e) => e.steerReceived);
@@ -1250,6 +1273,22 @@ async function main() {
 				steerAfterStop.isError === true &&
 					(steerAfterStop.content[0]?.text ?? "").includes("can no longer be steered"),
 				(steerAfterStop.content[0]?.text ?? "").slice(0, 90),
+			);
+			// A rejected steer must not silently look accepted: the row keeps the
+			// undelivered instruction visible next to the error text.
+			const rejectedRendered = steerTool
+				.renderResult(
+					steerAfterStop,
+					{ expanded: false, isPartial: false },
+					fakeTheme,
+					{ args: { runId: steerRunId, message: "too late" }, isError: true },
+				)
+				.render(200)
+				.join("\n");
+			check(
+				"a rejected steer still shows its message and the reason",
+				rejectedRendered.includes("too late") && rejectedRendered.includes("can no longer be steered"),
+				rejectedRendered.slice(0, 160),
 			);
 			const steerUnknown = await callTool(steerTool, { runId: "nope", message: "x" });
 			check("steering an unknown run is rejected", steerUnknown.isError === true);

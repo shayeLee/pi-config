@@ -2277,6 +2277,17 @@ export default function (pi: ExtensionAPI) {
 				],
 			};
 		},
+
+		// The queued instruction is the one thing the reader needs to verify, so the row
+		// prints it under the status line. It is read from `context.args` rather than
+		// folded into `content`, keeping the model-facing contract unchanged.
+		renderResult(result, _options, theme, context) {
+			const status = result.content[0]?.type === "text" ? result.content[0].text : "";
+			const message = typeof context.args?.message === "string" ? context.args.message : "";
+			let text = theme.fg(context.isError ? "error" : "muted", status);
+			if (message) text += `\n${theme.fg("dim", "  message: ")}${theme.fg("accent", message)}`;
+			return new Text(text, 0, 0);
+		},
 	});
 
 	pi.registerTool({

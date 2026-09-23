@@ -230,6 +230,8 @@ TUI 使用独立的轻量展示，不铺满工具成功/失败背景色。
 
 `renderCall` 和 `renderResult` 只控制 Pi TUI 展示，不改变主代理实际收到的 `content`，也不自动改变 pi-web 等其他宿主的渲染方式。
 
+`subagent_steer` 行在此之上有一条自己的渲染契约：投递成功的状态行下会再打印实际发出的指令文本（读自 `context.args`，不进入 `content`），被拒绝的 steer 也保留指令原文并配以错误文本——一眼就能核对「到底引导了什么」，并且被拒绝的 steer 不会看起来像已生效。
+
 ### FleetView 与对话浮层
 
 TUI 会在编辑器下方显示当前 session 的 FleetView：
@@ -279,7 +281,7 @@ FleetView、对话浮层和运行注册表只消费现有的 JSON 事件与 `Sin
 | `subagent_status` | 列出全部后台 run，或查询单个 run 的状态（running / completed / failed / stopped / interrupted）。 |
 | `subagent_logs` | 读取 run 的消息记录：已结束的 run 返回最终报告，运行中的 run 返回目前已采集的消息。可用 `tail` 限制条数。 |
 | `subagent_stop` | 停止运行中的 run。复用与浮层相同的终止链（SIGTERM → 5 秒 → SIGKILL），已采集的消息保留，终态为 `stopped`。 |
-| `subagent_steer` | 向运行中的 run 发送指令，**在下一个回合边界投递**（当前 assistant 回合执行完工具调用后、下一次 LLM 调用前）。 |
+| `subagent_steer` | 向运行中的 run 发送指令，**在下一个回合边界投递**（当前 assistant 回合执行完工具调用后、下一次 LLM 调用前）。指令内容从工具调用参数读取并原样打印在该行的 TUI 结果里，成功与失败都会显示，无需回翻参数。 |
 
 典型流程：先发起一个或多个子代理 → 期间可以继续工作或再发起 → 用 `subagent_wait` 收齐结果后再下结论。
 
