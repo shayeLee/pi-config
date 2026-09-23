@@ -320,8 +320,22 @@ FleetView、对话浮层和运行注册表只消费现有的 JSON 事件与 `Sin
 `hasUI` 为 `true`，扩展的对话框请求若无人应答，会让子进程在启动阶段静默 `exit 0`
 （事件循环排空触发 `beforeExit`），极难排查。
 
-`control-ext.js` 在 `agent_settled` 时关闭 socket listener——`net.Server` 会让 Node 事件循环
+`control-ext.js` 在 `agent_settled` 与 `session_shutdown` 时关闭 socket listener——`net.Server` 会让 Node 事件循环
 常驻，不关闭会导致子进程永不退出、父进程永久挂起。
+
+#### 启动门控（必读）
+
+socket 从 `session_start` 就监听，但 CLI **要等所有扩展的 `session_start` 处理完才提交初始 Task prompt**
+（print 模式的 `prompt(initialMessage)`）。父代理若在这条缝里 steer，命令会在 `isStreaming === false`
+时到达：`deliverAs` 被忽略，steer **自己启动一轮**，随后 CLI 提交 Task 时抛
+`Agent is already processing`，run 在产出任何东西前就 `exit=1`（实测 `turns=0`）。
+
+这个窗口是**跨进程**的，且被完整扩展集显著放大（stitch-mcp 等在 `session_start` 里做远程初始化）。
+因此 `control-ext.js` 把首个 `agent_start` 之前到达的命令**缓冲**起来，等任务回合真正取得会话后
+再按到达顺序放行。放行后的 steer 正常入队，不抢跑。
+
+新增扩展时请注意：**不要在 `session_start` 里做阻塞式初始化**，它直接决定了这个窗口的宽度。
+回归守护：`harness/steer-startup-gate.py`（在修复前的 `control-ext.js` 上稳定 FAIL）。
 
 后台 run **不绑定**父代理的 abort signal：父回合结束不应误杀后台子代理，停止只通过
 `subagent_stop`。Windows 无 AF_UNIX，`subagent_steer` 会明确返回「无控制通道」，其余工具正常。当前子进程仍使用一次性的 `--no-session` print 模式，不支持运行中 steer。

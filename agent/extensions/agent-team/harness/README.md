@@ -20,7 +20,14 @@
 node agent/extensions/agent-team/harness/run.mjs
 node agent/extensions/agent-team/harness/presentation.mjs
 node agent/extensions/agent-team/harness/overrides.mjs
+python3 agent/extensions/agent-team/harness/steer-startup-gate.py
 ```
+
+`steer-startup-gate.py` 是**真实 pi 子进程**的回归守护（不是 fake `pi`）：验证
+`subagent` 的初始 Task prompt 不会被抢先的 `subagent_steer` 挤掉。它必须用完整
+扩展集 + 发现式加载的 provoker 才能打开那个跨进程窗口——构造原因写在脚本头部，
+简化它会让竞态消失、守护退化成永远通过（这正是该 bug 当初溜过 harness 的方式）。
+注意它依赖 /Users/mz/.pi/agent/extensions 下的用户扩展集，不适合作为 CI 门禁。
 
 要求：
 
