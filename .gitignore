@@ -27,6 +27,8 @@ agent/thinking-breaker.json
 # 旧 git 包克隆（含嵌套 .git，体积大，不入库）
 agent/git/
 
-# WorkBuddy 凭据与本机状态
+# WorkBuddy 凭据与本机状态（两版各自的凭据与设置都不入库）
 agent/.workbuddy-auth.json
 agent/.workbuddy-settings.json
+agent/.workbuddy-cn-auth.json
+agent/.workbuddy-cn-settings.json

@@ -1,12 +1,12 @@
 {
   "name": "pi-workbuddy-connect",
   "version": "1.1.0",
-  "description": "WorkBuddy AI 国际版 provider for pi — plugin OAuth login, live credits, and per-model reasoning efforts.",
+  "description": "WorkBuddy provider for pi — WorkBuddy (CN) and WorkBuddy AI (international), plugin OAuth login, live credits, and per-model reasoning efforts.",
   "keywords": ["pi-package", "pi", "workbuddy", "provider"],
   "license": "MIT",
   "type": "module",
   "pi": {
-    "extensions": ["./extensions"]
+    "extensions": ["./extensions/workbuddy.ts"]
   },
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",

@@ -1,1019 +1,133 @@
-// WorkBuddy AI 国际版。登录走插件 OAuth 弹窗，桌面凭据仅作回退。推理档读产品配置。
-import { readFileSync } from "node:fs";
-import { readFile, writeFile, unlink } from "node:fs/promises";
-import { homedir } from "node:os";
-import { join } from "node:path";
-import type { OAuthCredentials, OAuthLoginCallbacks } from "@earendil-works/pi-ai";
+// WorkBuddy provider 入口：注册两个区域变体。
+//
+// - `workbuddy`    → WorkBuddy AI（国际版，www.workbuddy.ai）
+// - `workbuddy-cn` → WorkBuddy（国内版，www.workbuddy.cn）
+//
+// 两版各自的账号、积分、模型清单与设置互不混用；差异全部收敛在
+// `providers.ts` 的 ProviderSpec 里，本文件只负责把两个 spec 交给同一个实现。
+import { createHash } from "node:crypto";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import {
+  PROVIDERS,
+  WORKBUDDY_AI,
+  WORKBUDDY_CN,
+  buildAuthenticatedContextAad,
+  buildPiModels,
+  classifyDesktopAuthDocument,
+  creditsAreFree,
+  credFromPluginToken,
+  freeModelIds,
+  loadSettings,
+  openAuthField,
+  parseCredits,
+  parseProductConfig,
+  parseWorkBuddyAuth,
+  prepareChatPayload,
+  registerWorkBuddyProvider,
+  sealAuthFieldForTest,
+  selfCheckRefs,
+  statusText,
+  toOpenAIErrorEnvelope,
+  widgetLines,
+} from "./providers.ts";
 
-const PROVIDER = "workbuddy";
-const MARKER = "X-Pi-WorkBuddy";
-const GLOBAL_BASE = "https://www.workbuddy.ai";
-const CLIENT_UA = "CLI/2.63.2 CodeBuddy/2.63.2";
-const AUTH_ENV = "WORKBUDDY_AUTH_FILE";
-const AUTH_FILE = "workbuddy-desktop-ai.info";
-const PRODUCT_CONFIG_ENV = "WORKBUDDYAI_PRODUCT_CONFIG";
-const REFRESH_MARGIN_MS = 5 * 60 * 1000;
-const ZERO_COST = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
-const COMPAT = {
-  supportsDeveloperRole: false,
-  supportsReasoningEffort: true,
-  maxTokensField: "max_tokens" as const,
-};
-const EFFORTS = ["low", "medium", "high", "xhigh", "max"] as const;
-type Effort = (typeof EFFORTS)[number];
-type Scope = "free" | "all";
-type Visibility = "on" | "off";
-type Settings = { scope: Scope; visibility: Visibility };
-const LABEL = { on: "显示", off: "隐藏" } as const;
-
-export function thinkingLevelMap(efforts: readonly string[], canDisable = false) {
-  return {
-    off: canDisable ? "off" : null,
-    minimal: null,
-    low: efforts.includes("low") ? "low" : null,
-    medium: efforts.includes("medium") ? "medium" : null,
-    high: efforts.includes("high") ? "high" : null,
-    xhigh: efforts.includes("xhigh") ? "xhigh" : null,
-    max: efforts.includes("max") ? "max" : null,
-  } as const;
-}
-
-const HIGH_ONLY = thinkingLevelMap(["high"]);
-const LOW_HIGH = thinkingLevelMap(["low", "high"]);
-
-type Cred = {
-  accessToken: string;
-  refreshToken: string;
-  expiresAtMs: number;
-  domain: string;
-  uid: string;
-  enterpriseId?: string;
-  nickname?: string;
+export {
+  WORKBUDDY_AI,
+  WORKBUDDY_CN,
+  buildAuthenticatedContextAad,
+  buildPiModels,
+  classifyDesktopAuthDocument,
+  creditsAreFree,
+  credFromPluginToken,
+  freeModelIds,
+  loadSettings,
+  openAuthField,
+  parseCredits,
+  parseProductConfig,
+  parseWorkBuddyAuth,
+  prepareChatPayload,
+  sealAuthFieldForTest,
+  statusText,
+  toOpenAIErrorEnvelope,
+  widgetLines,
 };
 
-type ProductModel = {
-  id: string;
-  name: string;
-  credits?: string;
-  contextWindow: number;
-  maxTokens: number;
-  supportsImages: boolean;
-  supportsReasoning: boolean;
-  supportedEfforts?: Effort[];
-  canDisableThinking: boolean;
-};
-
-type ProductConfig = { source: "cache" | "builtin"; models: ProductModel[] };
-
-const FREE_IDS = ["hy3", "deepseek-v4.1-flash", "hy4-preview-f"] as const;
-// flash 的 max_tokens 不再封顶：原先硬压到 16k 是为了遮住 reasoning 复读，
-// 代价是长回答被截断。复读交给 thinking-breaker 观测/处理。
-
-const BUILTIN_MODELS: ProductModel[] = [
-  {
-    id: "deepseek-v4.1-flash",
-    name: "Deepseek-V4.1-Flash",
-    credits: "x0.00",
-    contextWindow: 1_000_000,
-    maxTokens: 128_000,
-    supportsImages: true,
-    supportsReasoning: true,
-    supportedEfforts: ["low", "medium", "high", "xhigh", "max"],
-    canDisableThinking: false,
-  },
-  {
-    id: "hy4-preview-f",
-    name: "Hy4 preview",
-    credits: "x0.00",
-    contextWindow: 1_000_000,
-    maxTokens: 64_000,
-    supportsImages: true,
-    supportsReasoning: true,
-    supportedEfforts: ["high"],
-    canDisableThinking: false,
-  },
-  {
-    id: "hy3",
-    name: "Hy3",
-    credits: "x0.00",
-    contextWindow: 192_000,
-    maxTokens: 64_000,
-    supportsImages: true,
-    supportsReasoning: true,
-    supportedEfforts: ["low", "high"],
-    canDisableThinking: false,
-  },
-];
-
-function agentDir(): string {
-  return process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent");
-}
-
-function productConfigPath(): string {
-  const override = process.env[PRODUCT_CONFIG_ENV]?.trim();
-  if (override) return override;
-  return join(homedir(), ".workbuddy-ai", "cache", "acc-product-config-v3.json");
-}
-
-function asRecord(value: unknown): Record<string, unknown> | undefined {
-  return typeof value === "object" && value !== null && !Array.isArray(value)
-    ? value as Record<string, unknown>
-    : undefined;
-}
-
-function positiveNumber(value: unknown): number | undefined {
-  return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : undefined;
-}
-
-/** 声明价为 0 即为免费。未标价的模型（`undefined` 或空串，如自动路由的 `default-model`）
- *  同样计入免费：没有任何证据表明它收费，而排除它会把 Auto 从免费清单里悄悄抹掉。
- *  上游两种写法都存在（`"x0.00"` 与 `"x0.34 credits"`），故先剥掉单位后缀再比对。 */
-export function creditsAreFree(credits: string | undefined): boolean {
-  if (credits === undefined) return true;
-  const price = credits.trim().replace(/\s*credits?\.?$/iu, "").trim();
-  if (price === "") return true;
-  return /^x?0(?:\.0+)?$/u.test(price);
-}
-
-function parseEffort(value: unknown): Effort | undefined {
-  return typeof value === "string" && (EFFORTS as readonly string[]).includes(value)
-    ? value as Effort
-    : undefined;
-}
-
-function parseProductModel(value: unknown): ProductModel | undefined {
-  const row = asRecord(value);
-  if (!row) return undefined;
-  const id = typeof row.id === "string" ? row.id.trim() : "";
-  if (id === "") return undefined;
-  const reasoning = asRecord(row.reasoning);
-  const rawEfforts = reasoning?.supportedEfforts;
-  let supportedEfforts: Effort[] | undefined;
-  if (Array.isArray(rawEfforts)) {
-    const efforts = rawEfforts.map(parseEffort).filter((e): e is Effort => e !== undefined);
-    if (efforts.length > 0) supportedEfforts = efforts;
-  }
-  return {
-    id,
-    name: typeof row.name === "string" && row.name !== "" ? row.name : id,
-    ...(typeof row.credits === "string" && row.credits.trim() !== "" ? { credits: row.credits.trim() } : {}),
-    contextWindow: positiveNumber(row.maxInputTokens) ?? positiveNumber(row.maxAllowedSize) ?? 0,
-    maxTokens: positiveNumber(row.maxOutputTokens) ?? 0,
-    supportsImages: row.supportsImages === true && row.disabledMultimodal !== true,
-    supportsReasoning: row.supportsReasoning === true,
-    ...supportedEfforts ? { supportedEfforts } : {},
-    canDisableThinking: reasoning?.canDisableThinking === true,
-  };
-}
-
-export function parseProductConfig(text: string): ProductConfig | undefined {
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(text);
-  } catch {
-    return undefined;
-  }
-  const document = asRecord(parsed);
-  if (!document || !Array.isArray(document.models)) return undefined;
-  const models = document.models.map(parseProductModel).filter((m): m is ProductModel => m !== undefined);
-  if (models.length === 0) return undefined;
-  return { source: "cache", models };
-}
-
-export function loadProductConfig(path = productConfigPath()): ProductConfig {
-  try {
-    const parsed = parseProductConfig(readFileSync(path, "utf8"));
-    if (parsed) return parsed;
-  } catch { /* missing/unreadable cache → builtin */ }
-  return { source: "builtin", models: BUILTIN_MODELS };
-}
-
-export function freeModelIds(config: ProductConfig): readonly string[] {
-  if (config.source === "builtin") return FREE_IDS;
-  const free = config.models.filter((m) => creditsAreFree(m.credits)).map((m) => m.id);
-  return free.length > 0 ? free : FREE_IDS;
-}
-
-function settingsPath(): string {
-  return join(agentDir(), ".workbuddy-settings.json");
-}
-
-export function loadSettings(): Settings {
-  try {
-    const parsed = JSON.parse(readFileSync(settingsPath(), "utf8")) as { scope?: unknown; visibility?: unknown };
-    return {
-      scope: parsed.scope === "all" ? "all" : "free",
-      // Legacy "full"/"compact" both mean visible; only "off" hides.
-      visibility: parsed.visibility === "off" ? "off" : "on",
-    };
-  } catch { /* default free and on */ }
-  return { scope: "free", visibility: "on" };
-}
-
-async function saveSettings(settings: Settings): Promise<void> {
-  await writeFile(settingsPath(), `${JSON.stringify(settings, null, 2)}\n`, { mode: 0o600 });
-}
-
-export function buildPiModels(config: ProductConfig, scope: Scope) {
-  const byId = new Map<string, ProductModel>();
-  if (config.source === "cache") {
-    for (const model of config.models) byId.set(model.id, model);
-  }
-  for (const model of BUILTIN_MODELS) {
-    if (!byId.has(model.id)) byId.set(model.id, model);
-  }
-  const free = new Set(freeModelIds(config));
-  const rows = [...byId.values()].filter((model) => scope === "all" || free.has(model.id));
-  return rows.flatMap((row) => {
-    if (row.contextWindow <= 0 || row.maxTokens <= 0) return [];
-    const efforts = row.supportsReasoning
-      ? (row.supportedEfforts?.length ? row.supportedEfforts : EFFORTS)
-      : [];
-    const credits = row.credits ?? "免费";
-    return [{
-      id: row.id,
-      name: `${row.name} · ${credits}`,
-      reasoning: row.supportsReasoning,
-      thinkingLevelMap: thinkingLevelMap(efforts, row.canDisableThinking),
-      input: (row.supportsImages ? ["text", "image"] : ["text"]) as ("text" | "image")[],
-      cost: ZERO_COST,
-      contextWindow: row.contextWindow,
-      maxTokens: row.maxTokens,
-      compat: COMPAT,
-    }];
-  });
-}
-
-function desktopCandidates(): string[] {
-  const env = process.env[AUTH_ENV]?.trim();
-  if (env) return [env];
-  const home = homedir();
-  const rel = ["CodeBuddyExtension", "Data", "Public", "auth", AUTH_FILE] as const;
-  if (process.platform === "darwin") return [join(home, "Library", "Application Support", ...rel)];
-  if (process.platform === "win32") {
-    return [join(home, "AppData", "Local", ...rel), join(home, "AppData", "Roaming", ...rel)];
-  }
-  return [join(home, ".config", ...rel)];
-}
-
-function ownPath(): string {
-  return join(process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent"), ".workbuddy-auth.json");
-}
-
-function optionalString(value: unknown): string | undefined {
-  return typeof value === "string" && value !== "" ? value : undefined;
-}
-
-function expiryToMs(value: number): number {
-  if (value <= 0) return 0;
-  return value > 1e12 ? value : value * 1000;
-}
-
-export function parseWorkBuddyAuth(text: string): Cred | undefined {
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(text);
-  } catch {
-    return undefined;
-  }
-  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return undefined;
-  const document = parsed as Record<string, unknown>;
-  const nested = typeof document.auth === "object" && document.auth !== null;
-  const auth = (nested ? document.auth : document) as Record<string, unknown>;
-  const identity = (
-    nested && typeof document.account === "object" && document.account !== null
-      ? document.account
-      : document
-  ) as Record<string, unknown>;
-  const accessToken = typeof auth.accessToken === "string" ? auth.accessToken : "";
-  if (accessToken === "") return undefined;
-  const enterpriseId = optionalString(identity.enterpriseId);
-  const nickname = optionalString(identity.nickname);
-  return {
-    accessToken,
-    refreshToken: typeof auth.refreshToken === "string" ? auth.refreshToken : "",
-    expiresAtMs: typeof auth.expiresAt === "number" ? expiryToMs(auth.expiresAt) : 0,
-    domain: optionalString(auth.domain) ?? "",
-    uid: optionalString(identity.uid) ?? "",
-    ...(enterpriseId ? { enterpriseId } : {}),
-    ...(nickname ? { nickname } : {}),
-  };
-}
-
-function parseOwn(text: string): Cred | undefined {
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(text);
-  } catch {
-    return undefined;
-  }
-  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return undefined;
-  const document = parsed as Record<string, unknown>;
-  if (document.version !== 1 || typeof document.credential !== "object" || document.credential === null) {
-    return undefined;
-  }
-  const stored = document.credential as Record<string, unknown>;
-  const accessToken = typeof stored.accessToken === "string" ? stored.accessToken : "";
-  if (accessToken === "") return undefined;
-  const enterpriseId = optionalString(stored.enterpriseId);
-  const nickname = optionalString(stored.nickname);
-  return {
-    accessToken,
-    refreshToken: typeof stored.refreshToken === "string" ? stored.refreshToken : "",
-    expiresAtMs: typeof stored.expiresAtMs === "number" ? stored.expiresAtMs : 0,
-    domain: optionalString(stored.domain) ?? "",
-    uid: optionalString(stored.uid) ?? "",
-    ...(enterpriseId ? { enterpriseId } : {}),
-    ...(nickname ? { nickname } : {}),
-  };
-}
-
-async function readText(path: string): Promise<string | undefined> {
-  try {
-    return await readFile(path, "utf8");
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
-    throw error;
-  }
-}
-
-async function current(): Promise<Cred | undefined> {
-  const own = await readText(ownPath()).then((text) => (text ? parseOwn(text) : undefined));
-  let desktop: Cred | undefined;
-  for (const path of desktopCandidates()) {
-    const text = await readText(path);
-    if (!text) continue;
-    desktop = parseWorkBuddyAuth(text);
-    if (desktop) break;
-  }
-  if (!desktop) return own;
-  if (!own) return desktop;
-  return own.expiresAtMs > desktop.expiresAtMs ? own : desktop;
-}
-
-async function saveOwn(cred: Cred): Promise<void> {
-  await writeFile(ownPath(), JSON.stringify({ version: 1, credential: cred }), { mode: 0o600 });
-}
-
-async function refreshAccess(cred: Cred): Promise<Cred> {
-  const response = await fetch(`${GLOBAL_BASE}/v2/plugin/auth/token/refresh`, {
-    method: "POST",
-    headers: {
-      Accept: "application/json, text/plain, */*",
-      "X-Requested-With": "XMLHttpRequest",
-      Origin: GLOBAL_BASE,
-      Referer: `${GLOBAL_BASE}/`,
-      "User-Agent": CLIENT_UA,
-      "X-Refresh-Token": cred.refreshToken,
-      "X-Auth-Refresh-Source": "workbuddy",
-      ...(cred.enterpriseId ? { "X-Enterprise-Id": cred.enterpriseId } : {}),
-    },
-    signal: AbortSignal.timeout(30_000),
-  });
-  const envelope = (await response.json()) as { code?: number; msg?: string; data?: Record<string, unknown> };
-  const data = envelope.data ?? {};
-  const accessToken = typeof data.accessToken === "string" ? data.accessToken : "";
-  if (!response.ok || envelope.code !== 0 || accessToken === "") {
-    throw new Error(envelope.msg || "workbuddy token refresh failed; sign in again in WorkBuddy AI");
-  }
-  return {
-    ...cred,
-    accessToken,
-    refreshToken: typeof data.refreshToken === "string" && data.refreshToken !== "" ? data.refreshToken : cred.refreshToken,
-    expiresAtMs: typeof data.expiresIn === "number" && data.expiresIn > 0
-      ? Date.now() + data.expiresIn * 1000
-      : cred.expiresAtMs,
-    domain: typeof data.domain === "string" && data.domain !== "" ? data.domain : cred.domain,
-  };
-}
-
-let inflight: Promise<Cred> | undefined;
-
-async function resolveCred(): Promise<Cred> {
-  const cred = await current();
-  if (!cred) {
-    throw new Error(
-      "workbuddy: 未登录。设置 → WorkBuddy AI → Connect 弹出登录页，或登录桌面应用 / 设 WORKBUDDY_AUTH_FILE",
-    );
-  }
-  if (cred.expiresAtMs > 0 && Date.now() + REFRESH_MARGIN_MS < cred.expiresAtMs) return cred;
-  if (cred.refreshToken === "") {
-    if (cred.expiresAtMs > Date.now() + 30_000) return cred;
-    throw new Error("workbuddy: access token expired; sign in again in WorkBuddy AI");
-  }
-  inflight ??= (async () => {
-    try {
-      const next = await refreshAccess(cred);
-      await saveOwn(next);
-      return next;
-    } catch (error) {
-      if (cred.expiresAtMs > Date.now() + 30_000) return cred;
-      throw error;
-    }
-  })().finally(() => {
-    inflight = undefined;
-  });
-  return inflight;
-}
-
-function chatHeaders(cred: Cred): Record<string, string> {
-  return {
-    Accept: "application/json, text/plain, */*",
-    "X-Requested-With": "XMLHttpRequest",
-    Origin: GLOBAL_BASE,
-    Referer: `${GLOBAL_BASE}/`,
-    "User-Agent": CLIENT_UA,
-    Authorization: `Bearer ${cred.accessToken}`,
-    ...(cred.uid === "" ? { "X-No-User-Id": "1" } : { "X-User-Id": cred.uid }),
-    ...(cred.enterpriseId ? { "X-Enterprise-Id": cred.enterpriseId } : { "X-No-Enterprise-Id": "1" }),
-    ...(cred.domain === "" ? { "X-No-Department-Info": "1" } : { "X-Domain": cred.domain }),
-    "X-Product": "SaaS",
-  };
-}
-
-function stripAssistantReasoning(messages: unknown[]): void {
-  for (const item of messages) {
-    if (typeof item !== "object" || item === null || Array.isArray(item)) continue;
-    const msg = item as Record<string, unknown>;
-    if (msg.role !== "assistant") continue;
-    delete msg.reasoning;
-    delete msg.thinking;
-    delete msg.reasoning_content;
-    if (!Array.isArray(msg.content)) continue;
-    msg.content = msg.content.filter((part) => {
-      if (typeof part !== "object" || part === null) return true;
-      const type = (part as { type?: string }).type;
-      return type !== "reasoning" && type !== "thinking";
-    });
-    if (Array.isArray(msg.content) && msg.content.length === 0) msg.content = "";
-  }
-}
-
-export function prepareChatPayload(payload: Record<string, unknown>): Record<string, unknown> {
-  payload.stream = true;
-  const messages = payload.messages;
-  if (Array.isArray(messages)) {
-    for (const message of messages) {
-      if (typeof message === "object" && message !== null && !Array.isArray(message)
-        && (message as Record<string, unknown>).role === "developer") {
-        (message as Record<string, unknown>).role = "system";
-      }
-    }
-    if (messages.length > 0 && (messages[0] as { role?: string } | undefined)?.role !== "system") {
-      messages.unshift({ role: "system", content: "You are a helpful assistant." });
-    }
-    stripAssistantReasoning(messages);
-  }
-  if ("tool_choice" in payload) {
-    const choice = payload.tool_choice;
-    if (typeof choice === "string") {
-      if (choice.trim().toLowerCase() === "none") {
-        delete payload.tool_choice;
-        delete payload.tools;
-        delete payload.functions;
-      }
-    } else if (typeof choice === "object" && choice !== null && !Array.isArray(choice)) {
-      const wrapped = choice as Record<string, unknown>;
-      const type = typeof wrapped.type === "string" ? wrapped.type.trim().toLowerCase() : "";
-      if (type === "none") {
-        delete payload.tool_choice;
-        delete payload.tools;
-        delete payload.functions;
-      } else if (type === "auto" || type === "required") {
-        payload.tool_choice = type;
-      } else if (type === "function") {
-        const fn = typeof wrapped.function === "object" && wrapped.function !== null
-          ? (wrapped.function as Record<string, unknown>)
-          : undefined;
-        const name = (typeof fn?.name === "string" ? fn.name : typeof wrapped.name === "string" ? wrapped.name : "").trim();
-        payload.tool_choice = name || "auto";
-      } else {
-        delete payload.tool_choice;
-      }
-    } else {
-      delete payload.tool_choice;
-    }
-  }
-  // ponytail: never inject reasoning_effort — upstream sends a bare request when no
-  // level is chosen, so "Default" must stay Default instead of silently becoming high.
-  return payload;
-}
-
-/** `before_provider_request` carries no provider, so payloads are scoped by model id.
- *  Without this the hook rewrites every other provider's request (developer role,
- *  tool_choice, stream). */
+/** 一个 payload 的 model 是否属于任一 WorkBuddy 变体（两个 provider 共享 hook）。 */
 export function isWorkBuddyModel(modelId: unknown, ids: ReadonlySet<string>): boolean {
   return typeof modelId === "string" && ids.has(modelId);
 }
 
-function asObject(payload: unknown): Record<string, unknown> | undefined {
-  const value = typeof payload === "string"
-    ? (() => {
-      try {
-        return JSON.parse(payload) as unknown;
-      } catch {
-        return undefined;
-      }
-    })()
-    : payload;
-  if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
-  return value as Record<string, unknown>;
-}
-
-function hasMarker(headers: Record<string, string | null>): boolean {
-  return headers[MARKER] === "1" || headers[MARKER.toLowerCase()] === "1";
-}
-
-/**
- * WorkBuddy 的错误体是 `{code, msg}`，但 pi 的 openai-completions 路径只保留
- * OpenAI 形状 `{error:{message,...}}`：`normalizeProviderError` 取
- * `error.error`，非对象时退化成 `error.message`，最终 `errorMessage` 只剩
- * `"400 status code (no body)"`，业务码与文案全部丢失（TUI 与 model-failback
- * 都看不见原因）。
- *
- * 因此这里在 fetch 层把 `{code,msg}` 补成
- * `{error:{message, type, code}}`，其中 `code` 原样保留为**字符串**，因为
- * pi 只把 `error.error.code` 透传进 `errorMessage` 的 JSON 里（数字会被丢掉）。
- * 这里不做任何语义判定：是否属于额度终态交给 model-failback 的 handler。
- */
-export function toOpenAIErrorEnvelope(status: number, body: unknown): Record<string, unknown> | undefined {
-  if (typeof body !== "object" || body === null || Array.isArray(body)) return undefined;
-  const record = body as Record<string, unknown>;
-  // 已经是 OpenAI 形状就不要二次包装。
-  if (typeof record.error === "object" && record.error !== null) return undefined;
-  const message = typeof record.msg === "string" && record.msg !== ""
-    ? record.msg
-    : typeof record.message === "string" && record.message !== "" ? record.message : undefined;
-  if (message === undefined) return undefined;
-  const code = record.code === undefined || record.code === null ? undefined : String(record.code);
-  const type = code === undefined
-    ? (status === 429 ? "rate_limit_error" : "invalid_request_error")
-    : "invalid_request_error";
-  return { error: { message, type, ...(code === undefined ? {} : { code }) } };
-}
-
-let errorEnvelopeInstalled = false;
-
-/**
- * 在 `globalThis.fetch` 上装一层：只改 WorkBuddy 自身的错误响应，其余请求与
- * 成功响应一律原样透传。pi 的 OpenAI 客户端用 `options.fetch ?? 默认 fetch`，
- * 而 pi 不传 `options.fetch`，所以这是唯一能触到响应体的位置。
- *
- * 幂等：重复调用只装一次，避免 `/reload` 后层层包裹。
- */
-export function installErrorEnvelopeRewrite(): void {
-  if (errorEnvelopeInstalled) return;
-  errorEnvelopeInstalled = true;
-  const original = globalThis.fetch;
-  globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
-    const response = await original(input, init);
-    if (response.ok) return response;
-    const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
-    // 只看我们自己的推理端点，避免影响其它 provider 与积分接口。
-    if (!url.startsWith(`${GLOBAL_BASE}/v2/`)) return response;
-    const text = await response.text().catch(() => "");
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(text) as unknown;
-    } catch {
-      return new Response(text, { status: response.status, statusText: response.statusText, headers: response.headers });
-    }
-    const rewritten = toOpenAIErrorEnvelope(response.status, parsed);
-    if (rewritten === undefined) {
-      return new Response(text, { status: response.status, statusText: response.statusText, headers: response.headers });
-    }
-    const headers = new Headers(response.headers);
-    headers.set("content-type", "application/json");
-    return new Response(JSON.stringify(rewritten), { status: response.status, statusText: response.statusText, headers });
-  }) as typeof fetch;
-}
-
-type Pack = { name: string; remain: number; size: number };
-
-function unwrap(value: unknown): Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value)
-    ? value as Record<string, unknown>
-    : {};
-}
-
-export function parseCredits(envelope: unknown): { total: number; packs: Pack[] } {
-  const inner = unwrap(unwrap(unwrap(unwrap(envelope).data).Response).Data);
-  const raw = Array.isArray(inner.Accounts) ? inner.Accounts : [];
-  const packs: Pack[] = [];
-  let total = 0;
-  for (const item of raw) {
-    const account = unwrap(item);
-    const num = (key: string): number => typeof account[key] === "number" ? account[key] as number : 0;
-    const size = num("CycleCapacitySize");
-    const cycleRemain = num("CycleCapacityRemain");
-    const cycleUsed = num("CycleCapacityUsed");
-    let remain = size > 0 || cycleRemain > 0 || cycleUsed > 0 ? cycleRemain : num("CapacityRemain");
-    if (remain < 0) remain = 0;
-    total += remain;
-    packs.push({
-      name: typeof account.PackageName === "string" ? account.PackageName : "(unnamed)",
-      remain,
-      size: size > 0 ? size : num("CapacitySize"),
-    });
-  }
-  return { total, packs };
-}
-
-function pad2(n: number): string {
-  return String(n).padStart(2, "0");
-}
-
-function fmtStamp(d: Date): string {
-  return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())} ${pad2(d.getHours())}:${pad2(d.getMinutes())}:${pad2(d.getSeconds())}`;
-}
-
-function fmtExpiry(ms: number): string {
-  if (ms <= 0) return "未知";
-  const d = new Date(ms);
-  return `${d.getFullYear()}/${d.getMonth() + 1}/${d.getDate()} ${pad2(d.getHours())}:${pad2(d.getMinutes())}:${pad2(d.getSeconds())}`;
-}
-
-function bar(remain: number, size: number, width = 28): string {
-  if (size <= 0) return "";
-  const n = Math.round(Math.min(1, Math.max(0, remain / size)) * width);
-  return `${"█".repeat(n)}${"░".repeat(width - n)}`;
-}
-
-export function widgetLines(input: {
-  cred?: Cred;
-  credits?: { total: number; packs: Pack[] };
-  error?: string;
-  scope?: Scope;
-  visibility?: Visibility;
-  models?: { name: string }[];
-}): string[] {
-  const visibility = input.visibility ?? "on";
-  if (visibility === "off") return [];
-  const scope = input.scope ?? "free";
-  const lines = [`WorkBuddy AI · 国际版 · ${scope === "all" ? "全部模型" : "仅免费模型"}`];
-  if (!input.cred) {
-    lines.push("未登录。设置 → 模型 → WorkBuddy AI → Connect，或 /login workbuddy");
-    if (input.error) lines.push(input.error);
-    lines.push("设置  /workbuddy");
-    return lines;
-  }
-  lines.push(`账号  已登录  ${input.cred.nickname || input.cred.uid}`);
-  lines.push(`令牌  ${fmtExpiry(input.cred.expiresAtMs)} 过期（自动续期）`);
-  if (input.credits) {
-    lines.push(`积分  合计 ${input.credits.total}`);
-    for (const pack of input.credits.packs) {
-      const right = pack.size > 0 ? `${pack.remain} / ${pack.size}` : String(pack.remain);
-      lines.push(`  ${pack.name}  剩余 ${right}`);
-      const drawn = bar(pack.remain, pack.size);
-      if (drawn) lines.push(`  ${drawn}`);
-    }
-  } else if (input.error) {
-    lines.push(`积分  ${input.error}`);
-  }
-  const names = (input.models ?? []).map((model) => model.name).join("  |  ") || "（无模型）";
-  lines.push(`模型  ${names}`);
-  lines.push("设置  /workbuddy");
-  return lines;
-}
-
-export function statusText(input: {
-  cred?: Cred;
-  credits?: { total: number };
-  visibility?: Visibility;
-}): string | undefined {
-  if ((input.visibility ?? "on") === "off") return undefined;
-  if (input.credits) return `积分 ${input.credits.total}`;
-  return input.cred ? "WorkBuddy 已登录" : "WorkBuddy 未登录";
-}
-
-async function fetchCredits(cred: Cred): Promise<{ total: number; packs: Pack[] }> {
-  const now = new Date();
-  const response = await fetch(`${GLOBAL_BASE}/v2/billing/meter/get-user-resource`, {
-    method: "POST",
-    headers: {
-      Accept: "application/json, text/plain, */*",
-      "Content-Type": "application/json",
-      "X-Requested-With": "XMLHttpRequest",
-      Origin: GLOBAL_BASE,
-      Referer: `${GLOBAL_BASE}/`,
-      "User-Agent": CLIENT_UA,
-      Authorization: `Bearer ${cred.accessToken}`,
-      ...(cred.uid === "" ? {} : { "X-User-Id": cred.uid }),
-    },
-    body: JSON.stringify({
-      PageNumber: 1,
-      PageSize: 100,
-      ProductCode: "p_tcaca",
-      Status: [0, 3],
-      PackageEndTimeRangeBegin: fmtStamp(now),
-      PackageEndTimeRangeEnd: fmtStamp(new Date(now.getTime() + 365 * 101 * 24 * 3600 * 1000)),
-    }),
-    signal: AbortSignal.timeout(30_000),
-  });
-  const envelope: unknown = await response.json();
-  const msg = unwrap(envelope).msg;
-  if (!response.ok || unwrap(envelope).code !== 0) {
-    throw new Error(typeof msg === "string" && msg !== "" ? msg : `credits ${response.status}`);
-  }
-  return parseCredits(envelope);
-}
-
-type Ui = {
-  setWidget(key: string, content: string[] | undefined): void;
-  setStatus(key: string, text: string | undefined): void;
-  notify(message: string, type?: "info" | "warning" | "error"): void;
-};
-
-async function paint(
-  ui: Ui,
-  notify = false,
-  extra: { scope: Scope; visibility: Visibility; models: { name: string }[] } = {
-    scope: "free",
-    visibility: "on",
-    models: [],
-  },
-): Promise<void> {
-  let cred: Cred | undefined;
-  let credits: { total: number; packs: Pack[] } | undefined;
-  let error: string | undefined;
-  try {
-    cred = await resolveCred();
-    credits = await fetchCredits(cred);
-  } catch (caught) {
-    cred = await current();
-    error = caught instanceof Error ? caught.message : String(caught);
-  }
-  const lines = widgetLines({ cred, credits, error, ...extra });
-  ui.setWidget("workbuddy", lines.length > 0 ? lines : undefined);
-  ui.setStatus("workbuddy", statusText({ cred, credits, visibility: extra.visibility }));
-  if (notify) {
-    ui.notify(
-      error ? `WorkBuddy：${error}` : `WorkBuddy 已刷新 · 积分 ${credits?.total ?? "?"}`,
-      error ? "warning" : "info",
-    );
-  }
-}
-
-const PLUGIN_AUTH_HEADERS = {
-  Accept: "application/json, text/plain, */*",
-  "Content-Type": "application/json",
-  Origin: GLOBAL_BASE,
-  Referer: `${GLOBAL_BASE}/`,
-  "User-Agent": CLIENT_UA,
-  "X-Requested-With": "XMLHttpRequest",
-  "X-Product": "SaaS",
-  "X-No-Authorization": "true",
-  "X-No-User-Id": "1",
-  "X-No-Enterprise-Id": "1",
-  "X-No-Department-Info": "1",
-};
-
-export function jwtPayload(token: string): Record<string, unknown> {
-  const part = token.split(".")[1];
-  if (!part) return {};
-  try {
-    const padded = part.replaceAll("-", "+").replaceAll("_", "/").padEnd(Math.ceil(part.length / 4) * 4, "=");
-    const parsed: unknown = JSON.parse(Buffer.from(padded, "base64").toString("utf8"));
-    return typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)
-      ? parsed as Record<string, unknown>
-      : {};
-  } catch {
-    return {};
-  }
-}
-
-export function credFromPluginToken(
-  data: Record<string, unknown>,
-  accessToken: string,
-  now = Date.now(),
-): Cred {
-  const jwt = jwtPayload(accessToken);
-  const uid = optionalString(data.uid)
-    ?? optionalString(jwt.uid)
-    ?? optionalString(jwt.sub)
-    ?? optionalString(jwt.email)
-    ?? "";
-  const enterpriseId = optionalString(data.enterpriseId) ?? optionalString(data.enterprise_id);
-  const nickname = optionalString(data.nickname) ?? optionalString(jwt.email) ?? optionalString(jwt.name);
-  return {
-    accessToken,
-    refreshToken: optionalString(data.refreshToken) ?? "",
-    expiresAtMs: typeof data.expiresIn === "number" && data.expiresIn > 0 ? now + data.expiresIn * 1000 : 0,
-    domain: optionalString(data.domain) ?? "www.workbuddy.ai",
-    uid,
-    ...(enterpriseId ? { enterpriseId } : {}),
-    ...(nickname ? { nickname } : {}),
-  };
-}
-
-async function startPluginLogin(): Promise<{ state: string; authUrl: string }> {
-  const nonce = crypto.randomUUID().replaceAll("-", "");
-  const response = await fetch(`${GLOBAL_BASE}/v2/plugin/auth/state?platform=CLI&nonce=${nonce}`, {
-    method: "POST",
-    headers: PLUGIN_AUTH_HEADERS,
-    body: JSON.stringify({ nonce }),
-    signal: AbortSignal.timeout(30_000),
-  });
-  const envelope = unwrap(await response.json());
-  const data = unwrap(envelope.data);
-  const state = typeof data.state === "string" ? data.state : "";
-  const authUrl = typeof data.authUrl === "string" ? data.authUrl : "";
-  if (!response.ok || envelope.code !== 0 || state === "" || authUrl === "") {
-    throw new Error(typeof envelope.msg === "string" && envelope.msg !== "" ? envelope.msg : "workbuddy login start failed");
-  }
-  return { state, authUrl };
-}
-
-async function pollPluginToken(state: string): Promise<Cred> {
-  const deadline = Date.now() + 15 * 60 * 1000;
-  while (Date.now() < deadline) {
-    const response = await fetch(`${GLOBAL_BASE}/v2/plugin/auth/token?state=${encodeURIComponent(state)}`, {
-      headers: PLUGIN_AUTH_HEADERS,
-      signal: AbortSignal.timeout(30_000),
-    });
-    const envelope = unwrap(await response.json());
-    if (envelope.code === 11217) {
-      await new Promise((resolve) => setTimeout(resolve, 2000));
-      continue;
-    }
-    const data = unwrap(envelope.data);
-    const accessToken = typeof data.accessToken === "string" ? data.accessToken : "";
-    if (!response.ok || envelope.code !== 0 || accessToken === "") {
-      throw new Error(typeof envelope.msg === "string" && envelope.msg !== "" ? envelope.msg : "workbuddy login failed");
-    }
-    return credFromPluginToken(data, accessToken);
-  }
-  throw new Error("workbuddy login timed out");
-}
-
-async function loginWorkBuddy(callbacks: OAuthLoginCallbacks): Promise<OAuthCredentials> {
-  callbacks.onProgress?.("正在打开 WorkBuddy 登录页…");
-  const { state, authUrl } = await startPluginLogin();
-  callbacks.onAuth({ url: authUrl });
-  callbacks.onProgress?.("请在弹出的页面完成登录，完成后会自动继续");
-  const cred = await pollPluginToken(state);
-  await saveOwn(cred);
-  return { access: cred.accessToken, refresh: cred.refreshToken, expires: cred.expiresAtMs };
-}
-
-async function refreshWorkBuddyOAuth(credentials: OAuthCredentials): Promise<OAuthCredentials> {
-  const prev = await current();
-  const next = await refreshAccess({
-    accessToken: credentials.access,
-    refreshToken: credentials.refresh,
-    expiresAtMs: credentials.expires ?? 0,
-    domain: prev?.domain ?? "www.workbuddy.ai",
-    uid: prev?.uid ?? "",
-    ...(prev?.enterpriseId ? { enterpriseId: prev.enterpriseId } : {}),
-    ...(prev?.nickname ? { nickname: prev.nickname } : {}),
-  });
-  await saveOwn(next);
-  return { access: next.accessToken, refresh: next.refreshToken, expires: next.expiresAtMs };
-}
-
 export default async function (pi: ExtensionAPI) {
-  installErrorEnvelopeRewrite();
-  let settings = loadSettings();
-  let models = buildPiModels(loadProductConfig(), settings.scope);
-  let ids = new Set(models.map((model) => model.id));
-  const extra = () => ({ scope: settings.scope, visibility: settings.visibility, models });
-  const oauth = {
-    name: "WorkBuddy AI",
-    login: loginWorkBuddy,
-    refreshToken: refreshWorkBuddyOAuth,
-    getApiKey: (credentials: OAuthCredentials) => credentials.access,
-  };
-
-  function apply(next?: Scope) {
-    if (next) settings = { ...settings, scope: next };
-    models = buildPiModels(loadProductConfig(), settings.scope);
-    ids = new Set(models.map((model) => model.id));
-    pi.registerProvider(PROVIDER, {
-      name: "WorkBuddy AI",
-      baseUrl: `${GLOBAL_BASE}/v2`,
-      api: "openai-completions",
-      headers: { [MARKER]: "1" },
-      oauth,
-      models,
-      async refreshModels() {
-        settings = loadSettings();
-        models = buildPiModels(loadProductConfig(), settings.scope);
-        ids = new Set(models.map((model) => model.id));
-        return models;
-      },
-    });
+  for (const spec of PROVIDERS) {
+    await registerWorkBuddyProvider(pi, spec);
   }
-
-  apply();
-
-  pi.on("before_provider_headers", async (event) => {
-    if (!hasMarker(event.headers)) return;
-    const cred = await resolveCred();
-    event.headers[MARKER] = null;
-    event.headers[MARKER.toLowerCase()] = null;
-    for (const [key, value] of Object.entries(chatHeaders(cred))) event.headers[key] = value;
-  });
-
-  pi.on("before_provider_request", (event) => {
-    const payload = asObject(event.payload);
-    if (!payload || !isWorkBuddyModel(payload.model, ids)) return;
-    return prepareChatPayload(payload);
-  });
-
-  pi.on("session_start", async (_event, ctx) => {
-    await paint(ctx.ui, false, extra());
-  });
-
-  pi.registerShortcut("ctrl+shift+w", {
-    description: "切换 WorkBuddy 侧栏显示（显示/隐藏）",
-    handler: async (ctx) => {
-      const next: Visibility = settings.visibility === "on" ? "off" : "on";
-      settings = { ...settings, visibility: next };
-      await saveSettings(settings);
-      await paint(ctx.ui, false, extra());
-      ctx.ui.notify(`WorkBuddy 侧栏：${LABEL[next]}`, "info");
-    },
-  });
-
-  pi.registerCommand("workbuddy", {
-    description: "WorkBuddy 设置：刷新积分、免费/全部模型、断开登录",
-    handler: async (args, ctx) => {
-      const cmd = String(args ?? "").trim().toLowerCase();
-      if (cmd === "free" || cmd === "all") {
-        settings = { ...settings, scope: cmd };
-        await saveSettings(settings);
-        apply();
-        await paint(ctx.ui, true, extra());
-        return;
-      }
-      if (cmd === "on" || cmd === "off") {
-        settings = { ...settings, visibility: cmd };
-        await saveSettings(settings);
-        await paint(ctx.ui, true, extra());
-        return;
-      }
-      if (cmd === "logout" || cmd === "disconnect") {
-        await unlink(ownPath()).catch(() => undefined);
-        await paint(ctx.ui, true, extra());
-        return;
-      }
-      const pick = await ctx.ui.select("WorkBuddy 设置", [
-        "刷新积分与账号",
-        settings.scope === "free" ? "列出全部模型（含付费）" : "只列出免费模型",
-        "断开登录",
-        `侧栏显示：${LABEL[settings.visibility]}`,
-      ]);      if (pick === undefined) return;
-      if (pick.startsWith("列出全部")) {
-        settings = { ...settings, scope: "all" };
-        await saveSettings(settings);
-        apply();
-      } else if (pick.startsWith("只列出")) {
-        settings = { ...settings, scope: "free" };
-        await saveSettings(settings);
-        apply();
-      } else if (pick === "断开登录") {
-        await unlink(ownPath()).catch(() => undefined);
-      } else if (pick.startsWith("侧栏显示：")) {
-        const next: Visibility = settings.visibility === "on" ? "off" : "on";
-        settings = { ...settings, visibility: next };
-        await saveSettings(settings);
-      }
-      await paint(ctx.ui, true, extra());
-    },
-  });
 }
 
 if (process.argv.includes("--self-check")) {
+  const { HIGH_ONLY, LOW_HIGH } = selfCheckRefs;
+  const assert = (condition: unknown, label: string): void => {
+    if (!condition) throw new Error(label);
+  };
+  /** 自检用的「配置缓存缺失」形状，与 loadProductConfig 的 builtin 分支一致。 */
+  const builtinConfig = (spec: typeof WORKBUDDY_AI) => ({
+    source: "builtin" as const,
+    models: spec.builtin,
+    cliRoster: new Set(spec.builtin.map((model) => model.id)),
+  });
+
+  // ── 凭据解析 ──
   const nested = parseWorkBuddyAuth(JSON.stringify({
     auth: { accessToken: "a", refreshToken: "r", expiresAt: 2000, domain: "www.workbuddy.ai" },
     account: { uid: "u1", nickname: "n" },
   }));
-  if (nested?.uid !== "u1" || nested.expiresAtMs !== 2_000_000) throw new Error("parse nested");
+  assert(nested?.uid === "u1" && nested.expiresAtMs === 2_000_000, "parse nested");
+  // 国内版桌面文件写的是毫秒 expiresAt，必须原样认。
+  const millis = parseWorkBuddyAuth(JSON.stringify({
+    auth: { accessToken: "a", refreshToken: "r", expiresAt: 1_794_908_187_523, domain: "www.workbuddy.cn" },
+    account: { uid: "u2" },
+  }));
+  assert(millis?.expiresAtMs === 1_794_908_187_523, "parse millis expiresAt");
+
+  // ── 请求改写 ──
   const payload = prepareChatPayload({
     model: "hy3",
     messages: [{ role: "developer", content: "sys" }, { role: "user", content: "hi" }],
     tool_choice: { type: "function", function: { name: "foo" } },
   });
-  if (payload.stream !== true) throw new Error("stream");
-  if ((payload.messages as { role: string }[])[0].role !== "system") throw new Error("system");
-  if (payload.tool_choice !== "foo") throw new Error("tool_choice");
-  if (payload.reasoning_effort !== undefined) throw new Error("no injected effort");
+  assert(payload.stream === true, "stream");
+  assert((payload.messages as { role: string }[])[0].role === "system", "system");
+  assert(payload.tool_choice === "foo", "tool_choice");
+  assert(payload.reasoning_effort === undefined, "no injected effort");
   const kept = prepareChatPayload({ messages: [], reasoning_effort: "max" });
-  if (kept.reasoning_effort !== "max") throw new Error("explicit effort preserved");
-  if (LOW_HIGH.low !== "low" || HIGH_ONLY.low !== null || HIGH_ONLY.high !== "high") throw new Error("effort map");
+  assert(kept.reasoning_effort === "max", "explicit effort preserved");
+  // 国内版原样透传 off；国际版丢弃 off 的行为在上游（不在本 hook），此处只保证不吞。
+  const off = prepareChatPayload({ messages: [], reasoning_effort: "off" });
+  assert(off.reasoning_effort === "off", "off passthrough");
+  assert(LOW_HIGH.low === "low" && HIGH_ONLY.low === null && HIGH_ONLY.high === "high", "effort map");
+  assert((selfCheckRefs as unknown) !== undefined, "self check refs");
+
+  // ── 模型归属：hook 不能污染其他 provider ──
   const ours = new Set(["hy3", "deepseek-v4.1-flash"]);
-  if (!isWorkBuddyModel("hy3", ours)) throw new Error("scope: own model accepted");
-  if (isWorkBuddyModel("grok-4.6", ours)) throw new Error("scope: foreign model must be rejected");
-  if (isWorkBuddyModel(undefined, ours) || isWorkBuddyModel(42, ours)) throw new Error("scope: non-string rejected");
-  if (thinkingLevelMap(["high"], true).off !== "off") throw new Error("off");
+  assert(isWorkBuddyModel("hy3", ours), "scope: own model accepted");
+  assert(!isWorkBuddyModel("grok-4.6", ours), "scope: foreign model must be rejected");
+  assert(!isWorkBuddyModel(undefined, ours) && !isWorkBuddyModel(42, ours), "scope: non-string rejected");
+  assert(selfCheckRefs.EFFORTS.length === 5, "effort vocabulary");
   const prepended = prepareChatPayload({ messages: [{ role: "user", content: "hi" }] });
-  if ((prepended.messages as { role: string }[])[0].role !== "system") throw new Error("prepend");
-  if (FREE_IDS.length !== 3) throw new Error("count");
-  if (!creditsAreFree("x0.00") || creditsAreFree("x1.00")) throw new Error("credits free");
-  if (!creditsAreFree("x0.00 credits") || !creditsAreFree("x0")) throw new Error("credits unit free");
-  if (creditsAreFree("x0.34 credits") || creditsAreFree("x6.67 credits")) throw new Error("credits unit paid");
-  if (!creditsAreFree(undefined) || !creditsAreFree("") || !creditsAreFree("  ")) throw new Error("credits unpriced");
+  assert((prepended.messages as { role: string }[])[0].role === "system", "prepend");
+  const looped = prepareChatPayload({
+    model: "deepseek-v4.1-flash",
+    max_tokens: 128_000,
+    messages: [{ role: "assistant", content: "done", reasoning: "OK.\nLet me write.", thinking: "Go." }],
+  });
+  const assistant = (looped.messages as Record<string, unknown>[])[1];
+  assert(assistant.reasoning === undefined && assistant.thinking === undefined, "reasoning replay");
+  assert(looped.max_tokens === 128_000, "flash payload passthrough");
+
+  // ── 免费判定 ──
+  assert(creditsAreFree("x0.00") && !creditsAreFree("x1.00"), "credits free");
+  assert(creditsAreFree("x0.00 credits") && creditsAreFree("x0"), "credits unit free");
+  assert(!creditsAreFree("x0.34 credits") && !creditsAreFree("x6.67 credits"), "credits unit paid");
+  assert(creditsAreFree(undefined) && creditsAreFree("") && creditsAreFree("  "), "credits unpriced");
   const mixed = parseProductConfig(JSON.stringify({
     models: [
       { id: "default-model", name: "Auto", credits: "", maxInputTokens: 176_000, maxOutputTokens: 24_000, supportsReasoning: true },
@@ -1021,50 +135,78 @@ if (process.argv.includes("--self-check")) {
       { id: "hy3", name: "Hy3", credits: "x0.00", maxInputTokens: 192_000, maxOutputTokens: 64_000, supportsReasoning: true },
     ],
   }));
-  const mixedFree = freeModelIds(mixed!);
-  if (!mixedFree.includes("default-model") || !mixedFree.includes("hy3")) throw new Error("unpriced free");
-  if (mixedFree.includes("fast-model")) throw new Error("priced unit excluded");
-  const flash = buildPiModels({ source: "builtin", models: BUILTIN_MODELS }, "free")
-    .find((model) => model.id === "deepseek-v4.1-flash");
-  if (flash?.thinkingLevelMap.low !== "low" || flash.thinkingLevelMap.xhigh !== "xhigh" || flash.thinkingLevelMap.max !== "max") {
-    throw new Error("flash efforts");
-  }
-  if (flash.maxTokens !== 128_000) throw new Error("flash maxTokens uncapped");
-  const looped = prepareChatPayload({
-    model: "deepseek-v4.1-flash",
-    max_tokens: 128_000,
-    messages: [{ role: "assistant", content: "done", reasoning: "OK.\nLet me write.", thinking: "Go." }],
-  });
-  const assistant = (looped.messages as Record<string, unknown>[])[1];
-  if (assistant.reasoning !== undefined || assistant.thinking !== undefined) throw new Error("reasoning replay");
-  if (looped.max_tokens !== 128_000) throw new Error("flash payload passthrough");
-  const fromCache = parseProductConfig(JSON.stringify({
-    models: [{
-      id: "deepseek-v4.1-flash",
-      name: "Deepseek-V4.1-Flash",
-      credits: "x0.00",
-      maxInputTokens: 1_000_000,
-      maxOutputTokens: 128_000,
-      supportsReasoning: true,
-      reasoning: { supportedEfforts: ["low", "medium", "high", "xhigh", "max"] },
-    }],
+  const mixedFree = freeModelIds(mixed!, WORKBUDDY_AI);
+  assert(mixedFree.includes("default-model") && mixedFree.includes("hy3"), "unpriced free");
+  assert(!mixedFree.includes("fast-model"), "priced unit excluded");
+
+  // ── CLI roster 收窄：配置顶层 models 里的补全/本地模型不能进选择器 ──
+  const withRoster = parseProductConfig(JSON.stringify({
+    agents: [{ name: "cli", models: ["hy3", "glm-5.3"] }, { name: "other", models: ["x"] }],
+    models: [
+      { id: "hy3", name: "Hy3", credits: "x0.00", maxInputTokens: 192_000, maxOutputTokens: 64_000, supportsReasoning: true },
+      { id: "glm-5.3", name: "GLM-5.3", credits: "x0.79", maxInputTokens: 1_000_000, maxOutputTokens: 64_000, supportsReasoning: true },
+      { id: "completion-gf", name: "Completion", credits: "x0.00", maxInputTokens: 200_000, maxOutputTokens: 8_000, supportsReasoning: false },
+      { id: "custom-local:mimo", name: "Local", credits: "x0.00", maxInputTokens: 900_000, maxOutputTokens: 130_000, supportsReasoning: true },
+    ],
   }));
-  if (!fromCache) throw new Error("parse config");
-  const cachedFlash = buildPiModels(fromCache, "free")[0];
-  if (cachedFlash.thinkingLevelMap.medium !== "medium" || cachedFlash.thinkingLevelMap.max !== "max") {
-    throw new Error("cache efforts");
+  assert(withRoster?.cliRoster.size === 2, "cli roster parsed");
+  const rosterFree = freeModelIds(withRoster!, WORKBUDDY_CN);
+  assert(rosterFree.includes("hy3"), "roster free kept");
+  assert(!rosterFree.includes("completion-gf") && !rosterFree.includes("custom-local:mimo"), "off-roster free excluded");
+  const rosterAll = buildPiModels(withRoster!, "all", WORKBUDDY_CN).map((model) => model.id);
+  assert(!rosterAll.includes("completion-gf") && !rosterAll.includes("custom-local:mimo"), "off-roster excluded from all");
+  assert(rosterAll.includes("hy3") && rosterAll.includes("glm-5.3"), "on-roster kept");
+  // roster 为空（配置没声明 agents）时不过滤。
+  assert(parseProductConfig(JSON.stringify({ models: [] })) === undefined, "empty models rejected");
+  assert(parseProductConfig(JSON.stringify({ models: [{ id: "a", name: "A", maxInputTokens: 1, maxOutputTokens: 1 }] }))?.cliRoster.size === 0, "absent roster");
+
+  // ── 两个变体的差异必须各就各位 ──
+  assert(WORKBUDDY_AI.id === "workbuddy" && WORKBUDDY_CN.id === "workbuddy-cn", "spec ids");
+  assert(WORKBUDDY_AI.base === "https://www.workbuddy.ai" && WORKBUDDY_CN.base === "https://www.workbuddy.cn", "spec bases");
+  assert(WORKBUDDY_AI.domain === "www.workbuddy.ai" && WORKBUDDY_CN.domain === "www.workbuddy.cn", "spec domains");
+  assert(WORKBUDDY_AI.desktopFilename === "workbuddy-desktop-ai.info", "ai desktop file");
+  assert(WORKBUDDY_CN.desktopFilename === "workbuddy-desktop.info", "cn desktop file");
+  assert(WORKBUDDY_AI.ownFilename !== WORKBUDDY_CN.ownFilename, "own files distinct");
+  assert(WORKBUDDY_AI.settingsFilename !== WORKBUDDY_CN.settingsFilename, "settings files distinct");
+  assert(WORKBUDDY_AI.productConfigEnv !== WORKBUDDY_CN.productConfigEnv, "product config envs distinct");
+  assert(WORKBUDDY_AI.command !== WORKBUDDY_CN.command, "commands distinct");
+  assert(WORKBUDDY_AI.shortcut !== WORKBUDDY_CN.shortcut, "shortcuts distinct");
+  assert(WORKBUDDY_AI.productConfigPaths[0]?.includes(".workbuddy-ai"), "ai config path");
+  assert(WORKBUDDY_CN.productConfigPaths[0]?.includes(".workbuddy") && !WORKBUDDY_CN.productConfigPaths[0]?.includes(".workbuddy-ai"), "cn config path");
+
+  // ── 内置兜底：CN 免费集合与国际版不同 ──
+  const cnFree = freeModelIds(builtinConfig(WORKBUDDY_CN), WORKBUDDY_CN);
+  assert(cnFree.length === 2 && cnFree.includes("hy3") && cnFree.includes("hy4-preview-f"), "cn builtin free");
+  const cnModels = buildPiModels(builtinConfig(WORKBUDDY_CN), "free", WORKBUDDY_CN);
+  assert(cnModels.length === 2, "cn builtin free scope size");
+  const cnAll = buildPiModels(builtinConfig(WORKBUDDY_CN), "all", WORKBUDDY_CN);
+  assert(cnAll.length === WORKBUDDY_CN.builtin.length, "cn builtin all scope size");
+  const aiAll = buildPiModels(builtinConfig(WORKBUDDY_AI), "all", WORKBUDDY_AI);
+  assert(aiAll.length === 3, "ai builtin size");
+  const flash = aiAll.find((model) => model.id === "deepseek-v4.1-flash");
+  assert(flash !== undefined, "flash present");
+  if (flash !== undefined) {
+    assert(flash.thinkingLevelMap.low === "low" && flash.thinkingLevelMap.xhigh === "xhigh", "flash efforts");
+    assert(flash.maxTokens === 128_000, "flash maxTokens");
   }
   const implied = parseProductConfig(JSON.stringify({
     models: [{
-      id: "implied",
-      name: "Implied",
-      credits: "x0.00",
-      maxInputTokens: 1000,
-      maxOutputTokens: 100,
-      supportsReasoning: true,
+      id: "implied", name: "Implied", credits: "x0.00",
+      maxInputTokens: 1000, maxOutputTokens: 100, supportsReasoning: true,
     }],
   }));
-  if (buildPiModels(implied!, "free")[0].thinkingLevelMap.xhigh !== "xhigh") throw new Error("implied efforts");
+  assert(buildPiModels(implied!, "free", WORKBUDDY_AI)[0].thinkingLevelMap.xhigh === "xhigh", "implied efforts");
+  const fromCache = parseProductConfig(JSON.stringify({
+    models: [{
+      id: "deepseek-v4.1-flash", name: "Deepseek-V4.1-Flash", credits: "x0.00",
+      maxInputTokens: 1_000_000, maxOutputTokens: 128_000, supportsReasoning: true,
+      reasoning: { supportedEfforts: ["low", "medium", "high", "xhigh", "max"] },
+    }],
+  }));
+  const cachedFlash = buildPiModels(fromCache!, "free", WORKBUDDY_AI)[0];
+  assert(cachedFlash.thinkingLevelMap.medium === "medium" && cachedFlash.thinkingLevelMap.max === "max", "cache efforts");
+
+  // ── 积分解析 ──
   const credits = parseCredits({
     code: 0,
     data: {
@@ -1078,45 +220,110 @@ if (process.argv.includes("--self-check")) {
       },
     },
   });
-  if (credits.total !== 349 || credits.packs.length !== 2) throw new Error("credits");
+  assert(credits.total === 349 && credits.packs.length === 2, "credits");
+
+  // ── widget / footer ──
   const cred = {
-    accessToken: "a",
-    refreshToken: "r",
+    accessToken: "a", refreshToken: "r",
     expiresAtMs: Date.UTC(2027, 8, 12, 1, 30, 0),
-    domain: "www.workbuddy.ai",
-    uid: "u",
-    nickname: "user@example.com",
+    domain: "www.workbuddy.cn", uid: "u", nickname: "user@example.com",
   };
-  const lines = widgetLines({ cred, credits });
-  if (!lines.some((line) => line.includes("user@example.com"))) throw new Error("account");
-  if (!lines.some((line) => line.includes("合计 349"))) throw new Error("total");
-  if (widgetLines({ cred, credits, visibility: "off" }).length !== 0) throw new Error("widget off");
-  if (widgetLines({ cred, credits, visibility: "on" }).length === 0) throw new Error("widget on");
-  if (widgetLines({ cred, credits }).length === 0) throw new Error("widget default on");
-  if (statusText({ cred, credits }) !== "积分 349") throw new Error("status on");
-  if (statusText({ cred, credits, visibility: "on" }) !== "积分 349") throw new Error("status on explicit");
-  if (statusText({ cred, credits, visibility: "off" }) !== undefined) throw new Error("status off");
-  if (statusText({ cred }) !== "WorkBuddy 已登录") throw new Error("status logged in");
-  if (statusText({}) !== "WorkBuddy 未登录") throw new Error("status logged out");
-  if (statusText({ cred, visibility: "off" }) !== undefined) throw new Error("status off without credits");
+  const lines = widgetLines(WORKBUDDY_CN, { cred, credits });
+  assert(lines.some((line) => line.includes("user@example.com")), "account");
+  assert(lines.some((line) => line.includes("合计 349")), "total");
+  assert(lines[0].includes("WorkBuddy") && lines[0].includes("国内版"), "cn widget title");
+  assert(widgetLines(WORKBUDDY_CN, { cred, credits, visibility: "off" }).length === 0, "widget off");
+  assert(widgetLines(WORKBUDDY_CN, { cred, credits, visibility: "on" }).length > 0, "widget on");
+  assert(statusText(WORKBUDDY_CN, { cred, credits }) === "国内版 积分 349", "cn status on");
+  assert(statusText(WORKBUDDY_AI, { cred, credits }) === "国际版 积分 349", "ai status on");
+  assert(statusText(WORKBUDDY_CN, { cred, credits, visibility: "off" }) === undefined, "status off");
+  assert(statusText(WORKBUDDY_AI, { cred }) === "国际版 已登录", "status logged in");
+  assert(statusText(WORKBUDDY_AI, {}) === "国际版 未登录", "status logged out");
+
+  // ── 插件登录令牌 ──
   const token = `x.${Buffer.from(JSON.stringify({ email: "a@b.c", sub: "u9" })).toString("base64url")}.y`;
   const fromTok = credFromPluginToken(
-    { refreshToken: "r", expiresIn: 10, domain: "www.workbuddy.ai", enterpriseId: "e1" },
+    WORKBUDDY_CN,
+    { refreshToken: "r", expiresIn: 10, enterpriseId: "e1" },
     token,
     1000,
   );
-  if (fromTok.uid !== "u9" || fromTok.nickname !== "a@b.c" || fromTok.expiresAtMs !== 11_000) throw new Error("plugin token");
-  if (fromTok.enterpriseId !== "e1") throw new Error("enterprise");
+  assert(fromTok.uid === "u9" && fromTok.nickname === "a@b.c" && fromTok.expiresAtMs === 11_000, "plugin token");
+  assert(fromTok.enterpriseId === "e1", "enterprise");
+  // 令牌没带 domain 时回落到该变体自己的域，而不是国际版。
+  assert(fromTok.domain === "www.workbuddy.cn", "cn domain fallback");
+
+  // ── 错误信封 ──
   const quota = toOpenAIErrorEnvelope(400, { code: 14001, msg: "UsageLimitExceeded", requestId: "r" });
   const err = (quota as { error: { message: string; type: string; code: string } }).error;
-  if (err.message !== "UsageLimitExceeded" || err.code !== "14001") throw new Error("envelope code");
-  if (err.type !== "invalid_request_error") throw new Error("envelope type");
+  assert(err.message === "UsageLimitExceeded" && err.code === "14001", "envelope code");
+  assert(err.type === "invalid_request_error", "envelope type");
   const rate = toOpenAIErrorEnvelope(429, { msg: "too many" }) as { error: { type: string } };
-  if (rate.error.type !== "rate_limit_error") throw new Error("envelope 429 type");
-  if (toOpenAIErrorEnvelope(400, { error: { message: "already" } }) !== undefined) throw new Error("envelope no rewrap");
-  if (toOpenAIErrorEnvelope(400, { other: 1 }) !== undefined) throw new Error("envelope no message");
-  if (toOpenAIErrorEnvelope(400, "plain text") !== undefined) throw new Error("envelope non-object");
+  assert(rate.error.type === "rate_limit_error", "envelope 429 type");
+  assert(toOpenAIErrorEnvelope(400, { error: { message: "already" } }) === undefined, "envelope no rewrap");
+  assert(toOpenAIErrorEnvelope(400, { other: 1 }) === undefined, "envelope no message");
+  assert(toOpenAIErrorEnvelope(400, "plain text") === undefined, "envelope non-object");
   const fromMessage = toOpenAIErrorEnvelope(400, { message: "plain" }) as { error: { message: string } };
-  if (fromMessage.error.message !== "plain") throw new Error("envelope message field");
+  assert(fromMessage.error.message === "plain", "envelope message field");
+
+  // ── 加密凭据（WorkBuddy 5.6+ 桌面文件） ──
+  // 自封自开的 round-trip，证明 AAD 构造与加解密路径自洽。
+  const key = createHash("sha256").update("selftest-secret", "utf8").digest();
+  const sealed = sealAuthFieldForTest(key, "the-access-token");
+  const keyId = createHash("sha256").update(key).digest("hex").slice(0, 16);
+  const classified = classifyDesktopAuthDocument(JSON.stringify({
+    auth: { accessToken: sealed, refreshToken: "plain-refresh", expiresAt: 1_794_908_187_523, domain: "www.workbuddy.cn" },
+    account: { uid: "u3", nickname: "n3" },
+  }));
+  assert(classified.format === "encrypted", "classify encrypted");
+  if (classified.format === "encrypted") {
+    assert(classified.fields.length === 1 && classified.fields[0].field === "accessToken", "wrapped field set");
+    assert(classified.fields[0].target === "auth", "wrapped field target");
+    const envelope = classified.fields[0].envelope;
+    assert(envelope.keyId === keyId, "envelope key id");
+    assert(envelope.nonce.length === 12 && envelope.authTag.length === 16, "envelope part sizes");
+    assert(openAuthField(key, envelope) === "the-access-token", "open auth field");
+    // 换把钥匙必须开不开，而不是给出垃圾明文。
+    const wrong = createHash("sha256").update("other-secret", "utf8").digest();
+    assert(openAuthField(wrong, envelope) === undefined, "wrong key rejected");
+  }
+  // 昵称也在同一个信封里（同一把钥匙、同一个方案），必须一并还原。
+  const nickClassified = classifyDesktopAuthDocument(JSON.stringify({
+    auth: { accessToken: "plain", refreshToken: "plain" },
+    account: { uid: "u4", nickname: sealAuthFieldForTest(key, "13800000000") },
+  }));
+  assert(nickClassified.format === "encrypted", "classify encrypted nickname");
+  if (nickClassified.format === "encrypted") {
+    assert(nickClassified.fields.length === 1, "nickname wrapped count");
+    assert(nickClassified.fields[0].target === "account" && nickClassified.fields[0].field === "nickname", "nickname target");
+    assert(openAuthField(key, nickClassified.fields[0].envelope) === "13800000000", "open nickname");
+  }
+  // 扁平写法（没有 auth/account 容器）也要能识别。
+  const flat = classifyDesktopAuthDocument(JSON.stringify({ accessToken: sealAuthFieldForTest(key, "t") }));
+  assert(flat.format === "encrypted" && flat.fields[0].target === "auth", "flat document shape");
+  // 超长 envelope 不得进入解码。
+  assert(
+    classifyDesktopAuthDocument(JSON.stringify({
+      auth: { accessToken: { $wbEncrypted: 1, envelope: "A".repeat(70_000) } },
+    })).format === "unrecognized",
+    "oversized envelope rejected",
+  );
+  assert(classifyDesktopAuthDocument("").format === "absent", "classify absent");
+  assert(classifyDesktopAuthDocument("{oops").format === "unrecognized", "classify bad json");
+  assert(classifyDesktopAuthDocument(JSON.stringify({ auth: { accessToken: "plain" } })).format === "plaintext", "classify plaintext");
+  assert(
+    classifyDesktopAuthDocument(JSON.stringify({ auth: { accessToken: { $wbEncrypted: 1, envelope: "!!!" } } })).format === "unrecognized",
+    "classify undecodable envelope",
+  );
+  // suite 不是 1 就不认，避免对未知格式盲开。
+  const otherSuite = sealAuthFieldForTest(key, "x", 2);
+  assert(
+    classifyDesktopAuthDocument(JSON.stringify({ auth: { accessToken: otherSuite } })).format === "unrecognized",
+    "classify unknown suite",
+  );
+  const aad = buildAuthenticatedContextAad(keyId, 1);
+  assert(aad.subarray(0, 7).toString("ascii") === "WB-AAD\0", "aad prefix");
+  assert(aad.includes(Buffer.from("WBEV1", "utf8")), "aad framing");
+
   console.log("ok");
 }
