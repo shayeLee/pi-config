@@ -19,6 +19,7 @@ agent/bin
 agent/sessions
 agent/subagent-usage
 agent/usage-cache.json
+agent/crashes.json
 
 # thinking-breaker 探针日志（含思考原文，仅本机留存）
 agent/thinking-breaker/
@@ -32,3 +33,5 @@ agent/.workbuddy-auth.json
 agent/.workbuddy-settings.json
 agent/.workbuddy-cn-auth.json
 agent/.workbuddy-cn-settings.json
+
+agent/extensions/**/pnpm-lock.yaml
