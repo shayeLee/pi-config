@@ -1,5 +1,6 @@
 /**
- * workbuddy — WorkBuddy AI 国际版(腾讯 CodeBuddy 同一后端)。
+ * workbuddy / workbuddy-cn — WorkBuddy AI 国际版与 WorkBuddy 国内版(腾讯 CodeBuddy 同一后端)。
+ * 两个区域变体共用同一后端与业务错误码,因此共用同一个 handler 工厂；它们注册为两个独立实例(各自持有瞬时故障计数),共用同一套配置键。
  *
  * 这个 handler 依赖 `pi-workbuddy-connect` 扩展在 fetch 层做的**错误信封补全**:
  * WorkBuddy 原生错误是 `{code, msg}`,而 pi 的 openai-completions 路径只保留
@@ -98,6 +99,16 @@
  */
 
 import type { ProviderFailbackHandler } from "./types";
+
+/** 两个区域变体共用同一后端与业务错误码,因此共用同一个 handler 工厂。 */
+export const WORKBUDDY_PROVIDER_IDS = ["workbuddy", "workbuddy-cn"] as const;
+export type WorkbuddyProviderId = (typeof WORKBUDDY_PROVIDER_IDS)[number];
+
+/** 各变体的展示名(仅用于 note 文案,便于区分是哪个部署失败)。 */
+const WORKBUDDY_LABELS: Record<string, string> = {
+  workbuddy: "WorkBuddy",
+  "workbuddy-cn": "WorkBuddy 国内版",
+};
 
 type AssistantLike = {
   role?: unknown;
@@ -346,16 +357,28 @@ export function setWorkbuddyRateLimitCooldownMs(value: number): void {
   rateLimitCooldownMs = Number.isFinite(value) && value > 0 ? Math.floor(value) : 0;
 }
 
+export interface WorkbuddyHandlerOptions {
+  /** pi provider id(默认 "workbuddy");决定 provider 过滤与 note 文案。 */
+  providerId?: string;
+  getTransientOutageStreak?: () => number;
+  getRateLimitCooldownMs?: () => number;
+  getWafBlockStreak?: () => number;
+}
+
 /**
- * Handler state belongs to one engine/session.  Do not move this map to module scope:
- * hosted Pi engines share the extension module, and one session's new prompt must not
- * erase another session's outage streak.
+ * 每个 (engine, provider) 一份独立 handler。Handler state belongs to one engine/session.
+ * Do not move the maps to module scope: hosted Pi engines share the extension module,
+ * and one session's new prompt must not erase another session's outage streak. 同理,
+ * workbuddy 与 workbuddy-cn 各持一份计数,一侧的 5xx 风暴不会把另一侧推到逃逸阈值。
  */
-export function createWorkbuddyHandler(
-  getTransientOutageStreak: () => number = () => transientOutageStreak,
-  getRateLimitCooldownMs: () => number = () => rateLimitCooldownMs,
-  getWafBlockStreak: () => number = () => wafBlockStreak,
-): ProviderFailbackHandler {
+export function createWorkbuddyHandler(options: WorkbuddyHandlerOptions = {}): ProviderFailbackHandler {
+  const {
+    providerId = "workbuddy",
+    getTransientOutageStreak = () => transientOutageStreak,
+    getRateLimitCooldownMs = () => rateLimitCooldownMs,
+    getWafBlockStreak = () => wafBlockStreak,
+  } = options;
+  const label = WORKBUDDY_LABELS[providerId] ?? "WorkBuddy";
   const outages = new Map<string, { count: number; lastAt: number }>();
   // WAF 拦截页用**独立**的计数器:它与 5xx 网关故障是不同的上游语义,
   // 共享计数会让一侧的偶发失败把另一侧推到阈值。
@@ -375,12 +398,12 @@ export function createWorkbuddyHandler(
     return count;
   };
   return {
-  providerId: "workbuddy",
+  providerId,
   resetTransientState: resetWorkbuddyOutages,
 
   inspect(message: unknown) {
     const msg = asAssistant(message);
-    if (!msg || msg.provider !== "workbuddy") return null;
+    if (!msg || msg.provider !== providerId) return null;
 
     const text = typeof msg.errorMessage === "string" ? msg.errorMessage : "";
     if (!text) return null;
@@ -396,7 +419,7 @@ export function createWorkbuddyHandler(
         return {
           reason: "quota_exhausted",
           scope: "cross-provider",
-          note: `WorkBuddy 账户额度耗尽(${code})`,
+          note: `${label} 账户额度耗尽(${code})`,
         };
       }
       // 瞬时限流:按配置直接切备用链,不再等 pi 退避重试耗尽。
@@ -419,8 +442,8 @@ export function createWorkbuddyHandler(
           scope: "any",
           resetsAt: bounded ?? Date.now() + cooldownMs,
           note: craftWindow !== undefined
-            ? `WorkBuddy 模型${craftWindow}已用尽(${code}),仅该模型受限,已切换备用链`
-            : `WorkBuddy 瞬时限流(${code}),已切换备用链`,
+            ? `${label} 模型${craftWindow}已用尽(${code}),仅该模型受限,已切换备用链`
+            : `${label} 瞬时限流(${code}),已切换备用链`,
         };
       }
       // 未知 code 不做猜测:留给人工确认,避免误 ban 整个 provider。
@@ -440,7 +463,7 @@ export function createWorkbuddyHandler(
         reason: "waf_blocked",
         scope: "cross-provider",
         resetsAt: Date.now() + WAF_BLOCK_COOLDOWN_MS,
-        note: "WorkBuddy 被腾讯云 WAF 拦截(403 拦截页),已切换备用链",
+        note: `${label} 被腾讯云 WAF 拦截(403 拦截页),已切换备用链`,
       };
     }
 
@@ -459,7 +482,7 @@ export function createWorkbuddyHandler(
         scope: "cross-provider",
         resetsAt: Date.now() + TRANSIENT_OUTAGE_COOLDOWN_MS,
         note:
-          `WorkBuddy 上游连续故障(${outage === "gateway" ? "5xx 网关页" : "Provider finish_reason: error"}),` +
+          `${label} 上游连续故障(${outage === "gateway" ? "5xx 网关页" : "Provider finish_reason: error"}),` +
           `已重试 ${count} 次`,
       };
     }
@@ -469,7 +492,7 @@ export function createWorkbuddyHandler(
       return {
         reason: "quota_exhausted",
         scope: "cross-provider",
-        note: "WorkBuddy 账户额度耗尽(429 兜底)",
+        note: `${label} 账户额度耗尽(429 兜底)`,
       };
     }
 
@@ -481,7 +504,7 @@ export function createWorkbuddyHandler(
         reason: "rate_limited",
         scope: "any",
         resetsAt: Date.now() + cooldownMs,
-        note: "WorkBuddy 瞬时限流(429)",
+        note: `${label} 瞬时限流(429)`,
       };
     }
 
@@ -490,9 +513,10 @@ export function createWorkbuddyHandler(
   };
 }
 
-// Backward-compatible standalone handler for direct provider tests. Engines use a fresh
-// instance from the registry above.
+// Standalone instances are for direct provider tests. Engines use independent instances from the registry.
 export const workbuddyHandler = createWorkbuddyHandler();
+export const workbuddyCnHandler = createWorkbuddyHandler({ providerId: "workbuddy-cn" });
 export function resetWorkbuddyOutages(): void {
   workbuddyHandler.resetTransientState?.();
+  workbuddyCnHandler.resetTransientState?.();
 }

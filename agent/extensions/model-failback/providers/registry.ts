@@ -1,6 +1,6 @@
 /**
  * provider → 判定 handler 的分派表。
- * 新增 provider:在 providers/ 下实现同名文件,并在这里注册一行即可。
+ * 新增 provider:在 providers/ 下实现同名文件,并在这里注册一行即可。workbuddy 两个变体由同一工厂展开。
  */
 
 import type { ProviderFailbackHandler } from "./types";
@@ -9,7 +9,7 @@ import { opencodeHandler } from "./opencode";
 import { opencodeGoHandler } from "./opencode-go";
 import { modelscopeHandler } from "./modelscope";
 import { commandCodeHandler } from "./command-code";
-import { createWorkbuddyHandler } from "./workbuddy";
+import { createWorkbuddyHandler, WORKBUDDY_PROVIDER_IDS } from "./workbuddy";
 
 const STATIC_HANDLERS: readonly ProviderFailbackHandler[] = [
   openaiCodexHandler,
@@ -32,10 +32,13 @@ export function createProviderRegistry(
 ): ProviderRegistry {
   const handlers = [
     ...STATIC_HANDLERS,
-    createWorkbuddyHandler(
-      getWorkbuddyTransientOutageStreak,
-      getWorkbuddyRateLimitCooldownMs,
-      getWorkbuddyWafBlockStreak,
+    ...WORKBUDDY_PROVIDER_IDS.map((providerId) =>
+      createWorkbuddyHandler({
+        providerId,
+        getTransientOutageStreak: getWorkbuddyTransientOutageStreak,
+        getRateLimitCooldownMs: getWorkbuddyRateLimitCooldownMs,
+        getWafBlockStreak: getWorkbuddyWafBlockStreak,
+      }),
     ),
   ];
   return {
@@ -49,5 +52,5 @@ export function createProviderRegistry(
 }
 
 export function supportedProviders(): string[] {
-  return [...STATIC_HANDLERS.map((handler) => handler.providerId), "workbuddy"];
+  return [...STATIC_HANDLERS.map((handler) => handler.providerId), ...WORKBUDDY_PROVIDER_IDS];
 }

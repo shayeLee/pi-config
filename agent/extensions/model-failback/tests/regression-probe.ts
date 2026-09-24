@@ -10,7 +10,7 @@ import { opencodeGoHandler } from "../providers/opencode-go";
 import { opencodeHandler } from "../providers/opencode";
 import { modelscopeHandler } from "../providers/modelscope";
 import { commandCodeHandler } from "../providers/command-code";
-import { workbuddyHandler } from "../providers/workbuddy";
+import { workbuddyCnHandler, workbuddyHandler } from "../providers/workbuddy";
 import {
   classifyTransientOutage,
   classifyWafBlock,
@@ -1287,6 +1287,35 @@ async function runRegressionTests(): Promise<TestResult[]> {
     setWorkbuddyRateLimitCooldownMs(DEFAULT_RATE_LIMIT_COOLDOWN_MS);
   }));
 
+  results.push(await runTest("workbuddy-cn shares the workbuddy terminal classification", () => {
+    setWorkbuddyRateLimitCooldownMs(DEFAULT_RATE_LIMIT_COOLDOWN_MS);
+    resetWorkbuddyOutages();
+    const quotaMessage = '400: {"message":"UsageLimitExceeded","type":"invalid_request_error","code":"14001"}';
+    const quota = workbuddyCnHandler.inspect(assistantFailure("workbuddy-cn", "hy3", quotaMessage));
+    expect(quota?.reason === "quota_exhausted", `unexpected quota verdict: ${quota?.reason}`);
+    expect(quota?.scope === "cross-provider", `unexpected quota scope: ${quota?.scope}`);
+
+    const resetAt = Math.floor((Date.now() + 2 * 3_600_000) / 1_000) * 1_000;
+    const rateLimit = workbuddyCnHandler.inspect(assistantFailure(
+      "workbuddy-cn",
+      "hy3",
+      `429: {"message":"usage exceeds frequency limit, but don't worry, your usage will reset at ${formatUtc8(resetAt)}, alternatively, you can switch to the other models to continue using it.","type":"invalid_request_error","code":"6004"}`,
+    ));
+    expect(rateLimit?.reason === "rate_limited", `unexpected rate-limit verdict: ${rateLimit?.reason}`);
+    expect(rateLimit?.scope === "any", `unexpected rate-limit scope: ${rateLimit?.scope}`);
+    expect(typeof rateLimit?.resetsAt === "number", "rate-limit resetsAt was not populated");
+    expect(rateLimit?.note?.includes("国内版"), `note did not identify domestic deployment: ${rateLimit?.note}`);
+
+    const waf = workbuddyCnHandler.inspect(assistantFailure("workbuddy-cn", "hy3", WAF_BLOCK_PAGE));
+    expect(waf?.reason === "waf_blocked", `unexpected WAF verdict: ${waf?.reason}`);
+    expect(waf?.scope === "cross-provider", `unexpected WAF scope: ${waf?.scope}`);
+    expect(workbuddyCnHandler.inspect(assistantFailure("workbuddy", "hy3", quotaMessage)) === null,
+      "domestic handler must ignore international provider messages");
+    expect(workbuddyHandler.inspect(assistantFailure("workbuddy-cn", "hy3", quotaMessage)) === null,
+      "international handler must ignore domestic provider messages");
+    resetWorkbuddyOutages();
+  }));
+
   results.push(await runTest("workbuddy rate-limit codes switch the chain with a cooldown", () => {
     // 瞬时限流:pi 的退避(1s/2s/4s)远短于 WorkBuddy 的限流窗口,重试耗尽后任务会中断,
     // 因此按配置直接切备用链,并带一个到期自动解 ban 的冷却期。
@@ -2032,9 +2061,9 @@ async function runRegressionTests(): Promise<TestResult[]> {
     );
   }));
 
-  results.push(await runTest("registry contains all six providers", () => {
+  results.push(await runTest("registry contains all seven providers", () => {
     const providers = supportedProviders();
-    expect(providers.length === 6, `expected 6 providers, got ${providers.length}`);
+    expect(providers.length === 7, `expected 7 providers, got ${providers.length}`);
     for (const provider of [
       "openai-codex",
       "opencode",
@@ -2042,6 +2071,7 @@ async function runRegressionTests(): Promise<TestResult[]> {
       "modelscope",
       "command-code",
       "workbuddy",
+      "workbuddy-cn",
     ]) {
       expect(providers.includes(provider), `missing provider ${provider}`);
     }

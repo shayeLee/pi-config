@@ -14,7 +14,7 @@
 
 ## 为什么按 provider 判定
 
-ChatGPT 订阅 backend 与其他 provider 的终态错误形状完全不同(错误码、文案、作用域),因此判定做成了**按 provider 分派**的插拔层。当前已实现并注册 `openai-codex`、`opencode`、`opencode-go`、`modelscope`、`command-code` 与 `workbuddy`;接入新 provider 只需新增一个文件并注册一行,见下文"扩展新 provider"。
+ChatGPT 订阅 backend 与其他 provider 的终态错误形状完全不同(错误码、文案、作用域),因此判定做成了**按 provider 分派**的插拔层。当前已实现并注册 `openai-codex`、`opencode`、`opencode-go`、`modelscope`、`command-code`、`workbuddy` 与 `workbuddy-cn`;接入新 provider 只需新增一个文件并注册一行,见下文"扩展新 provider"。
 
 ## 工作原理(openai-codex)
 
@@ -76,7 +76,7 @@ message_end(assistant, error)
 
 ## 工作原理(workbuddy)
 
-`workbuddy`(WorkBuddy AI 国际版)与腾讯官方 CodeBuddy CLI 共用同一后端,因此判定依据是官方 CLI 里的**业务错误码枚举**与归类表。
+`workbuddy`(WorkBuddy AI 国际版)与 `workbuddy-cn`(WorkBuddy 国内版)共用同一后端与业务错误码,判定依据是官方 CLI 里的**业务错误码枚举**与归类表。两版注册为独立 handler(瞬时故障计数互相独立),共用同一套 `workbuddy*` 配置键,note 文案会带"国内版"以区分部署。
 
 这个 provider 有个前提:WorkBuddy 原生错误是 `{code, msg}`,而 pi 的 openai-completions 路径只保留 OpenAI 形状 `{error:{message,...}}`,不改写时 `errorMessage` 会退化成 `"400 status code (no body)"`——业务码与文案全部丢失,TUI 和本扩展都看不见原因。`pi-workbuddy-connect` 扩展在 fetch 层把 `{code,msg}` 补成 `{error:{message,type,code}}`(`code` 保留为字符串,因为 pi 只透传 `error.error.code`),本 handler 才能读到 `"400: {\"message\":\"…\",\"code\":\"14001\"}"`。
 
@@ -195,9 +195,9 @@ WorkBuddy 的推理端点(apisix/openresty 网关)会以**纯 HTML 页面**返�
 | `maxConsecutive` | `3` | 单次 failback 链允许的最大连续切换次数 |
 | `banFileTtlMs` | `604800000` | 孤儿 session ban 文件的惰性清理 TTL(7 天);设为 `0` 或负数关闭 |
 | `autoRestore` | `false` | 配额恢复后自动切回原模型(每次 agent 启动时检查,不打断进行中的任务) |
-| `workbuddyTransientOutageStreak` | `3` | workbuddy:2 分钟内同一模型连续几次上游 5xx 网关页后允许一次跨 provider 逃逸;`<=0` 关闭 |
-| `workbuddyRateLimitCooldownMs` | `60000` | workbuddy:命中限流/配额窗口(`14003`/`6003`/`6004`/`6005`-`6008`/裸 `429`)时直接切备用链,并对源模型设冷却 ban;`6003`/`6004`/`6008` 优先用错误文案里的官方重置时刻,解析不到才用该值;`<=0` 关闭(交给 pi 退避重试) |
-| `workbuddyWafStreak` | `1` | workbuddy:连续几次 WAF 拦截页后跨 provider 逃逸;默认 `1`(首次即逃逸,pi 不重试 403);`<=0` 关闭 |
+| `workbuddyTransientOutageStreak` | `3` | (workbuddy 与 workbuddy-cn 共用) workbuddy:2 分钟内同一模型连续几次上游 5xx 网关页后允许一次跨 provider 逃逸;`<=0` 关闭 |
+| `workbuddyRateLimitCooldownMs` | `60000` | (workbuddy 与 workbuddy-cn 共用) workbuddy:命中限流/配额窗口(`14003`/`6003`/`6004`/`6005`-`6008`/裸 `429`)时直接切备用链,并对源模型设冷却 ban;`6003`/`6004`/`6008` 优先用错误文案里的官方重置时刻,解析不到才用该值;`<=0` 关闭(交给 pi 退避重试) |
+| `workbuddyWafStreak` | `1` | (workbuddy 与 workbuddy-cn 共用) workbuddy:连续几次 WAF 拦截页后跨 provider 逃逸;默认 `1`(首次即逃逸,pi 不重试 403);`<=0` 关闭 |
 
 ### 链式语义
 
@@ -261,7 +261,7 @@ E2E 会真实调用 provider，前提是 `opencode` 账户当前无余额，并�
 
 当前实现已经完成并启用:
 
-- 支持 `openai-codex`、`opencode`、`opencode-go`、`modelscope`、`command-code`、`workbuddy` 六个 provider;
+- 支持 `openai-codex`、`opencode`、`opencode-go`、`modelscope`、`command-code`、`workbuddy`、`workbuddy-cn` 七个 provider;
 - 使用 `chains` 表达多层 failback，精确节点优先于通配节点;
 - 终态发生后只 ban 精确的 `provider/model`，不 ban 整个 provider;
 - ban 在同一主 session 的 worker/reviewer 子进程之间共享，不跨 session;
@@ -299,7 +299,8 @@ export const myProviderHandler: ProviderFailbackHandler = {
 ## 已验证
 
 - 扩展被 pi 正常加载,不干扰正常任务
-- 六个 provider 的终态判定、provider 隔离和无关错误过滤
+- 七个 provider 的终态判定、provider 隔离和无关错误过滤
+- `workbuddy-cn` 与 `workbuddy` 判定一致、provider 互不误判(隔离)
 - Codex 流式原文 `Codex error: The usage limit has been reached`
 - compaction summarization 期间的 Codex 额度终态，以及切换后重新压缩上下文
 - OpenCode `CreditsError / Insufficient balance`、OpenCode Go `GoUsageLimitError` 与 `503 / Endpoint is unavailable`
