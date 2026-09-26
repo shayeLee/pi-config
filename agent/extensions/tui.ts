@@ -1,39 +1,6 @@
 import { isAbsolute, relative, resolve, sep } from "node:path";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, SessionEntry } from "@earendil-works/pi-coding-agent";
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
-
-function formatTokens(count: number): string {
-	if (count < 1000) return String(count);
-	if (count < 10000) return `${(count / 1000).toFixed(1)}k`;
-	if (count < 1_000_000) return `${Math.round(count / 1000)}k`;
-	if (count < 10_000_000) return `${(count / 1_000_000).toFixed(1)}M`;
-	return `${Math.round(count / 1_000_000)}M`;
-}
-
-interface FooterUsage {
-	input: number;
-	output: number;
-	cacheRead: number;
-	cacheWrite: number;
-	cost: number;
-}
-
-function numberOrZero(value: unknown): number {
-	return typeof value === "number" && Number.isFinite(value) ? value : 0;
-}
-
-function readFooterUsage(value: unknown): FooterUsage | undefined {
-	if (!value || typeof value !== "object") return undefined;
-	const usage = value as Record<string, unknown>;
-	const cost = usage.cost && typeof usage.cost === "object" ? (usage.cost as Record<string, unknown>) : undefined;
-	return {
-		input: numberOrZero(usage.input),
-		output: numberOrZero(usage.output),
-		cacheRead: numberOrZero(usage.cacheRead),
-		cacheWrite: numberOrZero(usage.cacheWrite),
-		cost: numberOrZero(cost?.total),
-	};
-}
 
 function formatCwd(cwd: string): string {
 	const home = process.env.HOME || process.env.USERPROFILE;
@@ -51,8 +18,218 @@ function sanitizeStatus(text: string): string {
 	return text.replace(/[\r\n\t]/g, " ").replace(/ +/g, " ").trim();
 }
 
+function formatTokens(count: number): string {
+	if (count < 1000) return String(count);
+	if (count < 10000) return `${(count / 1000).toFixed(1)}k`;
+	if (count < 1_000_000) return `${Math.round(count / 1000)}k`;
+	if (count < 10_000_000) return `${(count / 1_000_000).toFixed(1)}M`;
+	return `${Math.round(count / 1_000_000)}M`;
+}
+
+interface UsageTotals {
+	input: number;
+	output: number;
+	cacheRead: number;
+	cacheWrite: number;
+	cost: number;
+}
+
+interface CacheStats {
+	/** Cache hit rate of the most recent assistant message. Undefined when that message has no prompt tokens. */
+	latestAssistantPercent: number | undefined;
+	cumulativeRead: number;
+	cumulativeWrite: number;
+	/** Cache hit rate over assistant + branch_summary + compaction usage. Undefined when the denominator is 0. */
+	cumulativePercent: number | undefined;
+}
+
+interface UsageStats {
+	totals: UsageTotals;
+	cache: CacheStats;
+}
+
+interface FooterField {
+	key: string;
+	text: string;
+}
+
+type ContextColor = "error" | "warning" | "text" | "dim";
+
+function numberOrZero(value: unknown): number {
+	return typeof value === "number" && Number.isFinite(value) ? value : 0;
+}
+
+function readUsage(value: unknown): UsageTotals | undefined {
+	if (!value || typeof value !== "object") return undefined;
+	const record = value as Record<string, unknown>;
+	const cost = record.cost && typeof record.cost === "object" ? (record.cost as Record<string, unknown>) : undefined;
+	return {
+		input: numberOrZero(record.input),
+		output: numberOrZero(record.output),
+		cacheRead: numberOrZero(record.cacheRead),
+		cacheWrite: numberOrZero(record.cacheWrite),
+		cost: numberOrZero(cost?.total),
+	};
+}
+
+function addTotals(target: UsageTotals, usage: UsageTotals): void {
+	target.input += usage.input;
+	target.output += usage.output;
+	target.cacheRead += usage.cacheRead;
+	target.cacheWrite += usage.cacheWrite;
+	target.cost += usage.cost;
+}
+
+// Single pass over the active branch. Cache-hit numbers come from assistant messages and from
+// branch_summary/compaction entries; toolResult and standalone usage entries still contribute to
+// token and cost totals (but never to CH/ΣCH).
+function computeUsageStats(entries: readonly SessionEntry[]): UsageStats {
+	const totals: UsageTotals = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 };
+	let latestAssistantPercent: number | undefined;
+	let cumulativePrompt = 0;
+	let cumulativeRead = 0;
+	let cumulativeWrite = 0;
+
+	const addCacheSample = (usage: UsageTotals): void => {
+		cumulativePrompt += usage.input + usage.cacheRead + usage.cacheWrite;
+		cumulativeRead += usage.cacheRead;
+		cumulativeWrite += usage.cacheWrite;
+	};
+
+	for (const entry of entries) {
+		if (entry.type === "message") {
+			const message = entry.message as { role?: string; usage?: unknown } | undefined;
+			if (!message || typeof message !== "object") continue;
+			const usage = readUsage(message.usage);
+			if (!usage) continue;
+			if (message.role === "assistant") {
+				addTotals(totals, usage);
+				const promptTokens = usage.input + usage.cacheRead + usage.cacheWrite;
+				latestAssistantPercent = promptTokens > 0 ? (usage.cacheRead / promptTokens) * 100 : undefined;
+				addCacheSample(usage);
+			} else if (message.role === "toolResult") {
+				addTotals(totals, usage);
+			}
+		} else if (entry.type === "usage") {
+			const usage = readUsage(entry.usage);
+			if (usage) addTotals(totals, usage);
+		} else if (entry.type === "branch_summary" || entry.type === "compaction") {
+			const usage = readUsage(entry.usage);
+			if (!usage) continue;
+			addTotals(totals, usage);
+			addCacheSample(usage);
+		}
+	}
+
+	return {
+		totals,
+		cache: {
+			latestAssistantPercent,
+			cumulativeRead,
+			cumulativeWrite,
+			cumulativePercent: cumulativePrompt > 0 ? (cumulativeRead / cumulativePrompt) * 100 : undefined,
+		},
+	};
+}
+
+function formatUsageFields(stats: UsageStats): FooterField[] {
+	const fields: FooterField[] = [];
+	const { totals, cache } = stats;
+	if (totals.input) fields.push({ key: "in", text: `↑${formatTokens(totals.input)}` });
+	if (totals.output) fields.push({ key: "out", text: `↓${formatTokens(totals.output)}` });
+	if (totals.cacheRead) fields.push({ key: "read", text: `R${formatTokens(totals.cacheRead)}` });
+	if (totals.cacheWrite) fields.push({ key: "write", text: `W${formatTokens(totals.cacheWrite)}` });
+	const total = totals.input + totals.output + totals.cacheRead + totals.cacheWrite;
+	if (total) fields.push({ key: "sum", text: `Σ${formatTokens(total)}` });
+	if ((totals.cacheRead > 0 || totals.cacheWrite > 0) && cache.latestAssistantPercent !== undefined) {
+		fields.push({ key: "ch", text: `CH${cache.latestAssistantPercent.toFixed(1)}%` });
+	}
+	if ((cache.cumulativeRead > 0 || cache.cumulativeWrite > 0) && cache.cumulativePercent !== undefined) {
+		fields.push({ key: "sumch", text: `ΣCH${cache.cumulativePercent.toFixed(1)}%` });
+	}
+	if (totals.cost) fields.push({ key: "cost", text: `$${totals.cost.toFixed(3)}` });
+	return fields;
+}
+
+function buildContextField(
+	usage: { tokens: number | null; contextWindow: number; percent: number | null } | undefined,
+	model: { contextWindow?: number } | undefined,
+): { text: string; color: ContextColor } {
+	if (usage && usage.tokens != null && usage.percent != null) {
+		const color: ContextColor = usage.percent > 90 ? "error" : usage.percent > 70 ? "warning" : "text";
+		return { text: `${usage.percent.toFixed(1)}%/${formatTokens(usage.contextWindow)}`, color };
+	}
+	const window = usage?.contextWindow ?? model?.contextWindow;
+	if (window !== undefined) return { text: `?/${formatTokens(window)}`, color: "dim" };
+	return { text: "ctx ?", color: "dim" };
+}
+
 function block(theme: any, background: string, foreground: string, text: string): string {
 	return theme.bg(background, theme.fg(foreground, ` ${text} `));
+}
+
+// Deterministic degradation ladder for the stats/model line. Left fields are dropped least
+// valuable first (Σ and R/W, then the xp marker, cost and the token arrows) while the right side
+// loses the provider prefix and then the thinking level. CH/ΣCH/context survive the longest.
+const LEFT_DROP_STAGES: readonly (readonly string[])[] = [
+	[],
+	[],
+	["sum"],
+	["sum", "read", "write"],
+	["sum", "read", "write"],
+	["sum", "read", "write", "xp"],
+	["sum", "read", "write", "xp", "cost"],
+	["sum", "read", "write", "xp", "cost", "in", "out"],
+];
+const RIGHT_STAGE: readonly number[] = [0, 1, 1, 1, 2, 2, 2, 2];
+const MIN_LEFT_BUDGET = 6;
+
+function fitTwoSided(left: string, right: string, width: number): string | undefined {
+	const leftWidth = visibleWidth(left);
+	const rightWidth = visibleWidth(right);
+	if (leftWidth + rightWidth + 1 > width) return undefined;
+	return left + " ".repeat(width - leftWidth - rightWidth) + right;
+}
+
+function composeLine(
+	width: number,
+	fields: readonly FooterField[],
+	rightVariants: readonly string[],
+	modelLabel: string,
+	tpsSuffix: string,
+	styleModel: (text: string) => string,
+	ellipsis: string,
+): string {
+	if (width <= 0) return "";
+
+	for (let stage = 0; stage < LEFT_DROP_STAGES.length; stage++) {
+		const dropped = new Set(LEFT_DROP_STAGES[stage]);
+		const left = fields
+			.filter((field) => !dropped.has(field.key))
+			.map((field) => field.text)
+			.join(" ");
+		const fitted = fitTwoSided(left, rightVariants[RIGHT_STAGE[stage]], width);
+		if (fitted !== undefined) return fitted;
+	}
+
+	// Nothing fits: keep the model id and TPS, truncate everything else with an explicit ellipsis.
+	const compactDropped = new Set(LEFT_DROP_STAGES[LEFT_DROP_STAGES.length - 1]);
+	const leftCompact = fields
+		.filter((field) => !compactDropped.has(field.key))
+		.map((field) => field.text)
+		.join(" ");
+	const tpsWidth = visibleWidth(tpsSuffix);
+	let right: string;
+	if (width - 2 >= tpsWidth) {
+		right = styleModel(truncateToWidth(modelLabel, width - 2 - tpsWidth, ellipsis) + tpsSuffix);
+	} else {
+		right = truncateToWidth(styleModel(modelLabel + tpsSuffix), width, ellipsis);
+	}
+	const rightWidth = visibleWidth(right);
+	const leftBudget = width - rightWidth - 1;
+	if (leftBudget < MIN_LEFT_BUDGET) return right;
+	const left = truncateToWidth(leftCompact, leftBudget, ellipsis);
+	return left + " ".repeat(Math.max(0, width - visibleWidth(left) - rightWidth)) + right;
 }
 
 export default function (pi: ExtensionAPI) {
@@ -66,6 +243,14 @@ export default function (pi: ExtensionAPI) {
 	let lastTpsRefreshAt = 0;
 	let tpsTimer: ReturnType<typeof setTimeout> | undefined;
 	let tpsText = "0 tok/s";
+	// Context usage and cumulative usage stats are expensive to compute, so they are cached here
+	// and only refreshed once per final settlement (agent_settled). Render never walks the branch.
+	// Undefined means "not computed yet"; the cache is cleared on session/tree/compact/model changes.
+	let contextUsage: { tokens: number | null; contextWindow: number; percent: number | null } | undefined;
+	let usageStats: UsageStats | undefined;
+	// Session name is read once per session (getSessionName walks all entries); session_info_changed
+	// updates it directly so render never triggers a full history scan.
+	let sessionName: string | undefined;
 
 	function resetTpsMeasurement() {
 		firstDeltaAt = undefined;
@@ -146,8 +331,17 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("session_shutdown", () => resetTpsMeasurement());
 
+	pi.on("session_info_changed", (event) => {
+		sessionName = event.name;
+		activeTui?.requestRender();
+	});
+
 	pi.on("session_start", (_event, ctx) => {
+		contextUsage = undefined;
+		usageStats = undefined;
+		sessionName = undefined;
 		if (ctx.mode !== "tui") return;
+		sessionName = ctx.sessionManager.getSessionName();
 
 		ctx.ui.setFooter((tui, theme, footerData) => {
 			activeTui = tui;
@@ -164,112 +358,50 @@ export default function (pi: ExtensionAPI) {
 					let pwd = formatCwd(ctx.sessionManager.getCwd());
 					const branch = footerData.getGitBranch();
 					if (branch) pwd += ` (${branch})`;
-					const sessionName = ctx.sessionManager.getSessionName();
 					if (sessionName) pwd += ` • ${sessionName}`;
 
-					const totals = {
-						input: 0,
-						output: 0,
-						cacheRead: 0,
-						cacheWrite: 0,
-						cost: 0,
-					};
-					let latestCacheHitRate: number | undefined;
-					let cachePromptTokens = 0;
-					let cacheReadTokens = 0;
-					let cacheWriteTokens = 0;
-
-					for (const entry of ctx.sessionManager.getBranch()) {
-						if (entry.type === "message") {
-							const message = entry.message;
-							if (!message || typeof message !== "object") continue;
-							const usage = readFooterUsage("usage" in message ? message.usage : undefined);
-							if (!usage) continue;
-
-							if (message.role === "assistant") {
-								totals.input += usage.input;
-								totals.output += usage.output;
-								totals.cacheRead += usage.cacheRead;
-								totals.cacheWrite += usage.cacheWrite;
-								totals.cost += usage.cost;
-								const promptTokens = usage.input + usage.cacheRead + usage.cacheWrite;
-								latestCacheHitRate = promptTokens > 0 ? (usage.cacheRead / promptTokens) * 100 : undefined;
-								cachePromptTokens += promptTokens;
-								cacheReadTokens += usage.cacheRead;
-								cacheWriteTokens += usage.cacheWrite;
-							} else if (message.role === "toolResult") {
-								totals.input += usage.input;
-								totals.output += usage.output;
-								totals.cacheRead += usage.cacheRead;
-								totals.cacheWrite += usage.cacheWrite;
-								totals.cost += usage.cost;
-							}
-						} else if (entry.type === "branch_summary" || entry.type === "compaction") {
-							const usage = readFooterUsage(entry.usage);
-							if (!usage) continue;
-							totals.input += usage.input;
-							totals.output += usage.output;
-							totals.cacheRead += usage.cacheRead;
-							totals.cacheWrite += usage.cacheWrite;
-							totals.cost += usage.cost;
-							cachePromptTokens += usage.input + usage.cacheRead + usage.cacheWrite;
-							cacheReadTokens += usage.cacheRead;
-							cacheWriteTokens += usage.cacheWrite;
-						}
-					}
-
-					const context = ctx.getContextUsage();
-					const contextWindow = context?.contextWindow ?? model?.contextWindow ?? 0;
-					const contextDisplay =
-						context?.percent == null ? `?/${formatTokens(contextWindow)}` : `${context.percent.toFixed(1)}%/${formatTokens(contextWindow)}`;
-					const contextColor =
-						context?.percent != null && context.percent > 90
-							? "error"
-							: context?.percent != null && context.percent > 70
-								? "warning"
-								: "text";
-
-					const stats: string[] = [];
-					if (totals.input) stats.push(`↑${formatTokens(totals.input)}`);
-					if (totals.output) stats.push(`↓${formatTokens(totals.output)}`);
-					if (totals.cacheRead) stats.push(`R${formatTokens(totals.cacheRead)}`);
-					if (totals.cacheWrite) stats.push(`W${formatTokens(totals.cacheWrite)}`);
-					const totalTokens = totals.input + totals.output + totals.cacheRead + totals.cacheWrite;
-					if (totalTokens) stats.push(`Σ${formatTokens(totalTokens)}`);
-					const cumulativeCacheHitRate = cachePromptTokens > 0 ? (cacheReadTokens / cachePromptTokens) * 100 : undefined;
-					if ((totals.cacheRead > 0 || totals.cacheWrite > 0) && latestCacheHitRate !== undefined)
-						stats.push(`CH${latestCacheHitRate.toFixed(1)}%`);
-					if ((cacheReadTokens > 0 || cacheWriteTokens > 0) && cumulativeCacheHitRate !== undefined)
-						stats.push(`ΣCH${cumulativeCacheHitRate.toFixed(1)}%`);
-					if (totals.cost || model?.provider === "kimi-coding")
-						stats.push(`$${totals.cost.toFixed(3)}${model?.provider === "kimi-coding" ? " (sub)" : ""}`);
-					stats.push(theme.fg(contextColor, contextDisplay));
-					if (process.env.PI_EXPERIMENTAL === "1")
-						stats.push(`${theme.fg("dim", "•")} ${theme.bold(theme.fg("warning", "xp"))}`);
-
-					const statsText = theme.fg("dim", stats.join(" "));
 					const thinking = model?.reasoning
 						? ctx.thinkingLevel && ctx.thinkingLevel !== "off"
 							? ` • ${ctx.thinkingLevel}`
 							: " • thinking off"
 						: "";
-					let modelText = model?.id || "no-model";
-					if (footerData.getAvailableProviderCount() > 1 && model) modelText = `(${model.provider}) ${modelText}`;
-					modelText += thinking;
-					modelText += ` • ${tpsText}`;
+					const modelLabel = model?.id || "no-model";
+					const providerPrefix = footerData.getAvailableProviderCount() > 1 && model ? `(${model.provider}) ` : "";
+					const tpsSuffix = ` • ${tpsText}`;
 
-					const modelBlock = block(theme, "selectedBg", "accent", modelText);
-					const statsWidth = visibleWidth(statsText);
-					const availableForModel = width - statsWidth - 2;
-					let statsLine: string;
-					if (availableForModel > 0) {
-						const right = truncateToWidth(modelBlock, availableForModel, "");
-						statsLine = statsText + " ".repeat(Math.max(0, width - statsWidth - visibleWidth(right))) + right;
-					} else {
-						statsLine = truncateToWidth(statsText, width, "");
+					const styleModel = (text: string) => block(theme, "selectedBg", "accent", text);
+					const rightVariants = [
+						styleModel(`${providerPrefix}${modelLabel}${thinking}${tpsSuffix}`),
+						styleModel(`${modelLabel}${thinking}${tpsSuffix}`),
+						styleModel(`${modelLabel}${tpsSuffix}`),
+					];
+
+					const context = buildContextField(contextUsage, model);
+					const fields: FooterField[] = [];
+					if (usageStats) {
+						for (const field of formatUsageFields(usageStats)) {
+							fields.push({ key: field.key, text: theme.fg("dim", field.text) });
+						}
+					}
+					fields.push({ key: "ctx", text: theme.fg(context.color, context.text) });
+					if (process.env.PI_EXPERIMENTAL === "1") {
+						fields.push({
+							key: "xp",
+							text: `${theme.fg("dim", "•")} ${theme.bold(theme.fg("warning", "xp"))}`,
+						});
 					}
 
-					const lines = [truncateToWidth(theme.fg("dim", pwd), width, theme.fg("dim", "...")), statsLine];
+					const line = composeLine(
+						width,
+						fields,
+						rightVariants,
+						modelLabel,
+						tpsSuffix,
+						styleModel,
+						theme.fg("dim", "..."),
+					);
+
+					const lines = [truncateToWidth(theme.fg("dim", pwd), width, theme.fg("dim", "...")), line];
 					const statuses = [...footerData.getExtensionStatuses().entries()]
 						.sort(([a], [b]) => a.localeCompare(b))
 						.map(([, text]) => sanitizeStatus(text))
@@ -281,7 +413,29 @@ export default function (pi: ExtensionAPI) {
 		});
 	});
 
-	pi.on("model_select", () => activeTui?.requestRender());
+	pi.on("agent_settled", (_event, ctx) => {
+		if (ctx.mode !== "tui") return;
+		usageStats = computeUsageStats(ctx.sessionManager.getBranch());
+		const usage = ctx.getContextUsage();
+		contextUsage = usage
+			? { tokens: usage.tokens, contextWindow: usage.contextWindow, percent: usage.percent }
+			: undefined;
+		activeTui?.requestRender();
+	});
+
+	// Cache invalidation only clears state and re-renders; it never calls getBranch/getContextUsage.
+	const invalidateAll = () => {
+		usageStats = undefined;
+		contextUsage = undefined;
+		activeTui?.requestRender();
+	};
+
+	pi.on("session_tree", invalidateAll);
+	pi.on("session_compact", invalidateAll);
+	pi.on("model_select", () => {
+		contextUsage = undefined;
+		activeTui?.requestRender();
+	});
 	pi.on("thinking_level_select", () => activeTui?.requestRender());
 	pi.on("turn_end", () => activeTui?.requestRender());
 }

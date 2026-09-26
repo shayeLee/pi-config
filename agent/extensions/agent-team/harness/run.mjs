@@ -30,6 +30,7 @@
  * dist/index.js and node_modules if auto-detection fails.
  */
 import { createRequire } from "node:module";
+import { getEventListeners } from "node:events";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -269,7 +270,7 @@ async function main() {
 			// model-failback propagation; the harness runs without a hosted session.
 			sessionManager: { getSessionId: () => "harness-session" },
 		};
-		const callTool = (tool, params) => tool.execute("harness-call", params, undefined, undefined, ctx);
+		const callTool = (tool, params, signal, onUpdate) => tool.execute("harness-call", params, signal, onUpdate, ctx);
 
 		// Every subagent is a background run now. These data-flow assertions need the
 		// settled transcript, so this helper starts a run and collects it through
@@ -914,6 +915,87 @@ async function main() {
 			(await callTool(statusTool, { runId: slowRunId })).content[0]?.text?.includes("status: running"),
 		);
 		if (slowRunId) await callTool(stopTool, { runId: slowRunId });
+
+		// (9j-3) A wait creates three resources (progress interval, timeout timer,
+		// abort listener). All three must be released on every exit path, including
+		// when the wait ends early, or a long-lived session accumulates them.
+		{
+			// (a) Early completion (the run settles before the timeout).
+			const acDone = new AbortController();
+			const quickRun = await subagent.execute(
+				"harness-call",
+				{ agent: "worker", task: "SCENARIO:tool_result_end_only" },
+				undefined,
+				undefined,
+				ctx,
+			);
+			const quickId = /runId: (\d+)/.exec(quickRun.content[0]?.text ?? "")?.[1];
+			await callTool(waitTool, { runIds: [quickId], timeoutMs: 20_000 }, acDone.signal);
+			check(
+				"a completed wait removes its abort listener",
+				getEventListeners(acDone.signal, "abort").length === 0,
+				String(getEventListeners(acDone.signal, "abort").length),
+			);
+
+			// (b) Timeout. The abort listener must be released even though the signal was
+			// never aborted, and no further progress ticks may fire after the wait ends.
+			const acTimeout = new AbortController();
+			const ticks = [];
+			const slowRun2 = await subagent.execute(
+				"harness-call",
+				{ agent: "worker", task: "SCENARIO:long_running" },
+				undefined,
+				undefined,
+				ctx,
+			);
+			const slowId2 = /runId: (\d+)/.exec(slowRun2.content[0]?.text ?? "")?.[1];
+			await callTool(
+				waitTool,
+				{ runIds: [slowId2], timeoutMs: 300 },
+				acTimeout.signal,
+				(update) => ticks.push(update),
+			);
+			check(
+				"a timed-out wait removes its abort listener",
+				getEventListeners(acTimeout.signal, "abort").length === 0,
+				String(getEventListeners(acTimeout.signal, "abort").length),
+			);
+			const ticksAtEnd = ticks.length;
+			await new Promise((resolve) => setTimeout(resolve, 1300));
+			check(
+				"a timed-out wait clears its progress interval",
+				ticks.length === ticksAtEnd,
+				`${ticksAtEnd} -> ${ticks.length}`,
+			);
+			if (slowId2) await callTool(stopTool, { runId: slowId2 });
+
+			// (c) Abort, including a signal that is already aborted before the wait starts.
+			const acPre = new AbortController();
+			acPre.abort();
+			const preRun = await subagent.execute(
+				"harness-call",
+				{ agent: "worker", task: "SCENARIO:long_running" },
+				undefined,
+				undefined,
+				ctx,
+			);
+			const preId = /runId: (\d+)/.exec(preRun.content[0]?.text ?? "")?.[1];
+			const preResult = await callTool(waitTool, { runIds: [preId], timeoutMs: 60_000 }, acPre.signal);
+			check(
+				"a wait given an already-aborted signal returns immediately as aborted",
+				(preResult.content[0]?.text ?? "").includes("aborted"),
+				(preResult.content[0]?.text ?? "").split("\n")[0],
+			);
+			check(
+				"an already-aborted wait does not stop the subagent",
+				(await callTool(statusTool, { runId: preId })).content[0]?.text?.includes("status: running"),
+			);
+			check(
+				"an already-aborted wait adds no abort listener",
+				getEventListeners(acPre.signal, "abort").length === 0,
+			);
+			if (preId) await callTool(stopTool, { runId: preId });
+		}
 
 		// (9k) Waiting on an unknown id is reported, not silently ignored.
 		const badWait = await callTool(waitTool, { runIds: ["nope"], timeoutMs: 500 });

@@ -46,6 +46,12 @@ export interface BackgroundRunRecord<TResult> {
 	stop: () => boolean;
 	/** Live transcript handle, present from registration until the run settles. */
 	live?: BackgroundLiveView;
+	/**
+	 * Cached one-line summary of the run's latest words, refreshed by the data-flow
+	 * layer on semantic events. Wait progress reads this instead of scanning the
+	 * live transcript on every tick.
+	 */
+	progressSummary?: () => string;
 	/** Control channel for steering a running subagent (B-s stage). */
 	controlSocketPath?: string;
 	/**
@@ -136,6 +142,7 @@ export class BackgroundRunRegistry<TResult> {
 		// Keep the transcript reachable through `result` only; drop the live handle
 		// so a settled run cannot be mistaken for a running one.
 		record.live = undefined;
+		record.progressSummary = undefined;
 		const resolve = this.settleResolvers.get(runId);
 		if (resolve) {
 			this.settleResolvers.delete(runId);

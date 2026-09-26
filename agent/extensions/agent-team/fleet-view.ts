@@ -3,7 +3,10 @@ import { getMarkdownTheme, type ExtensionContext, type Theme } from "@earendil-w
 import { Container, Markdown, matchesKey, Text, truncateToWidth, type TUI, visibleWidth } from "@earendil-works/pi-tui";
 import {
 	FleetStore,
+	RevisionCache,
+	conversationCacheKey,
 	type FleetRun,
+	type FleetToolUpdate,
 } from "./fleet-store.ts";
 
 const ENABLE_MOUSE_TRACKING = "\x1b[?1000h\x1b[?1006h";
@@ -89,7 +92,7 @@ export class FleetWidget {
 		private tui: TUI,
 		private theme: Theme,
 	) {
-		this.unsubscribe = store.subscribe(() => tui.requestRender());
+		this.unsubscribe = store.subscribeTui(() => tui.requestRender());
 		this.ticker = setInterval(() => {
 			const now = Date.now();
 			if (
@@ -155,11 +158,33 @@ function formatToolArguments(args: unknown): string {
 	}
 }
 
-function buildConversation(run: FleetRun, width: number, theme: Theme): string[] {
+/**
+ * Status suffix for a tool whose execution has started but whose durable
+ * toolResult has not landed yet.
+ *
+ * `tool_execution_start` / `tool_execution_end` are transient Fleet state: they
+ * carry no message, so the durable transcript cannot show them. Annotating the
+ * tool-call line (or, with no durable call yet, the fallback line) is what makes
+ * a started tool — including one that emits no output at all — visible the
+ * moment it starts, and its completion/error visible before the toolResult
+ * arrives. Partial streaming output is deliberately not rendered here: the
+ * durable toolResult is the transcript's account of what the tool produced.
+ */
+function toolStatusSuffix(update: FleetToolUpdate, theme: Theme): string {
+	if (update.phase === "streaming") return theme.fg("dim", "  running…");
+	return update.isError ? theme.fg("error", "  ✗ failed") : theme.fg("success", "  ✓ done");
+}
+
+export function buildConversation(run: FleetRun, width: number, theme: Theme): string[] {
 	const container = new Container();
 	const markdownTheme = getMarkdownTheme();
 	container.addChild(new Text(theme.fg("muted", "Task"), 0, 0));
 	container.addChild(new Markdown(run.task, 1, 0, markdownTheme));
+
+	// Tool calls already visible in the durable transcript. A tool that starts
+	// (tool_execution_start) before it produces any output has no durable message
+	// yet, so without this it would be invisible while it runs.
+	const knownToolCallIds = new Set<string>();
 
 	for (const message of run.messages) {
 		if (message.role === "assistant") {
@@ -168,10 +193,22 @@ function buildConversation(run: FleetRun, width: number, theme: Theme): string[]
 					container.addChild(new Text(theme.fg("accent", "Assistant"), 0, 1));
 					container.addChild(new Markdown(part.text, 1, 0, markdownTheme));
 				} else if (part.type === "toolCall") {
+					const callId =
+						typeof (part as { id?: unknown }).id === "string"
+							? (part as { id: string }).id
+							: (part as { toolCallId?: string }).toolCallId;
+					if (callId) knownToolCallIds.add(callId);
 					const args = formatToolArguments(part.arguments);
+					// The call's execution status, if it is running or just finished and the
+					// durable toolResult has not arrived yet. This is the only signal the TUI
+					// gets for a zero-output tool between start and result.
+					const status = callId ? run.toolUpdates[callId] : undefined;
 					container.addChild(
 						new Text(
-							theme.fg("warning", "▶ ") + theme.fg("toolTitle", part.name) + (args ? theme.fg("dim", ` ${args}`) : ""),
+							theme.fg("warning", "▶ ") +
+								theme.fg("toolTitle", part.name) +
+								(args ? theme.fg("dim", ` ${args}`) : "") +
+								(status ? toolStatusSuffix(status, theme) : ""),
 							1,
 							0,
 						),
@@ -179,10 +216,26 @@ function buildConversation(run: FleetRun, width: number, theme: Theme): string[]
 				}
 			}
 		} else if (message.role === "toolResult") {
+			knownToolCallIds.add(message.toolCallId);
 			const icon = message.isError ? theme.fg("error", "✗") : theme.fg("success", "✓");
 			container.addChild(new Text(`${icon} ${theme.fg("toolTitle", `${message.toolName} result`)}`, 1, 0));
 			container.addChild(new Text(theme.fg("toolOutput", toolResultText(message)), 2, 0));
 		}
+	}
+
+	// In-flight tools with no durable call yet: a lightweight status line, so a
+	// zero-output tool is visible from the moment it starts (and still shows its
+	// terminal state until the durable toolResult arrives). Tools already
+	// represented above are skipped to avoid printing one call twice.
+	for (const [id, update] of Object.entries(run.toolUpdates)) {
+		if (knownToolCallIds.has(id)) continue;
+		container.addChild(
+			new Text(
+				theme.fg("warning", "▶ ") + theme.fg("toolTitle", update.toolName) + toolStatusSuffix(update, theme),
+				1,
+				0,
+			),
+		);
 	}
 
 	return container.render(Math.max(10, width));
@@ -197,6 +250,15 @@ class FleetOverlay {
 	private mouseTrackingEnabled = false;
 	private stopConfirmationId?: string;
 	private stopConfirmationTimer?: ReturnType<typeof setTimeout>;
+	/**
+	 * Cached transcript for the selected run. `buildConversation` is the expensive
+	 * part of the overlay (markdown layout for the whole transcript), and the
+	 * overlay repaints on every scroll and on the 1s tick. The cache is keyed by
+	 * run identity + that run's own semantic revision + width, so scrolling and
+	 * the ticker reuse it while any durable change to this run or a resize rebuilds
+	 * it. Another run's activity never invalidates it.
+	 */
+	private conversationCache = new RevisionCache<string[]>();
 
 	constructor(
 		private store: FleetStore,
@@ -207,7 +269,7 @@ class FleetOverlay {
 		private reportError: (message: string) => void,
 	) {
 		this.selectedId = this.sortedRuns()[0]?.id;
-		this.unsubscribe = store.subscribe(() => tui.requestRender());
+		this.unsubscribe = store.subscribeTui(() => tui.requestRender());
 		this.ticker = setInterval(() => tui.requestRender(), 1000);
 		this.ticker.unref?.();
 	}
@@ -283,7 +345,11 @@ class FleetOverlay {
 		return this.box(body, innerWidth);
 	}
 
-	invalidate(): void {}
+	invalidate(): void {
+		// A theme change must not keep ANSI-styled transcript lines built under the
+		// old palette, so the cached conversation is dropped.
+		this.conversationCache.clear();
+	}
 
 	dispose(): void {
 		this.disableMouseTracking();
@@ -383,7 +449,9 @@ class FleetOverlay {
 		}
 
 		const height = Math.max(8, Math.floor(this.tui.terminal.rows * 0.75) - 5);
-		const transcript = buildConversation(run, width, this.theme);
+		const transcript = this.conversationCache.get(conversationCacheKey(run, width), () =>
+			buildConversation(run, width, this.theme),
+		);
 		const maxOffset = Math.max(0, transcript.length - height);
 		const offset = Math.min(this.offsetFromBottom, maxOffset);
 		this.offsetFromBottom = offset;

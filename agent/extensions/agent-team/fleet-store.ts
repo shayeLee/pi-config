@@ -74,15 +74,81 @@ export interface FleetRun {
 	 * to an unrelated run whose id happens to collide.
 	 */
 	live: boolean;
+	/**
+	 * Bumped only on semantic (durable) changes. The TUI caches rendered rows by
+	 * run identity + this revision, so streaming deltas never invalidate them.
+	 */
+	revision: number;
 	stop: () => boolean;
 }
 
-export type RestoredFleetRun = Omit<FleetRun, "id" | "stop" | "status" | "toolUpdates" | "streamingParts" | "streamingReset" | "streamingDeltas" | "live"> & {
+export type RestoredFleetRun = Omit<FleetRun, "id" | "stop" | "status" | "toolUpdates" | "streamingParts" | "streamingReset" | "streamingDeltas" | "live" | "revision"> & {
 	status: Exclude<FleetRunStatus, "running">;
 	toolUpdates?: Record<string, FleetToolUpdate>;
 };
 
+/**
+ * Single-entry memo keyed by a caller-built string.
+ *
+ * Rendering runs on the interactive path, and the TUI repaints far more often
+ * than durable run state changes. The live transcript row and the overlay's
+ * transcript builder are both expensive, so they cache their last result and
+ * rebuild only when the key changes. `clear()` drops the entry so a theme change
+ * cannot serve stale ANSI-styled lines.
+ */
+export class RevisionCache<T> {
+	private entry?: { key: string; value: T };
+
+	get(key: string, build: () => T): T {
+		if (!this.entry || this.entry.key !== key) {
+			this.entry = { key, value: build() };
+		}
+		return this.entry.value;
+	}
+
+	clear(): void {
+		this.entry = undefined;
+	}
+}
+
+/**
+ * Cache key for one live subagent row.
+ *
+ * A row displays a fixed set of run ids. Its rendered content only changes when
+ * one of *those* runs changes semantically, so the key is built from exactly
+ * those runs' `revision` counters. A pruned/cleared run keys as "x" so losing it
+ * also rebuilds. Keying per-run (instead of on a global store counter) means an
+ * unrelated run's durable change never rebuilds an already-finished row, and
+ * per-token streaming deltas — which never bump `revision` — never rebuild it
+ * either.
+ */
+export function liveRowRevisionKey(runs: readonly FleetRun[], runIds: readonly string[]): string {
+	const byId = new Map(runs.map((run) => [run.id, run] as const));
+	return runIds.map((id) => `${id}:${byId.get(id)?.revision ?? "x"}`).join(",");
+}
+
+/**
+ * Cache key for the overlay's transcript of one run: run identity + that run's
+ * own semantic revision + width. Scrolling and the 1s ticker keep the same key
+ * (a cache hit); a durable change to this run, a resize, or switching to another
+ * run changes it. Another run's activity does not.
+ */
+export function conversationCacheKey(run: FleetRun, width: number): string {
+	return `${run.id}:${run.revision}:${width}`;
+}
+
 type FleetListener = () => void;
+
+/**
+ * How a FleetStore change is classified for the TUI channel.
+ *
+ * `delta` is transient streaming output (assistant text/thinking and partial
+ * tool output): the Web UI consumes it, but it is invisible to the TUI's durable
+ * view, so it must not trigger a repaint or invalidate a cached row.
+ * `semantic` is a durable change (message boundary, tool start/end, run
+ * lifecycle) that the TUI must reflect immediately.
+ */
+export type FleetTouchKind = "semantic" | "delta";
 
 /**
  * Observable state container for the Fleet run list. The data-flow layer adds
@@ -93,14 +159,16 @@ type FleetListener = () => void;
 export class FleetStore {
 	private runs: FleetRun[] = [];
 	private listeners = new Set<FleetListener>();
+	private tuiListeners = new Set<FleetListener>();
 	private nextId = 1;
 
-	add(run: Omit<FleetRun, "id" | "status" | "startedAt" | "streamingParts" | "streamingReset" | "streamingDeltas" | "live">): FleetRun {
+	add(run: Omit<FleetRun, "id" | "status" | "startedAt" | "streamingParts" | "streamingReset" | "streamingDeltas" | "live" | "revision">): FleetRun {
 		const entry: FleetRun = {
 			...run,
 			streamingParts: [],
 			streamingReset: 0,
 			streamingDeltas: [],
+			revision: 0,
 			id: String(this.nextId++),
 			status: "running",
 			startedAt: Date.now(),
@@ -108,7 +176,7 @@ export class FleetStore {
 		};
 		this.runs.push(entry);
 		this.prune();
-		this.notify();
+		this.notifyAll();
 		return entry;
 	}
 
@@ -121,17 +189,32 @@ export class FleetStore {
 			streamingParts: [],
 			streamingReset: 0,
 			streamingDeltas: [],
+			revision: 0,
 			// Restored runs have no live process; see the `live` field docs.
 			live: false,
 			stop: () => false,
 		}));
 		this.runs = [...restoredRuns, ...activeRuns];
 		this.prune();
-		this.notify();
+		this.notifyAll();
 	}
 
-	touch(): void {
+	touch(kind: FleetTouchKind = "semantic", run?: FleetRun): void {
+		// The Web UI needs every delta to drive its live streaming layer, so its
+		// listeners are notified unconditionally. The TUI renders durable state only
+		// and is therefore woken on semantic changes alone.
 		this.notify();
+		if (kind === "delta") return;
+		if (run) {
+			run.revision++;
+		} else {
+			// Rare compatibility path: a semantic touch naming no run. The TUI caches
+			// rows by per-run revision, so without bumping something they would serve
+			// stale content. Bump every current run (the store is capped at 32);
+			// production callers pass the run so unrelated rows are not invalidated.
+			for (const current of this.runs) current.revision++;
+		}
+		this.notifyTui();
 	}
 
 	finish(run: FleetRun, status: Exclude<FleetRunStatus, "running">): void {
@@ -143,7 +226,8 @@ export class FleetStore {
 		// (status badge / timeline) even when no further message boundary fires.
 		run.streamingDeltas = [];
 		run.streamingReset++;
-		this.notify();
+		run.revision++;
+		this.notifyAll();
 	}
 
 	stop(id: string): boolean {
@@ -159,7 +243,8 @@ export class FleetStore {
 		run.stopping = true;
 		run.streamingDeltas = [];
 		run.streamingReset++;
-		this.notify();
+		run.revision++;
+		this.notifyAll();
 	}
 
 	list(): readonly FleetRun[] {
@@ -168,12 +253,23 @@ export class FleetStore {
 
 	clear(): void {
 		this.runs = [];
-		this.notify();
+		this.notifyAll();
 	}
 
 	subscribe(listener: FleetListener): () => void {
 		this.listeners.add(listener);
 		return () => this.listeners.delete(listener);
+	}
+
+	/**
+	 * Subscribe to semantic changes only. The TUI renders durable state (status,
+	 * usage, transcript), so per-token streaming deltas must not trigger a repaint
+	 * or invalidate a cached row; the Web UI keeps using `subscribe` for every
+	 * delta.
+	 */
+	subscribeTui(listener: FleetListener): () => void {
+		this.tuiListeners.add(listener);
+		return () => this.tuiListeners.delete(listener);
 	}
 
 	private prune(): void {
@@ -188,5 +284,14 @@ export class FleetStore {
 
 	private notify(): void {
 		for (const listener of this.listeners) listener();
+	}
+
+	private notifyTui(): void {
+		for (const listener of this.tuiListeners) listener();
+	}
+
+	private notifyAll(): void {
+		this.notify();
+		this.notifyTui();
 	}
 }

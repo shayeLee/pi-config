@@ -37,7 +37,7 @@ import { Container, Markdown, Spacer, Text, truncateToWidth, type Component, vis
 import { Type } from "typebox";
 import { type AgentConfig, type AgentScope, discoverAgents } from "./agents.ts";
 import { BackgroundRunRegistry, type BackgroundRunRecord, type BackgroundRunStatus } from "./background-runs.ts";
-import { FleetStore, type FleetRun, type FleetRunStatus, type FleetStreamingDelta, type RestoredFleetRun } from "./fleet-store.ts";
+import { FleetStore, RevisionCache, liveRowRevisionKey, type FleetRun, type FleetRunStatus, type FleetStreamingDelta, type FleetTouchKind, type RestoredFleetRun } from "./fleet-store.ts";
 import { FleetWidget, showFleetOverlay } from "./fleet-view.ts";
 import { FleetWebServer } from "./fleet-web.ts";
 
@@ -54,8 +54,34 @@ const STREAMING_DELTA_METADATA_BYTES = 64;
 const FLEET_TRUNCATION_MARKER = "\n\n[Fleet live output truncated]";
 const DEFAULT_THINKING_LEVEL: ModelThinkingLevel = "medium";
 
-/** Renders a subagent tool row in the opencode style: subtle background + left rail. */
-class OpencodeToolShell implements Component {
+/**
+ * Renders a subagent tool row in the opencode style: subtle background + left rail.
+ *
+ * The shell wraps a component whose output is expensive to format: every line
+ * goes through ANSI/CJK-aware `truncateToWidth` and `visibleWidth`, and a settled
+ * tool row can hold dozens of lines. A transcript repaints on a timer, so a
+ * static row re-formats all of its lines on every frame even though nothing
+ * changed — the dominant cost in a render profile.
+ *
+ * `inner.render()` is therefore still called on every `render()` (a live child
+ * can change without calling `invalidate()`), but the expensive per-line work is
+ * skipped when the child's lines, the width and the styling are all unchanged. A
+ * per-line cache built from the previous frame's lines keeps a one-line change to
+ * re-formatting that one line. The caches hold only the current frame, so they
+ * cannot grow with the length of the transcript.
+ */
+export class OpencodeToolShell implements Component {
+	// Last frame's input snapshot and output, returned verbatim on a no-op frame.
+	private cachedWidth = -1;
+	private cachedStyle = "";
+	private cachedInput: string[] = [];
+	private cachedOutput: string[] = [];
+
+	// Formatting result per input line for the frame just rendered. Bounded by the
+	// number of lines in one frame, never by the number of frames.
+	private lineCache = new Map<string, string>();
+	private lineCacheKey = "";
+
 	constructor(
 		private readonly inner: Component,
 		private readonly background: (text: string) => string,
@@ -65,16 +91,69 @@ class OpencodeToolShell implements Component {
 	render(width: number): string[] {
 		if (width <= 0) return [""];
 		const contentWidth = Math.max(1, width - 2);
-		return this.inner.render(contentWidth).map((line) => {
-			const clipped = truncateToWidth(line, contentWidth, "");
-			const padding = " ".repeat(Math.max(0, contentWidth - visibleWidth(clipped)));
-			return truncateToWidth(this.background(`${this.rail("│")} ${clipped}${padding}`), width, "");
-		});
+		// Always render the child: it may hold live state (a running run's status)
+		// that changed since the last frame without an invalidate().
+		const input = this.inner.render(contentWidth);
+		// Styling arrives as opaque closures. Sampling them detects a theme or state
+		// change even when the same component instance is reused.
+		const style = `${this.background("\u0000")}\u0001${this.rail("\u0000")}`;
+
+		if (width === this.cachedWidth && style === this.cachedStyle && sameLines(input, this.cachedInput)) {
+			return this.cachedOutput;
+		}
+
+		const lineCacheKey = `${width}\u0001${contentWidth}\u0001${style}`;
+		if (lineCacheKey !== this.lineCacheKey) {
+			// Width or styling changed: every cached line was formatted for the old
+			// geometry/style and must not be reused.
+			this.lineCache.clear();
+			this.lineCacheKey = lineCacheKey;
+		}
+
+		const previousLines = this.lineCache;
+		const nextLines = new Map<string, string>();
+		const output: string[] = new Array(input.length);
+		for (let i = 0; i < input.length; i++) {
+			const line = input[i];
+			let rendered = previousLines.get(line);
+			if (rendered === undefined) rendered = this.formatLine(line, contentWidth, width);
+			nextLines.set(line, rendered);
+			output[i] = rendered;
+		}
+
+		this.lineCache = nextLines;
+		this.cachedWidth = width;
+		this.cachedStyle = style;
+		// Snapshot the child's lines: it may mutate and return the same array, so a
+		// reference comparison would miss an in-place change.
+		this.cachedInput = input.slice();
+		this.cachedOutput = output;
+		return output;
+	}
+
+	private formatLine(line: string, contentWidth: number, width: number): string {
+		const clipped = truncateToWidth(line, contentWidth, "");
+		const padding = " ".repeat(Math.max(0, contentWidth - visibleWidth(clipped)));
+		return truncateToWidth(this.background(`${this.rail("│")} ${clipped}${padding}`), width, "");
 	}
 
 	invalidate(): void {
+		this.cachedWidth = -1;
+		this.cachedStyle = "";
+		this.cachedInput = [];
+		this.cachedOutput = [];
+		this.lineCache.clear();
+		this.lineCacheKey = "";
 		this.inner.invalidate();
 	}
+}
+
+function sameLines(a: readonly string[], b: readonly string[]): boolean {
+	if (a.length !== b.length) return false;
+	for (let i = 0; i < a.length; i++) {
+		if (a[i] !== b[i]) return false;
+	}
+	return true;
 }
 
 function capFleetText(value: string, maxBytes: number): { text: string; truncated: boolean } {
@@ -379,6 +458,12 @@ interface RunControlHooks {
 		stop: () => boolean;
 		live: { messages: Message[] };
 		controlSocketPath?: string;
+		/**
+		 * Cached one-line summary of the run's latest words, refreshed on semantic
+		 * events only. Wait progress reads this instead of re-scanning the transcript
+		 * on every tick.
+		 */
+		progressSummary?: () => string;
 	}) => void;
 	/** Control socket path injected into the child (B-s stage). */
 	controlSocketPath?: string;
@@ -662,23 +747,43 @@ function liveFleetResults(runIds: readonly string[], fleetStore: FleetStore): Si
 }
 
 /**
- * A live row that rebuilds its content on every repaint.
+ * A live row that re-reads its run state when the durable state changes.
  *
  * The transcript constructs a tool row once, when the tool returns, and then
  * repaints that same component tree. A `subagent` row read once at construction
  * would therefore freeze at "no output" for the whole run. Re-reading the run
  * state inside `render()` is what keeps the row live; there is no subscription
  * because a Component has no dispose hook to unsubscribe from.
+ *
+ * Rebuilding the component on every repaint would be wasteful — the TUI repaints
+ * far more often than the run's durable state changes. The built component is
+ * therefore cached and only rebuilt when the revision of one of the runs this
+ * row displays changes (durable events only: message boundaries, tool start/end,
+ * run lifecycle) or the width changes. Keying on those runs rather than a global
+ * counter means an unrelated run's message never rebuilds an already-finished
+ * row. Per-token streaming deltas do not bump a run's revision, so they never
+ * invalidate the cache either.
  */
 class LiveSubagentRow implements Component {
-	constructor(private readonly build: () => Component) {}
+	private cache = new RevisionCache<Component>();
+
+	constructor(
+		private readonly store: FleetStore,
+		private readonly runIds: readonly string[],
+		private readonly build: () => Component,
+	) {}
 
 	render(width: number): string[] {
-		return this.build().render(width);
+		const component = this.cache.get(
+			`${liveRowRevisionKey(this.store.list(), this.runIds)}:${width}`,
+			this.build,
+		);
+		return component.render(width);
 	}
 
 	invalidate(): void {
-		// Nothing cached: the next render rebuilds from current run state.
+		// Theme change or an explicit cache clear: rebuild on the next render.
+		this.cache.clear();
 	}
 }
 
@@ -707,8 +812,10 @@ function renderSubagentResult(
 	if (!isLive) {
 		return buildSubagentResultComponent(result, { expanded, isPartial }, isError, theme, fleetStore);
 	}
-	return new LiveSubagentRow(() =>
-		buildSubagentResultComponent(result, { expanded, isPartial }, isError, theme, fleetStore),
+	return new LiveSubagentRow(
+		fleetStore,
+		(rawDetails?.liveRunIds as string[] | undefined) ?? [],
+		() => buildSubagentResultComponent(result, { expanded, isPartial }, isError, theme, fleetStore),
 	);
 }
 
@@ -1105,6 +1212,7 @@ async function startBackgroundRun(
 				startedAt: Date.now(),
 				stop: handle.stop,
 				live: handle.live,
+				progressSummary: handle.progressSummary,
 				controlSocketPath: handle.controlSocketPath,
 			});
 			resolveSpawned();
@@ -1385,10 +1493,23 @@ async function runSingleAgent(
 		stop: () => fleetStore.stop(fleetRun.id),
 		live: { messages: currentResult.messages },
 		controlSocketPath: control.controlSocketPath,
+		progressSummary: () => progressSummary,
 	});
 
 	const clearStreamingDeltas = () => {
 		fleetRun.streamingDeltas = [];
+	};
+
+	// Wait progress reads the subagent's latest words. Recomputing that by
+	// scanning the whole transcript on every tick is wasteful for long runs, so
+	// the summary is refreshed only when a semantic event (message_end / tool
+	// start / tool end) actually changes the transcript. Deltas do not change
+	// `messages`, so they never touch it. The wait tool reads it via
+	// `RunControlHooks.progressSummary`.
+	let progressSummary = "";
+	const refreshProgressSummary = () => {
+		const messages = currentResult.messages;
+		progressSummary = latestAssistantText(messages) || summarizeMessage(messages[messages.length - 1]);
 	};
 
 	const deltaByteSize = (delta: FleetStreamingDelta): number => {
@@ -1483,10 +1604,11 @@ async function runSingleAgent(
 		pushStreamingDelta({ index: contentIndex, type: kind, text: delta });
 	};
 
-	const emitUpdate = () => {
+	const emitUpdate = (kind: FleetTouchKind = "semantic") => {
 		fleetRun.model = currentResult.model;
 		fleetRun.thinkingLevel = currentResult.thinkingLevel;
-		fleetStore.touch();
+		if (kind === "semantic") refreshProgressSummary();
+		fleetStore.touch(kind, fleetRun);
 	};
 
 	try {
@@ -1586,7 +1708,7 @@ async function runSingleAgent(
 							appendStreaming(contentIndex, "text", undefined, typeof assistantEvent.content === "string" ? assistantEvent.content : undefined);
 							break;
 					}
-					emitUpdate();
+					emitUpdate("delta");
 				}
 
 				if (event.type === "message_end" && isRecord(event.message)) {
@@ -1650,9 +1772,17 @@ async function runSingleAgent(
 					}
 				}
 
+				if (event.type === "tool_execution_start" && isToolId(event.toolCallId)) {
+					// Register the tool the moment it starts, with no output yet. Otherwise
+					// a long-running tool is invisible until its first partial result, and a
+					// tool that never streams output is invisible until it finishes.
+					updateFleetTool(event.toolCallId, isToolName(event.toolName) ? event.toolName : "tool", "streaming", undefined);
+					emitUpdate("semantic");
+				}
+
 				if (event.type === "tool_execution_update" && isToolId(event.toolCallId)) {
 					updateFleetTool(event.toolCallId, isToolName(event.toolName) ? event.toolName : "tool", "streaming", event.partialResult);
-					emitUpdate();
+					emitUpdate("delta");
 				}
 
 				if (event.type === "tool_execution_end" && isToolId(event.toolCallId)) {
@@ -2351,30 +2481,29 @@ export default function (pi: ExtensionAPI) {
 				for (const record of requested) {
 					const current = backgroundRuns.get(record.runId);
 					if (!current || current.status !== "running") continue;
-					const messages = current.live?.messages ?? [];
 					const label = total > 1 ? `run ${current.runId} (${current.agent})` : current.agent;
-					// The newest assistant text is the most useful signal; fall back to the
-					// newest message of any kind, then to "starting".
-					const said = latestAssistantText(messages) || summarizeMessage(messages[messages.length - 1]);
+					// The summary is maintained by the data-flow layer on semantic events, so
+					// this tick is O(outstanding runs) and never re-scans a transcript.
+					const said = current.progressSummary?.() ?? "";
 					lines.push(said ? `${label}: ${said}` : `${label}: starting`);
 				}
 				return lines.join("\n");
 			};
+			let timeoutTimer: ReturnType<typeof setTimeout> | undefined;
+			let abortResolve: () => void = () => {};
+			const abortHandler = () => {
+				aborted = true;
+				abortResolve();
+			};
 			const abortPromise = new Promise<void>((resolve) => {
+				abortResolve = resolve;
 				if (!signal) return;
 				if (signal.aborted) {
 					aborted = true;
 					resolve();
 					return;
 				}
-				signal.addEventListener(
-					"abort",
-					() => {
-						aborted = true;
-						resolve();
-					},
-					{ once: true },
-				);
+				signal.addEventListener("abort", abortHandler, { once: true });
 			});
 			// Report progress while waiting, otherwise the row sits on "Working" with no
 			// sign of which runs are still outstanding.
@@ -2386,17 +2515,22 @@ export default function (pi: ExtensionAPI) {
 				await Promise.race([
 					Promise.allSettled(requested.map((record) => record.settled)),
 					new Promise<void>((resolve) => {
-						const timer = setTimeout(() => {
+						timeoutTimer = setTimeout(() => {
 							timedOut = true;
 							resolve();
 						}, timeoutMs);
 						// Do not keep the process alive purely for the timeout.
-						timer.unref?.();
+						timeoutTimer.unref?.();
 					}),
 					abortPromise,
 				]);
 			} finally {
+				// Release every resource the wait created, including when it ends early
+				// (settled, timed out, or aborted): the interval must not keep ticking
+				// and the abort listener must not stay attached to a long-lived signal.
 				clearInterval(progressTimer);
+				if (timeoutTimer) clearTimeout(timeoutTimer);
+				signal?.removeEventListener("abort", abortHandler);
 			}
 
 			const sections = requested.map((record) => {

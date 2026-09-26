@@ -132,11 +132,14 @@ async function main() {
 	const fleetStoreModule = await jiti.import(path.join(EXTENSION_DIR, "fleet-store.ts"));
 	const fleetView = await jiti.import(path.join(EXTENSION_DIR, "fleet-view.ts"));
 	const fleetWeb = await jiti.import(path.join(EXTENSION_DIR, "fleet-web.ts"));
+	const extensionModule = await jiti.import(EXTENSION_DIR + "/index.ts");
 	const piTui = await jiti.import(path.join(pkgRoot, "node_modules/@earendil-works/pi-tui/dist/index.js"));
 	const { FleetStore } = fleetStoreModule;
-	const { FleetWidget } = fleetView;
+	const { liveRowRevisionKey, conversationCacheKey, RevisionCache } = fleetStoreModule;
+	const { FleetWidget, buildConversation } = fleetView;
 	const { FleetWebServer, webRun, selectWebRun, serializeFleetRun, WEB_RUN_OPTIONS } = fleetWeb;
-	const { visibleWidth } = piTui;
+	const { OpencodeToolShell } = extensionModule;
+	const { visibleWidth, truncateToWidth } = piTui;
 
 	// ------------------------------------------------------------------------
 	console.log("\n[0] data-flow layer must not depend on the presentation layer");
@@ -389,6 +392,441 @@ async function main() {
 			"restored history is not marked live",
 			ids.filter((r) => r.agent.startsWith("hist-")).every((r) => r.live === false),
 		);
+	}
+
+	// ------------------------------------------------------------------------
+	console.log("\n[1b] TUI notification channel (deltas must not repaint or invalidate)");
+	{
+		const store = new FleetStore();
+		let webNotified = 0;
+		let tuiNotified = 0;
+		store.subscribe(() => webNotified++);
+		store.subscribeTui(() => tuiNotified++);
+
+		const run = store.add(makeRun());
+		check("add notifies both channels", webNotified === 1 && tuiNotified === 1);
+
+		// Thousands of streaming deltas: the Web channel must see every one (it drives
+		// the SSE live layer), while the TUI is not woken and the run's semantic
+		// revision does not move.
+		const revisionBefore = run.revision;
+		for (let i = 0; i < 5000; i++) {
+			run.streamingDeltas.push({ index: 0, type: "text", text: `delta-${i}` });
+			store.touch("delta", run);
+		}
+		check(
+			"5000 streaming deltas notify the Web channel every time",
+			webNotified === 5001,
+			String(webNotified),
+		);
+		check("streaming deltas do not wake the TUI channel", tuiNotified === 1, String(tuiNotified));
+		check("streaming deltas do not bump the run revision", run.revision === revisionBefore);
+		check("delta data is still retained for the Web layer", run.streamingDeltas.length === 5000);
+
+		// A durable assistant message_end / tool event is semantic: it bumps the run
+		// revision and wakes the TUI immediately.
+		store.touch("semantic", run);
+		check("a semantic touch wakes the TUI", tuiNotified === 2, String(tuiNotified));
+		check("a semantic touch bumps the run revision", run.revision === revisionBefore + 1);
+
+		// Lifecycle transitions are semantic on both channels.
+		const before = { web: webNotified, tui: tuiNotified };
+		store.finish(run, "completed");
+		check(
+			"finish notifies both channels and bumps the revision",
+			webNotified === before.web + 1 && tuiNotified === before.tui + 1 && run.revision === revisionBefore + 2,
+		);
+
+		// A bare touch() (no run) is a rare compatibility path: it must still bump the
+		// revisions the TUI caches on, otherwise a no-arg touch leaves cached rows
+		// stale. It must not, however, bump on a delta.
+		store.touch();
+		check(
+			"a no-arg semantic touch bumps every run's revision",
+			run.revision === revisionBefore + 3,
+			String(run.revision),
+		);
+		store.touch("delta");
+		check("a no-arg delta touch does not bump any revision", run.revision === revisionBefore + 3);
+
+		// Unsubscribe must stop each channel independently.
+		const store2 = new FleetStore();
+		let tui2 = 0;
+		const off = store2.subscribeTui(() => tui2++);
+		off();
+		store2.add(makeRun());
+		check("unsubscribing from the TUI channel stops notifications", tui2 === 0, String(tui2));
+	}
+
+	// ------------------------------------------------------------------------
+	console.log("\n[1c] render caches: per-run revision keys and real hits");
+	{
+		// A live row displays a fixed set of run ids; its key must follow only those
+		// runs. Another run changing must not rebuild it.
+		const runA = makeRun({ id: "1" });
+		const runB = makeRun({ id: "2" });
+		const keyBefore = liveRowRevisionKey([runA, runB], ["1"]);
+		runB.revision += 1;
+		check("an unrelated run's revision does not change a row's key", liveRowRevisionKey([runA, runB], ["1"]) === keyBefore);
+		runA.revision += 1;
+		check("the row's own run revision changes its key", liveRowRevisionKey([runA, runB], ["1"]) !== keyBefore);
+		check(
+			"a pruned run keys as missing",
+			liveRowRevisionKey([runA], ["1", "2"]) !== liveRowRevisionKey([runA, runB], ["1", "2"]),
+		);
+
+		// The overlay transcript key follows run identity + that run's revision + width.
+		const convA = makeRun({ id: "7" });
+		const base = conversationCacheKey(convA, 80);
+		check("same run/revision/width yields the same conversation key", conversationCacheKey(convA, 80) === base);
+		check("a width change invalidates the conversation key", conversationCacheKey(convA, 100) !== base);
+		check("another run invalidates the conversation key", conversationCacheKey(makeRun({ id: "8" }), 80) !== base);
+		convA.revision += 1;
+		check("a semantic revision invalidates the conversation key", conversationCacheKey(convA, 80) !== base);
+
+		// RevisionCache must actually skip the builder on a hit (not just return equal
+		// output), and must rebuild after invalidate().
+		const cache = new RevisionCache();
+		let built = 0;
+		const build = () => {
+			built += 1;
+			return [`build-${built}`];
+		};
+		const first = cache.get("k", build);
+		const second = cache.get("k", build);
+		check("a cache hit reuses the value and skips the builder", built === 1 && first === second && first[0] === "build-1");
+		const third = cache.get("other", build);
+		check("a different key rebuilds", built === 2 && third[0] === "build-2");
+		cache.clear();
+		cache.get("other", build);
+		check("clear() forces a rebuild", built === 3);
+	}
+
+	// ------------------------------------------------------------------------
+	console.log("\n[1d] overlay transcript: a tool's start/end is visible before its result");
+	{
+		const theme = mockTheme();
+		const toolCallMessage = (id, name) => ({
+			role: "assistant",
+			content: [{ type: "toolCall", id, name, arguments: { path: "/tmp/x" } }],
+		});
+		const toolResultMessage = (id, name, text) => ({
+			role: "toolResult",
+			toolCallId: id,
+			toolName: name,
+			content: [{ type: "text", text }],
+			isError: false,
+		});
+
+		// (a) The normal sequence: the durable assistant toolCall has landed, then the
+		// tool starts (tool_execution_start) with no output, then ends
+		// (tool_execution_end). Both transitions must be visible on the existing
+		// toolCall line — the durable toolResult has not arrived yet, so nothing else
+		// in the transcript can show them.
+		const run = makeRun({ id: "5", messages: [toolCallMessage("call-1", "bash")], toolUpdates: {} });
+		run.toolUpdates["call-1"] = { toolName: "bash", phase: "streaming", content: [] };
+		const started = buildConversation(run, 80, theme).join("\n");
+		check(
+			"a started tool is marked running on its existing toolCall line",
+			started.includes("bash") && started.includes("running"),
+			started.slice(0, 200),
+		);
+		check(
+			"the started tool's call is not printed twice",
+			started.split("bash").length - 1 === 1,
+			started.slice(0, 200),
+		);
+
+		// End with no output: the terminal state must show immediately, without
+		// waiting for the durable toolResult.
+		run.toolUpdates["call-1"] = { toolName: "bash", phase: "completed", content: [], isError: false };
+		const completed = buildConversation(run, 80, theme).join("\n");
+		check(
+			"a finished tool is marked done before its toolResult arrives",
+			completed.includes("done") && !completed.includes("running"),
+			completed.slice(0, 200),
+		);
+		run.toolUpdates["call-1"] = { toolName: "bash", phase: "completed", content: [], isError: true };
+		check(
+			"a failed tool is marked failed before its toolResult arrives",
+			buildConversation(run, 80, theme).join("\n").includes("failed"),
+		);
+
+		// (b) Partial streaming output must not leak into the durable transcript; only
+		// the status marker is added.
+		run.toolUpdates["call-1"] = {
+			toolName: "bash",
+			phase: "streaming",
+			content: [{ type: "text", text: "PARTIAL-TOOL-OUTPUT" }],
+		};
+		const streaming = buildConversation(run, 80, theme).join("\n");
+		check(
+			"streaming tool output is not rendered in the overlay",
+			!streaming.includes("PARTIAL-TOOL-OUTPUT"),
+			streaming.slice(0, 200),
+		);
+
+		// (c) The isolated-start fallback: a tool with no durable call yet still gets a
+		// status line, and once its toolResult lands the toolUpdate is cleared (as the
+		// data-flow layer does) so nothing is printed twice.
+		const orphan = makeRun({ id: "6", messages: [], toolUpdates: {} });
+		orphan.toolUpdates["call-2"] = { toolName: "grep", phase: "streaming", content: [] };
+		const orphanText = buildConversation(orphan, 80, theme).join("\n");
+		check(
+			"a tool with no durable call yet gets its own status line",
+			orphanText.includes("grep") && orphanText.includes("running"),
+			orphanText.slice(0, 200),
+		);
+		orphan.messages.push(toolResultMessage("call-2", "grep", "MATCH"));
+		delete orphan.toolUpdates["call-2"];
+		const settledText = buildConversation(orphan, 80, theme).join("\n");
+		check(
+			"after the toolResult lands the fallback line is gone and the result shows",
+			settledText.includes("MATCH") && settledText.includes("grep result") && !settledText.includes("running"),
+			settledText.slice(0, 200),
+		);
+	}
+
+	// ------------------------------------------------------------------------
+	console.log("\n[1e] OpencodeToolShell: static rows are formatted once, not per frame");
+	{
+		// The shell's per-line work (ANSI/CJK-aware truncate + width) is what a
+		// render profile shows as the hot path: a settled tool row repaints on a
+		// timer and re-formats every line each frame. These assertions pin the
+		// cache to that cost while requiring output to stay byte-identical to the
+		// pre-cache algorithm.
+		const sameOutput = (a, b) => a.length === b.length && a.every((line, i) => line === b[i]);
+		// The pre-cache implementation, kept verbatim as the correctness oracle.
+		const legacyRender = (inner, width, background, rail) => {
+			if (width <= 0) return [""];
+			const contentWidth = Math.max(1, width - 2);
+			return inner.render(contentWidth).map((line) => {
+				const clipped = truncateToWidth(line, contentWidth, "");
+				const padding = " ".repeat(Math.max(0, contentWidth - visibleWidth(clipped)));
+				return truncateToWidth(background(`${rail("│")} ${clipped}${padding}`), width, "");
+			});
+		};
+		const makeInner = (lines) => ({
+			lines,
+			invalidations: 0,
+			render() {
+				return this.lines;
+			},
+			invalidate() {
+				this.invalidations += 1;
+			},
+		});
+		// Counts only real per-line formatting; the once-per-frame style probe
+		// (called with "\u0000") is excluded so the assertion is about the hot work.
+		const makeStyle = () => {
+			const counts = { bg: 0, rail: 0 };
+			return {
+				counts,
+				background: (s) => {
+					if (s !== "\u0000") counts.bg += 1;
+					return `\x1b[48;5;236m${s}\x1b[49m`;
+				},
+				rail: (s) => {
+					if (s !== "\u0000") counts.rail += 1;
+					return `\x1b[2m${s}\x1b[22m`;
+				},
+			};
+		};
+		const fixture = (count) =>
+			Array.from({ length: count }, (_, i) =>
+				i % 7 === 0 ? "" : `line ${i} \x1b[31mred\x1b[39m ${"中文宽度 😀".repeat(i % 3)}`,
+			);
+
+		// (a) 100 identical frames: the child is re-rendered every time (it may hold
+		// live state), but its lines are formatted exactly once.
+		{
+			const lines = fixture(200);
+			const style = makeStyle();
+			let renders = 0;
+			const inner = {
+				lines: [...lines],
+				render() {
+					renders += 1;
+					return this.lines;
+				},
+				invalidate() {},
+			};
+			const shell = new OpencodeToolShell(inner, style.background, style.rail);
+			let frame = shell.render(80);
+			for (let i = 0; i < 99; i++) frame = shell.render(80);
+			check(
+				"100 static frames format each line exactly once",
+				style.counts.bg === lines.length && style.counts.rail === lines.length,
+				`bg=${style.counts.bg} rail=${style.counts.rail} lines=${lines.length}`,
+			);
+			check("the wrapped child is still rendered every frame", renders === 100, String(renders));
+			const oracle = makeStyle();
+			check(
+				"cached frames match the pre-cache algorithm",
+				sameOutput(frame, legacyRender(makeInner([...lines]), 80, oracle.background, oracle.rail)),
+			);
+		}
+
+		// (b) A one-line change re-formats only that line and reuses the rest.
+		{
+			const lines = fixture(50);
+			const style = makeStyle();
+			const inner = makeInner([...lines]);
+			const shell = new OpencodeToolShell(inner, style.background, style.rail);
+			shell.render(80);
+			const before = style.counts.bg;
+			inner.lines[5] = "line 5 changed";
+			const frame = shell.render(80);
+			check("only the changed line is re-formatted", style.counts.bg === before + 1, `delta=${style.counts.bg - before}`);
+			const oracle = makeStyle();
+			check(
+				"the one-line change matches the pre-cache algorithm",
+				sameOutput(frame, legacyRender(makeInner([...inner.lines]), 80, oracle.background, oracle.rail)),
+			);
+		}
+
+		// (c) The child may mutate and return the same array; a reference comparison
+		// would miss it, so the shell must snapshot the lines.
+		{
+			const lines = fixture(20);
+			const style = makeStyle();
+			const inner = makeInner(lines);
+			const shell = new OpencodeToolShell(inner, style.background, style.rail);
+			shell.render(60);
+			lines[3] = "in-place edit";
+			const frame = shell.render(60);
+			const oracle = makeStyle();
+			check("the in-place edit is visible in the output", frame.some((line) => line.includes("in-place edit")));
+			check(
+				"an in-place child array edit matches the pre-cache algorithm",
+				sameOutput(frame, legacyRender(makeInner([...lines]), 60, oracle.background, oracle.rail)),
+			);
+		}
+
+		// (d) Width changes invalidate every cached line, in both directions.
+		{
+			const lines = fixture(30);
+			const style = makeStyle();
+			const shell = new OpencodeToolShell(makeInner([...lines]), style.background, style.rail);
+			shell.render(80);
+			const before = style.counts.bg;
+			const narrow = shell.render(40);
+			check("a width change re-formats every line", style.counts.bg === before + lines.length, `delta=${style.counts.bg - before}`);
+			const oracle = makeStyle();
+			check(
+				"the narrowed output matches the pre-cache algorithm",
+				sameOutput(narrow, legacyRender(makeInner([...lines]), 40, oracle.background, oracle.rail)),
+			);
+			const oracleWide = makeStyle();
+			check(
+				"widening back matches the pre-cache algorithm",
+				sameOutput(shell.render(80), legacyRender(makeInner([...lines]), 80, oracleWide.background, oracleWide.rail)),
+			);
+		}
+
+		// (e) A style change (theme swap) must re-format every line, and invalidate()
+		// must clear the cache and reach the child. The styling functions are opaque
+		// closures, so the shell samples them to detect the change.
+		{
+			const lines = fixture(30);
+			let mode = "a";
+			let formatted = 0;
+			const background = (s) => {
+				if (s !== "\u0000") formatted += 1;
+				return `\x1b[48;5;${mode === "a" ? 236 : 52}m${s}\x1b[49m`;
+			};
+			const rail = (s) => `\x1b[2m${s}\x1b[22m`;
+			const inner = makeInner([...lines]);
+			const shell = new OpencodeToolShell(inner, background, rail);
+			shell.render(80);
+			const before = formatted;
+			mode = "b";
+			const frame = shell.render(80);
+			check("a style change re-formats every line", formatted === before + lines.length, `delta=${formatted - before}`);
+			check(
+				"the restyled output matches the pre-cache algorithm",
+				sameOutput(frame, legacyRender(makeInner([...lines]), 80, background, rail)),
+			);
+			const beforeInvalidate = formatted;
+			shell.invalidate();
+			shell.render(80);
+			check(
+				"invalidate() re-formats every line and forwards to the child",
+				formatted === beforeInvalidate + lines.length && inner.invalidations === 1,
+				`formatted=${formatted} invalidations=${inner.invalidations}`,
+			);
+		}
+
+		// (f) Width 0 keeps the legacy empty frame; narrow widths, CJK, emoji,
+		// combining marks, tabs and ANSI must stay byte-identical on both the
+		// first and the cached frame.
+		{
+			const lines = [
+				"",
+				"plain ascii",
+				"\x1b[31mred\x1b[39m text",
+				"中文宽度测试",
+				"emoji 😀😀 tail",
+				"combining e\u0301 accent",
+				"tab\tseparated",
+				"a".repeat(200),
+				`中文\x1b[1mbold\x1b[22m😀${"x".repeat(50)}`,
+			];
+			const style = makeStyle();
+			check(
+				"width 0 keeps the legacy empty frame",
+				sameOutput(new OpencodeToolShell(makeInner([...lines]), style.background, style.rail).render(0), [""]),
+			);
+			for (const width of [1, 2, 5, 80, 120]) {
+				const shell = new OpencodeToolShell(makeInner([...lines]), style.background, style.rail);
+				const frame = shell.render(width);
+				const oracle = makeStyle();
+				const expected = legacyRender(makeInner([...lines]), width, oracle.background, oracle.rail);
+				check(`width ${width}: output is byte-identical to the pre-cache algorithm`, sameOutput(frame, expected));
+				check(`width ${width}: the cached frame is byte-identical`, sameOutput(shell.render(width), expected));
+			}
+
+			// Narrow widths collapse to the same contentWidth (width 1/2/3 all use
+			// contentWidth 1) but the outer truncate still depends on width, so a line
+			// cached at one of them must not be reused at another. Alternate them on a
+			// single instance: every frame must equal the pre-cache algorithm.
+			{
+				const shell = new OpencodeToolShell(makeInner([...lines]), style.background, style.rail);
+				for (const width of [1, 2, 3, 1, 2, 3, 1]) {
+					const oracle = makeStyle();
+					check(
+						`consecutive narrow widths: width ${width} matches the pre-cache algorithm`,
+						sameOutput(shell.render(width), legacyRender(makeInner([...lines]), width, oracle.background, oracle.rail)),
+					);
+				}
+			}
+		}
+
+		// (g) Small fixed benchmark: a static multi-line row across many frames, the
+		// shape that dominated the CPU profile. Bounded (a few hundred ms), no real
+		// model and no large stress run.
+		{
+			const lines = fixture(120);
+			const frames = 200;
+			const legacyStyle = makeStyle();
+			const legacyStart = performance.now();
+			for (let i = 0; i < frames; i++) {
+				legacyRender(makeInner([...lines]), 100, legacyStyle.background, legacyStyle.rail);
+			}
+			const legacyMs = performance.now() - legacyStart;
+			const cachedStyle = makeStyle();
+			const shell = new OpencodeToolShell(makeInner([...lines]), cachedStyle.background, cachedStyle.rail);
+			const cachedStart = performance.now();
+			let frame;
+			for (let i = 0; i < frames; i++) frame = shell.render(100);
+			const cachedMs = performance.now() - cachedStart;
+			check(
+				"benchmark: cached frames match the pre-cache algorithm",
+				sameOutput(frame, legacyRender(makeInner([...lines]), 100, legacyStyle.background, legacyStyle.rail)),
+			);
+			check("benchmark: the cache is faster on a static row", cachedMs < legacyMs, `${cachedMs.toFixed(1)}ms vs ${legacyMs.toFixed(1)}ms`);
+			console.log(`  info  ${frames} static frames x ${lines.length} lines: pre-cache ${legacyMs.toFixed(1)}ms, cached ${cachedMs.toFixed(1)}ms`);
+		}
 	}
 
 	// ------------------------------------------------------------------------
