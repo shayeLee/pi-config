@@ -165,6 +165,8 @@ if (process.argv.includes("--self-check")) {
   assert(WORKBUDDY_AI.base === "https://www.workbuddy.ai" && WORKBUDDY_CN.base === "https://www.workbuddy.cn", "spec bases");
   assert(WORKBUDDY_AI.domain === "www.workbuddy.ai" && WORKBUDDY_CN.domain === "www.workbuddy.cn", "spec domains");
   assert(WORKBUDDY_AI.desktopFilename === "workbuddy-desktop-ai.info", "ai desktop file");
+  assert(WORKBUDDY_AI.electronAppName === "WorkBuddy AI", "ai Electron app name");
+  assert(WORKBUDDY_AI.electronBundleId === "com.workbuddy.workbuddy-ai", "ai Electron bundle id");
   assert(WORKBUDDY_CN.desktopFilename === "workbuddy-desktop.info", "cn desktop file");
   assert(WORKBUDDY_AI.ownFilename !== WORKBUDDY_CN.ownFilename, "own files distinct");
   assert(WORKBUDDY_AI.settingsFilename !== WORKBUDDY_CN.settingsFilename, "settings files distinct");

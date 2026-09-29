@@ -125,6 +125,8 @@ export const WORKBUDDY_AI: ProviderSpec = {
   productConfigPaths: [join(homedir(), ".workbuddy-ai", "cache", "acc-product-config-v3.json")],
   command: "workbuddy",
   shortcut: "ctrl+shift+w",
+  electronAppName: "WorkBuddy AI",
+  electronBundleId: "com.workbuddy.workbuddy-ai",
   electronEnv: "WORKBUDDY_AI_ELECTRON_BIN",
   builtin: [
     model("deepseek-v4.1-flash", "Deepseek-V4.1-Flash", "x0.00", 1_000_000, 128_000, ["low", "medium", "high", "xhigh", "max"]),
