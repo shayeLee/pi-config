@@ -12,6 +12,7 @@ For agent discovery, load user-level agents from `~/.pi/agent/agents` and projec
 
 - `lite`: a clear, local, reversible, low-risk change with a known target and a clear acceptance method.
 - `worker`: substantial or multi-step execution after the objective, scope, and approach are reasonably clear.
+- `designer`: designs, implements, and refines web, desktop, mobile, and terminal UIs; verifies actual rendering, relevant interactions, and tests—code review alone is not visual verification—and never claims to restore a design without a reference.
 - `reviewer`: requested reviews and validation that is substantial, risky, security-sensitive, or consequential to external parties. It is read-only and does not perform or apply changes.
 - `rescue`: when a concrete knowledge or reasoning gap prevents the root Architect from proceeding reliably, after two failed attempts at the same step, when confidence in the cause or safe approach is low, or when an explicit second opinion is requested. It provides read-only analysis and guidance and does not perform or apply changes.
 
