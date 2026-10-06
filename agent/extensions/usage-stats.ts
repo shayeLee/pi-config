@@ -298,8 +298,8 @@ interface ScanResult {
 	opencodeGoQuota?: SubscriptionQuotaInfo;
 	/** DeepSeek API account balance from its official balance endpoint, when resolvable. */
 	deepSeekBalance?: DeepSeekBalanceInfo;
-	/** WorkBuddy credit packs from the WorkBuddy plugin billing endpoint, when resolvable. */
-	workBuddyQuota?: WorkBuddyQuotaInfo;
+	/** WorkBuddy credit packs per region variant, when resolvable. */
+	workBuddyQuotas?: WorkBuddyQuotaInfo[];
 }
 
 function emptyTotals(): UsageTotals {
@@ -981,8 +981,20 @@ function renderDeepSeekBalanceLines(balance: DeepSeekBalanceInfo, width: number,
 // pi-workbuddy-connect sidebar use. Credits are account-level, so this is
 // best-effort like the other quota rows: any failure hides the line only.
 
-const WORKBUDDY_PROVIDER_ID = "workbuddy";
-const WORKBUDDY_BILLING_BASE_URL = "https://www.workbuddy.ai";
+interface WorkBuddyVariant {
+	/** pi provider id, also the key of the per-variant quota cache. */
+	providerId: string;
+	/** Row label; the international variant keeps the historical "WorkBuddy". */
+	label: string;
+	/** Billing/chat base used when the resolved auth carries no baseUrl. */
+	baseUrl: string;
+}
+
+/** Region variants, mirroring `pi-workbuddy-connect`'s two providers. */
+const WORKBUDDY_VARIANTS: readonly WorkBuddyVariant[] = [
+	{ providerId: "workbuddy", label: "WorkBuddy", baseUrl: "https://www.workbuddy.ai" },
+	{ providerId: "workbuddy-cn", label: "WorkBuddy CN", baseUrl: "https://www.workbuddy.cn" },
+];
 const WORKBUDDY_RESOURCE_PATH = "/v2/billing/meter/get-user-resource";
 const WORKBUDDY_PRODUCT_CODE = "p_tcaca";
 const WORKBUDDY_CLIENT_UA = "CLI/2.63.2 CodeBuddy/2.63.2";
@@ -995,19 +1007,21 @@ interface WorkBuddyCreditPack {
 }
 
 interface WorkBuddyQuotaInfo {
+	providerId: string;
+	label: string;
 	total: number;
 	packs: WorkBuddyCreditPack[];
 }
 
-let workBuddyQuotaInFlight: Promise<WorkBuddyQuotaInfo | undefined> | undefined;
-let workBuddyQuotaCached: { at: number; value: WorkBuddyQuotaInfo | undefined } | undefined;
+const workBuddyQuotaInFlight = new Map<string, Promise<WorkBuddyQuotaInfo | undefined>>();
+const workBuddyQuotaCached = new Map<string, { at: number; value: WorkBuddyQuotaInfo | undefined }>();
 
 function workBuddyStamp(date: Date): string {
 	const pad = (value: number) => String(value).padStart(2, "0");
 	return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
 }
 
-function parseWorkBuddyQuota(json: unknown): WorkBuddyQuotaInfo | undefined {
+function parseWorkBuddyQuota(variant: WorkBuddyVariant, json: unknown): WorkBuddyQuotaInfo | undefined {
 	if (!json || typeof json !== "object") return undefined;
 	const envelope = json as Record<string, unknown>;
 	if (numericValue(envelope.code) !== 0) return undefined;
@@ -1038,15 +1052,17 @@ function parseWorkBuddyQuota(json: unknown): WorkBuddyQuotaInfo | undefined {
 		total += remain;
 		packs.push({ name, remain, size: size > 0 ? size : numericValue(account.CapacitySize) ?? 0, expiresAt });
 	}
-	return packs.length > 0 ? { total, packs } : undefined;
+	return packs.length > 0 ? { providerId: variant.providerId, label: variant.label, total, packs } : undefined;
 }
 
-async function fetchWorkBuddyQuota(resolver: SubscriptionQuotaAuthResolver, signal?: AbortSignal): Promise<WorkBuddyQuotaInfo | undefined> {
+async function fetchWorkBuddyQuota(variant: WorkBuddyVariant, resolver: SubscriptionQuotaAuthResolver, signal?: AbortSignal): Promise<WorkBuddyQuotaInfo | undefined> {
 	try {
-		const authResult = await resolver.getProviderAuth(WORKBUDDY_PROVIDER_ID);
+		const authResult = await resolver.getProviderAuth(variant.providerId);
 		const accessToken = authResult?.auth?.apiKey;
 		if (!accessToken) return undefined;
-		const baseUrl = (authResult?.auth?.baseUrl?.trim() || WORKBUDDY_BILLING_BASE_URL).replace(/\/+$/, "");
+		// pi 若在 auth 上透出 provider 的聊天 base（含 `/v2`），先剥掉再拼计费路径。
+		const resolvedBase = authResult?.auth?.baseUrl?.trim().replace(/\/v2\/?$/u, "");
+		const baseUrl = (resolvedBase || variant.baseUrl).replace(/\/+$/, "");
 		const now = new Date();
 		const controller = new AbortController();
 		const onAbort = () => controller.abort();
@@ -1075,7 +1091,7 @@ async function fetchWorkBuddyQuota(resolver: SubscriptionQuotaAuthResolver, sign
 				signal: controller.signal,
 			});
 			if (!response.ok) return undefined;
-			return parseWorkBuddyQuota((await response.json()) as unknown);
+			return parseWorkBuddyQuota(variant, (await response.json()) as unknown);
 		} finally {
 			clearTimeout(timer);
 			signal?.removeEventListener("abort", onAbort);
@@ -1086,24 +1102,44 @@ async function fetchWorkBuddyQuota(resolver: SubscriptionQuotaAuthResolver, sign
 	}
 }
 
-/** 获取 WorkBuddy 账户的积分包余量；失败时静默返回 undefined。 */
-export async function getWorkBuddyQuota(
+async function getWorkBuddyVariantQuota(
+	variant: WorkBuddyVariant,
 	resolver: SubscriptionQuotaAuthResolver,
 	signal?: AbortSignal,
 ): Promise<WorkBuddyQuotaInfo | undefined> {
-	const cached = workBuddyQuotaCached;
+	const cached = workBuddyQuotaCached.get(variant.providerId);
 	if (cached && Date.now() - cached.at < OPENAI_CODEX_QUOTA_CACHE_MS) return cached.value;
-	if (!workBuddyQuotaInFlight) {
-		workBuddyQuotaInFlight = fetchWorkBuddyQuota(resolver, signal)
-			.then((value) => {
-				workBuddyQuotaCached = { at: Date.now(), value };
-				return value;
-			})
-			.finally(() => {
-				workBuddyQuotaInFlight = undefined;
-			});
-	}
-	return workBuddyQuotaInFlight;
+	const existing = workBuddyQuotaInFlight.get(variant.providerId);
+	if (existing) return existing;
+	const pending = fetchWorkBuddyQuota(variant, resolver, signal)
+		.then((value) => {
+			workBuddyQuotaCached.set(variant.providerId, { at: Date.now(), value });
+			return value;
+		})
+		.finally(() => {
+			workBuddyQuotaInFlight.delete(variant.providerId);
+		});
+	workBuddyQuotaInFlight.set(variant.providerId, pending);
+	return pending;
+}
+
+/** 获取国际版 WorkBuddy 账户的积分包余量；失败时静默返回 undefined。 */
+export function getWorkBuddyQuota(
+	resolver: SubscriptionQuotaAuthResolver,
+	signal?: AbortSignal,
+): Promise<WorkBuddyQuotaInfo | undefined> {
+	return getWorkBuddyVariantQuota(WORKBUDDY_VARIANTS[0]!, resolver, signal);
+}
+
+/** 获取全部已登录 WorkBuddy 变体（国际版 / 国内版）的积分包余量；未登录或失败的不返回。 */
+export async function getWorkBuddyQuotas(
+	resolver: SubscriptionQuotaAuthResolver,
+	signal?: AbortSignal,
+): Promise<WorkBuddyQuotaInfo[]> {
+	const quotas = await Promise.all(
+		WORKBUDDY_VARIANTS.map((variant) => getWorkBuddyVariantQuota(variant, resolver, signal)),
+	);
+	return quotas.filter((quota): quota is WorkBuddyQuotaInfo => quota !== undefined);
 }
 
 function renderWorkBuddyQuotaLines(quota: WorkBuddyQuotaInfo, width: number, theme: any): string[] {
@@ -1114,7 +1150,7 @@ function renderWorkBuddyQuotaLines(quota: WorkBuddyQuotaInfo, width: number, the
 		const expires = pack.expiresAt ? ` · expires ${formatResetTime(pack.expiresAt)}` : "";
 		parts.push(`${pack.name} ${amount}${expires}`);
 	}
-	return [truncateToWidth(theme.fg("accent", `WorkBuddy quota: ${parts.join("  │  ")}`), innerWidth, "")];
+	return [truncateToWidth(theme.fg("accent", `${quota.label} quota: ${parts.join("  │  ")}`), innerWidth, "")];
 }
 
 function parseTimestamp(value: unknown): number | undefined {
@@ -1569,7 +1605,7 @@ function renderUsageTable(
 	openCodeGoQuota?: SubscriptionQuotaInfo,
 	deepSeekBalance?: DeepSeekBalanceInfo,
 	commandCodeQuota?: CommandCodeQuotaInfo,
-	workBuddyQuota?: WorkBuddyQuotaInfo,
+	workBuddyQuotas?: WorkBuddyQuotaInfo[],
 ): string[] {
 	const innerWidth = Math.max(1, width - 2);
 	const metricWidths = [11, 10, 8, 10, 10, 10, 10];
@@ -1599,7 +1635,7 @@ function renderUsageTable(
 	if (openCodeGoQuota) lines.push(...renderOpenCodeGoQuotaLines(openCodeGoQuota, width, theme));
 	if (deepSeekBalance) lines.push(...renderDeepSeekBalanceLines(deepSeekBalance, width, theme));
 	if (commandCodeQuota) lines.push(...renderCommandCodeQuotaLines(commandCodeQuota, width, theme));
-	if (workBuddyQuota) lines.push(...renderWorkBuddyQuotaLines(workBuddyQuota, width, theme));
+	for (const quota of workBuddyQuotas ?? []) lines.push(...renderWorkBuddyQuotaLines(quota, width, theme));
 	const headerCells = ["provider/model", "tokens(M)", "cost", "hit%", "input(M)", "output(M)", "cacheR(M)", "cacheW(M)"];
 	const header = headerCells
 		.map((cell, index) => {
@@ -1683,7 +1719,7 @@ function renderSessionTable(
 	openCodeGoQuota?: SubscriptionQuotaInfo,
 	deepSeekBalance?: DeepSeekBalanceInfo,
 	commandCodeQuota?: CommandCodeQuotaInfo,
-	workBuddyQuota?: WorkBuddyQuotaInfo,
+	workBuddyQuotas?: WorkBuddyQuotaInfo[],
 ): string[] {
 	const innerWidth = Math.max(1, width - 2);
 	const metricWidths = [11, 10, 8, 10, 10, 10, 10];
@@ -1703,7 +1739,7 @@ function renderSessionTable(
 	if (openCodeGoQuota) lines.push(...renderOpenCodeGoQuotaLines(openCodeGoQuota, width, theme));
 	if (deepSeekBalance) lines.push(...renderDeepSeekBalanceLines(deepSeekBalance, width, theme));
 	if (commandCodeQuota) lines.push(...renderCommandCodeQuotaLines(commandCodeQuota, width, theme));
-	if (workBuddyQuota) lines.push(...renderWorkBuddyQuotaLines(workBuddyQuota, width, theme));
+	for (const quota of workBuddyQuotas ?? []) lines.push(...renderWorkBuddyQuotaLines(quota, width, theme));
 	if (session) {
 		const subagentText = session.subagentRecords > 0
 			? ` · subagents ${formatTokens(totalTokens(session.subagents))}, ${formatCost(session.subagents.cost)} (${session.subagentRecords} records)`
@@ -1815,11 +1851,11 @@ export default function (pi: ExtensionAPI) {
 							? getDeepSeekBalance(ctx.modelRegistry, loader.signal)
 							: Promise.resolve(undefined),
 						usageStatsConfig.showWorkBuddyQuota === false
-							? Promise.resolve(undefined)
-							: getWorkBuddyQuota(ctx.modelRegistry, loader.signal),
+							? Promise.resolve<WorkBuddyQuotaInfo[]>([])
+							: getWorkBuddyQuotas(ctx.modelRegistry, loader.signal),
 					])
-						.then(([report, codexQuota, commandCodeQuota, opencodeGoQuota, deepSeekBalance, workBuddyQuota]) => {
-							if (!loader.signal.aborted) done({ report, codexQuota, commandCodeQuota, opencodeGoQuota, deepSeekBalance, workBuddyQuota });
+						.then(([report, codexQuota, commandCodeQuota, opencodeGoQuota, deepSeekBalance, workBuddyQuotas]) => {
+							if (!loader.signal.aborted) done({ report, codexQuota, commandCodeQuota, opencodeGoQuota, deepSeekBalance, workBuddyQuotas });
 						})
 						.catch((error: unknown) => {
 							if (!loader.signal.aborted) {
@@ -1846,7 +1882,7 @@ export default function (pi: ExtensionAPI) {
 			const opencodeGoQuota = scanResult.opencodeGoQuota;
 			const deepSeekBalance = scanResult.deepSeekBalance;
 			const commandCodeQuota = scanResult.commandCodeQuota;
-			const workBuddyQuota = scanResult.workBuddyQuota;
+			const workBuddyQuotas = scanResult.workBuddyQuotas;
 			const initialPeriod = periodFromArgs(args);
 			await ctx.ui.custom<void>(
 				(tui, theme, _keybindings, done) => {
@@ -1869,8 +1905,8 @@ export default function (pi: ExtensionAPI) {
 					return {
 						render(width: number): string[] {
 							return view === "overview"
-								? renderUsageTable(report, period, selectedIndex, startIndex, width, theme, codexQuota, opencodeGoQuota, deepSeekBalance, commandCodeQuota, workBuddyQuota)
-								: renderSessionTable(report, sessionRows, selectedIndex, startIndex, width, theme, codexQuota, opencodeGoQuota, deepSeekBalance, commandCodeQuota, workBuddyQuota);
+								? renderUsageTable(report, period, selectedIndex, startIndex, width, theme, codexQuota, opencodeGoQuota, deepSeekBalance, commandCodeQuota, workBuddyQuotas)
+								: renderSessionTable(report, sessionRows, selectedIndex, startIndex, width, theme, codexQuota, opencodeGoQuota, deepSeekBalance, commandCodeQuota, workBuddyQuotas);
 						},
 						handleInput(data: string): void {
 							if (matchesKey(data, Key.escape) || matchesKey(data, Key.ctrl("c"))) {
