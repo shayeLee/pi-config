@@ -16,6 +16,7 @@
  */
 
 import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as net from "node:net";
 import * as os from "node:os";
@@ -1901,6 +1902,12 @@ const WaitParams = Type.Object({
 });
 
 export default function (pi: ExtensionAPI) {
+	// Narrow, session-local host capability. A present host may refuse, never fall back to SDK direct.
+	type AdmissionAck = { accepted: true; mode: string; requestId: string } | { accepted: false; reason: string };
+	type HostTransport = { post(payload: { version: 1; notificationId: string; runIds: string[]; text: string }): Promise<AdmissionAck> };
+	let hostTransport: HostTransport | undefined;
+	let hostMode = false;
+	let shuttingDown = false;
 	const fleetStore = new FleetStore();
 	const fleetWebServer = new FleetWebServer(fleetStore);
 	// Background runs are tracked here so the main agent can inspect and stop them
@@ -1911,6 +1918,12 @@ export default function (pi: ExtensionAPI) {
 	};
 
 	pi.on("session_start", (_event, ctx) => {
+		shuttingDown = false;
+		// Session-local identity is independent of transport readiness; never use process.env.
+		pi.events.emit("agent-team:host-identity", { accept: (identity: { version: number; host: string }) => {
+			if (identity?.version === 1 && identity.host === "pi-agent-server") hostMode = true;
+		} });
+		pi.events.emit("agent-team:host-transport", { version: 1, accept: (transport: HostTransport) => { hostTransport = transport; } });
 		restoreFleetHistory(ctx);
 		if (ctx.mode !== "tui") return;
 		ctx.ui.setWidget(
@@ -1921,6 +1934,7 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("session_shutdown", async (_event, ctx) => {
+		shuttingDown = true;
 		for (const run of fleetStore.list()) {
 			if (run.status === "running") fleetStore.stop(run.id);
 		}
@@ -1944,22 +1958,60 @@ export default function (pi: ExtensionAPI) {
 	//     out immediately.
 	// The `notified` flag keeps a run from being reported twice and prevents the
 	// reminder from feeding itself in a loop.
+	const notifications = new Map<string, { payload: { version: 1; notificationId: string; runIds: string[]; text: string }; appended: boolean; inflight: boolean }>();
 	const reportUncollectedResults = (): void => {
+		if (shuttingDown) return;
 		const pending = backgroundRuns.needsReminder();
 		if (pending.length === 0) return;
+		const key = pending.map(record => record.runId).sort().join("\n");
+		if (notifications.get(key)?.inflight) return;
 		const lines = pending.map((record) => {
 			const output = record.result ? getResultOutput(record.result) : "(no result captured)";
 			const preview = output.length > 2000 ? `${output.slice(0, 2000)}…` : output;
 			return `### [${record.agent}] run ${record.runId} — ${record.status}\n\n${preview}`;
 		});
-		for (const record of pending) backgroundRuns.markNotified(record.runId);
 		const summary =
 			`${pending.length} background subagent result(s) are waiting to be collected. ` +
 			"Call subagent_wait to read the full result.";
+		let notification = notifications.get(key);
+		if (!notification) {
+			notification = { payload: { version: 1, notificationId: randomUUID(), runIds: pending.map(record => record.runId), text: `${summary}\n\n${lines.join("\n\n---\n\n")}` }, appended: false, inflight: false };
+			notifications.set(key, notification);
+		}
+		// Set synchronously before either SDK boundary (including reentrant callbacks).
+		notification.inflight = true;
 		try {
-			pi.sendUserMessage(`${summary}\n\n${lines.join("\n\n---\n\n")}`, { deliverAs: "followUp" });
+			if (!notification.appended) {
+				pi.appendEntry("agent-team:notification", notification.payload);
+				notification.appended = true;
+			}
 		} catch {
-			/* session already disposed (print/json mode); results stay queryable by runId */
+			notification.inflight = false;
+			return; // No durable display fact: retain the same id for a later callback.
+		}
+		if (hostTransport) {
+			try {
+				void hostTransport.post(notification.payload).then(ack => {
+					if (ack.accepted) for (const record of pending) backgroundRuns.markNotified(record.runId);
+				}, () => { /* A failed post is not an admission ACK. Never use SDK direct. */ })
+					.finally(() => { notification.inflight = false; }).catch(() => {});
+			} catch {
+				notification.inflight = false;
+			}
+			return;
+		}
+		if (hostMode) {
+			notification.inflight = false;
+			return; // Host identity without a transport is fail-closed, never CLI direct.
+		}
+		try {
+			pi.sendMessage({ customType: "agent-team:results-ready", content: notification.payload.text, display: false, details: { version: 1, notificationId: notification.payload.notificationId } }, { deliverAs: "followUp", triggerTurn: true });
+			// sendMessage is void: this records invocation, NOT delivery/model acknowledgement.
+			for (const record of pending) backgroundRuns.markNotified(record.runId);
+		} catch {
+			/* Display fact remains durable; a later callback reuses its id. */
+		} finally {
+			notification.inflight = false;
 		}
 	};
 
