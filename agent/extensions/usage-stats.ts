@@ -1,4 +1,5 @@
 import { createReadStream } from "node:fs";
+import { identityHash, weeklyObservation, observedTotals, observationLines, ObservationLedger, type Observation } from "./usage-stats/codex-observations.ts";
 import { appendFile, chmod, mkdir, readFile, readdir, rename, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
@@ -7,6 +8,7 @@ import {
 	getAgentDir,
 	SessionManager,
 	type ExtensionAPI,
+	type ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 import { Key, matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 
@@ -404,10 +406,19 @@ export interface SubscriptionQuotaInfo {
 	 * 绝不含 access token 或响应原文）。凭据未配置时不设置，整行静默隐藏。
 	 */
 	unavailable?: string;
+	/** Fresh endpoint evidence only; cached responses retain their original timestamp. */
+	observation?: Observation;
+	observedLines?: string[];
+	account?: string;
+	plan?: string;
 }
 
-let codexQuotaInFlight: Promise<SubscriptionQuotaInfo | undefined> | undefined;
-let codexQuotaCached: { at: number; value: SubscriptionQuotaInfo | undefined } | undefined;
+const codexQuotaInFlight = new Map<string, Promise<SubscriptionQuotaInfo | undefined>>();
+const codexQuotaCached = new Map<string, { at: number; value: SubscriptionQuotaInfo | undefined }>();
+let codexLedger: ObservationLedger | undefined;
+function observationLedger(): ObservationLedger {
+	return codexLedger ??= new ObservationLedger(join(getAgentDir(), "codex-quota-observations"));
+}
 
 /** Minimal structural view of the model registry auth resolution used by quota fetches. */
 export interface SubscriptionQuotaAuthResolver {
@@ -555,9 +566,25 @@ function chatgptAccountIdFromAccessToken(accessToken: string): string | undefine
 	}
 }
 
-async function fetchOpenAICodexQuota(resolver: SubscriptionQuotaAuthResolver, signal?: AbortSignal): Promise<SubscriptionQuotaInfo | undefined> {
+async function bounded<T>(work: Promise<T>, ms: number, signal?: AbortSignal): Promise<T> {
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	let abort: (() => void) | undefined;
 	try {
-		const authResult = await resolver.getProviderAuth(OPENAI_CODEX_PROVIDER_ID);
+		return await Promise.race([work, new Promise<never>((_resolve, reject) => {
+			abort = () => reject(new Error("canceled"));
+			if (signal?.aborted) return abort();
+			signal?.addEventListener("abort", abort, { once: true });
+			timer = setTimeout(() => reject(new Error("timeout")), ms);
+		})]);
+	} finally {
+		if (timer) clearTimeout(timer);
+		if (abort) signal?.removeEventListener("abort", abort);
+	}
+}
+
+async function fetchOpenAICodexQuota(authResult: Awaited<ReturnType<SubscriptionQuotaAuthResolver["getProviderAuth"]>>, signal?: AbortSignal): Promise<SubscriptionQuotaInfo | undefined> {
+	if (signal?.aborted) return undefined;
+	try {
 		const accessToken = authResult?.auth?.apiKey;
 		if (!accessToken) return undefined;
 		const baseUrl = (authResult?.auth?.baseUrl?.trim() || OPENAI_CODEX_DEFAULT_BASE_URL).replace(/\/+$/, "");
@@ -583,7 +610,18 @@ async function fetchOpenAICodexQuota(resolver: SubscriptionQuotaAuthResolver, si
 			} catch {
 				return { windows: [], planType: undefined, unavailable: "non-JSON response" };
 			}
-			return parseCodexQuota(json) ?? { windows: [], unavailable: "unexpected response shape" };
+			if (controller.signal.aborted) return signal?.aborted ? undefined : { windows: [], unavailable: "timeout after 8s" };
+			const at = Date.now();
+			const quota = parseCodexQuota(json) ?? { windows: [], unavailable: "unexpected response shape" };
+			if (accountId) {
+				const sample = weeklyObservation(json, identityHash(`${baseUrl}\0${accountId}`), at);
+				if (sample) {
+					quota.observation = sample;
+					try { await bounded(observationLedger().append(sample, signal), 1_000, signal); }
+					catch { observationLedger().unavailable = true; }
+				}
+			}
+			return quota;
 		} finally {
 			clearTimeout(timer);
 			signal?.removeEventListener("abort", onAbort);
@@ -604,20 +642,76 @@ async function fetchOpenAICodexQuota(resolver: SubscriptionQuotaAuthResolver, si
 export async function getOpenAICodexQuota(
 	resolver: SubscriptionQuotaAuthResolver,
 	signal?: AbortSignal,
+	fresh = false,
 ): Promise<SubscriptionQuotaInfo | undefined> {
-	const cached = codexQuotaCached;
-	if (cached && Date.now() - cached.at < OPENAI_CODEX_QUOTA_CACHE_MS) return cached.value;
-	if (!codexQuotaInFlight) {
-		codexQuotaInFlight = fetchOpenAICodexQuota(resolver, signal)
+	try {
+		if (signal?.aborted) return undefined;
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		let onAbort: (() => void) | undefined;
+		const auth = await Promise.race([
+			resolver.getProviderAuth(OPENAI_CODEX_PROVIDER_ID),
+			new Promise<never>((_resolve, reject) => {
+				onAbort = () => reject(new Error("aborted"));
+				signal?.addEventListener("abort", onAbort, { once: true });
+				timer = setTimeout(() => reject(new Error("auth timeout")), OPENAI_CODEX_REQUEST_TIMEOUT_MS);
+			}),
+		]).finally(() => {
+			if (timer) clearTimeout(timer);
+			if (onAbort) signal?.removeEventListener("abort", onAbort);
+		});
+		const token = auth?.auth?.apiKey;
+		if (!token || signal?.aborted) return undefined;
+		const base = (auth?.auth?.baseUrl?.trim() || OPENAI_CODEX_DEFAULT_BASE_URL).replace(/\/+$/, "");
+		const account = chatgptAccountIdFromAccessToken(token);
+		// Unknown identities cannot borrow another account's cached quota.
+		const key = identityHash(`${base}\0${account ?? token}`);
+		// Recheck after waiting: another fresh waiter may have installed a newer slot.
+		while (codexQuotaInFlight.has(key)) {
+			const pending = codexQuotaInFlight.get(key)!;
+			if (!fresh) return bounded(pending, OPENAI_CODEX_REQUEST_TIMEOUT_MS + 1_000, signal).catch(() => signal?.aborted ? undefined : { windows: [], unavailable: "timeout after 8s" });
+			await bounded(pending, OPENAI_CODEX_REQUEST_TIMEOUT_MS + 1_000, signal);
+		}
+		const cached = codexQuotaCached.get(key);
+		if (!fresh && cached && Date.now() - cached.at < OPENAI_CODEX_QUOTA_CACHE_MS) return cached.value;
+		const controller = new AbortController();
+		const onRequestAbort = () => controller.abort();
+		if (signal?.aborted) return undefined;
+		signal?.addEventListener("abort", onRequestAbort, { once: true });
+		// A fresh request gets its own full budget, independent of auth/pending time.
+		const request = bounded(fetchOpenAICodexQuota(auth, controller.signal), OPENAI_CODEX_REQUEST_TIMEOUT_MS, signal)
+			.catch(() => { controller.abort(); return signal?.aborted ? undefined : { windows: [], unavailable: "timeout after 8s" } as SubscriptionQuotaInfo; })
 			.then((value) => {
-				codexQuotaCached = { at: Date.now(), value };
-				return value;
-			})
-			.finally(() => {
-				codexQuotaInFlight = undefined;
-			});
-	}
-	return codexQuotaInFlight;
+			if (value && account) {
+				value.account = identityHash(`${base}\0${account}`);
+				value.plan = value.observation?.plan ?? (value.planType ? identityHash(value.planType) : cached?.value?.plan);
+			}
+			if (!signal?.aborted && value !== undefined) {
+				codexQuotaCached.delete(key);
+				codexQuotaCached.set(key, { at: Date.now(), value });
+				while (codexQuotaCached.size > 8) codexQuotaCached.delete(codexQuotaCached.keys().next().value!);
+			}
+			return value;
+		}).finally(() => {
+			signal?.removeEventListener("abort", onRequestAbort);
+			if (codexQuotaInFlight.get(key) === request) codexQuotaInFlight.delete(key);
+		});
+		codexQuotaInFlight.set(key, request);
+		return request;
+	} catch { return signal?.aborted ? undefined : { windows: [], unavailable: "auth unavailable" }; }
+}
+
+async function addObservedLines(quota: SubscriptionQuotaInfo, signal?: AbortSignal): Promise<SubscriptionQuotaInfo> {
+	const ledger = observationLedger();
+	const now = new Date();
+	let records: Observation[] = [];
+	try { records = await bounded(ledger.read(now), 1_000, signal); }
+	catch { ledger.unavailable = true; }
+	const account = quota.observation?.account ?? quota.account;
+	const plan = quota.observation?.plan ?? quota.plan;
+	const current = records.filter((s) => s.account === account && s.plan === plan && s.at <= +now);
+	quota.observedLines = observationLines(account && plan ? observedTotals(records, account, plan, now) : undefined, current);
+	if (ledger.unavailable) quota.observedLines.push("Codex observations: persistence unavailable · history may be incomplete");
+	return quota;
 }
 
 function formatResetTime(date: Date): string {
@@ -637,14 +731,15 @@ function renderCodexQuotaLines(quota: SubscriptionQuotaInfo, width: number, them
 	if (quota.windows.length === 0) {
 		const reason = quota.unavailable ?? "no data";
 		const hint = /^HTTP 4(01|03)$/.test(reason) ? " · Codex 登录可能已失效，运行 /login openai-codex 重新登录" : "";
-		return [truncateToWidth(theme.fg("warning", `Codex quota${planType}: unavailable (${reason})${hint}`), innerWidth, "")];
+		return [truncateToWidth(theme.fg("warning", `Codex quota${planType}: unavailable (${reason})${hint}`), innerWidth, ""),
+			...(quota.observedLines ?? observationLines()).map((text) => truncateToWidth(theme.fg("dim", text), innerWidth, ""))];
 	}
 	const parts = quota.windows.map((window) => {
 		const reset = window.resetsAt ? ` · resets ${formatResetTime(window.resetsAt)}` : "";
 		return `${window.label} ${Math.round(100 - window.percent)}% left${reset}`;
 	});
 	const line = truncateToWidth(theme.fg("accent", `Codex quota${planType}: ${parts.join("  │  ")}`), innerWidth, "");
-	return [line];
+	return [line, ...(quota.observedLines ?? observationLines()).map((text) => truncateToWidth(theme.fg("dim", text), innerWidth, ""))];
 }
 
 // --- OpenCode Go subscription quota ---
@@ -1791,6 +1886,56 @@ function renderSessionTable(
 }
 
 export default function (pi: ExtensionAPI) {
+	let usedCodex = false;
+	let lifecycle = new AbortController();
+	let finalSample: Promise<SubscriptionQuotaInfo | undefined> | undefined;
+	const launch = (ctx: ExtensionContext, fresh = false, turnSignal?: AbortSignal) => {
+		const owner = lifecycle;
+		if (owner.signal.aborted) return Promise.resolve(undefined);
+		const controller = new AbortController();
+		const abort = () => controller.abort();
+		owner.signal.addEventListener("abort", abort, { once: true });
+		turnSignal?.addEventListener("abort", abort, { once: true });
+		if (turnSignal?.aborted) controller.abort();
+		return getOpenAICodexQuota(ctx.modelRegistry, controller.signal, fresh).catch(() => undefined).finally(() => {
+			owner.signal.removeEventListener("abort", abort);
+			turnSignal?.removeEventListener("abort", abort);
+		});
+	};
+	const baseline = (ctx: ExtensionContext) => {
+		if (ctx.model?.provider === OPENAI_CODEX_PROVIDER_ID) void launch(ctx, false, ctx.signal);
+	};
+	pi.on("session_start", (_event, ctx) => {
+		if (lifecycle.signal.aborted) lifecycle = new AbortController();
+		usedCodex = false;
+		finalSample = undefined;
+		baseline(ctx);
+	});
+	pi.on("model_select", (event, ctx) => {
+		if (event.model.provider === OPENAI_CODEX_PROVIDER_ID) void launch(ctx, false, ctx.signal);
+	});
+	pi.on("before_agent_start", (_event, ctx) => { baseline(ctx); });
+	pi.on("before_provider_request", (_event, ctx) => {
+		if (ctx.model?.provider !== OPENAI_CODEX_PROVIDER_ID) return;
+		usedCodex = true;
+		baseline(ctx);
+	});
+	pi.on("message_end", (event, ctx) => {
+		if (event.message.role === "assistant" && event.message.provider === OPENAI_CODEX_PROVIDER_ID) {
+			usedCodex = true;
+			void launch(ctx, false, ctx.signal);
+		}
+	});
+	pi.on("agent_settled", (_event, ctx) => {
+		if (!usedCodex) return;
+		usedCodex = false;
+		// Settled operation signals may already be aborted; final sampling belongs to the session.
+		finalSample = launch(ctx, true);
+	});
+	pi.on("session_shutdown", async () => {
+		lifecycle.abort();
+		try { await bounded(Promise.all([finalSample, codexLedger?.flush()]), 250); } catch { /* best effort */ }
+	});
 	// --no-session has no JSONL session file, so persist its usage in a separate
 	// numeric-only ledger. Normal persisted sessions are read from their JSONL files
 	// and are deliberately not written here to avoid double counting.
@@ -1840,7 +1985,14 @@ export default function (pi: ExtensionAPI) {
 								? { path: ctx.sessionManager.getSessionFile()!, id: ctx.sessionManager.getSessionId() }
 								: undefined,
 						),
-						getOpenAICodexQuota(ctx.modelRegistry, loader.signal),
+						(async () => {
+							try {
+								if (finalSample) await bounded(finalSample, 18_000, loader.signal);
+								const quota = await bounded(launch(ctx, true, loader.signal), 26_000, loader.signal);
+								if (!quota) return undefined;
+								return await addObservedLines(quota, loader.signal);
+							} catch { return loader.signal.aborted ? undefined : { windows: [], unavailable: "timeout after 8s", observedLines: observationLines() }; }
+						})(),
 						usageStatsConfig.showCommandCodeQuota === true
 							? getCommandCodeQuota(ctx.modelRegistry, loader.signal)
 							: Promise.resolve(undefined),

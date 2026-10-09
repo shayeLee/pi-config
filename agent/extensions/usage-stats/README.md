@@ -104,6 +104,26 @@ Pro 系列 plan（服务端 `plan_type` 为 `prolite`）不再返回 5 小时窗
   `HTTP <status>` / `timeout after 8s` / `request failed` / `non-JSON response` / `unexpected response shape` / `no usable windows` 均为错误类别，不包含任何凭据或响应内容
 - 请求与扫描并行，不拖慢 `/usage` 打开速度；结果（含失败原因）在内存中缓存 90 秒
 
+### Codex 日历用量（观测下界）
+
+额度余量行保持不变；其下两行分别显示「今日 / 昨日」「本周 / 本月」，另有部分观测提示（`观测下界 · 部分观测`），已知当前账号/plan 时显示保留记录的实际首次/最新采样时间。本周从本地周一开始，例如 `Codex observed: 本周 24.00 pp │ 本月 124.00 pp`。单位 **pp 为周额度百分比点**，不是剩余百分比、Token 估算或完整账单。多次周重置后，月累计超过 100 pp 是有效值。
+
+仅接受账号级 `rate_limit.primary_window` / `secondary_window` 中显式 `limit_window_seconds: 604800` 的唯一窗口、数值 `used_percent`、有效 reset 与明确 `plan_type`。模型级限额、旧版标签推断和缺失字段仍可用于余量展示，但不能成为日历用量证据。
+
+- `session_start`、`model_select`、`before_agent_start` 与 `before_provider_request` 启动后台基线采样，不阻塞模型请求；首次未观测消耗可能未知。`message_end` 触发后台节流采样；`agent_settled` 在所有自动继续结束后启动可追踪的强制新采样（先等待已有请求，再发新请求），不等待慢网络/文件 IO。不使用过早的 `agent_end`。`/usage` 有界等待最终采样后发起新查询并有界读取账本；关闭/重载/切换 session 时取消旧工作并限时 flush，不创建空闲轮询定时器。
+- 缓存最多 8 个账号/端点，90 秒节流；每次先解析当前认证，换账号不能复用旧缓存。解析认证与请求有超时/取消边界；缓存样本保持原始观测时间。
+- 第一条样本只作基线；合并多个进程的原始样本后，按同账号、同 plan、同周周期高水位计算正增量。reset 漂移容忍 120 秒，不累计漂移；百分比回落不重复计数。超过 24 小时的间隔、明显回落、plan 变化、reset 变化、冲突的同时刻样本均不能直接算用量。
+- 跨午夜区间对当天/昨日 unresolved；若完整落在周/月内，仍能计算周/月。不会按时间比例摊分。重置两侧的未知消耗不补猜。
+- `部分观测` 始终说明观测只是下界，包含账号在其他客户端的使用；只有基线或无可解析区间时显示 `数据不足`，跨边界等未知区间标记 `归属不明`。读取损坏、写入失败或账本 IO 超时显示 persistence unavailable；启用前、停机和丢失账本的历史无法恢复。最新查询失败时，仅在当前账号/plan 已知时显示其记录时间，不借用其他账号。
+
+原始观测存于 `~/.pi/agent/codex-quota-observations/<pid>-<uuid>.jsonl`，目录 `0700`、文件 `0600`，每个进程独立追加。仅保存版本、端点/账号 SHA-256、plan SHA-256、实际观测时间、周用量与 reset；不保存原始账号、凭据、响应、提示词或模型内容。不读取 Codex CLI 历史。读取时保留本月和上月有效样本用于边界基线；不自动删除历史文件。
+
+离线验证（不访问真实认证或网络；渲染测试为字符串 stub，不代表实际 TUI 视觉验证）：
+
+```sh
+volta run node --experimental-strip-types --test agent/extensions/usage-stats/*.test.mts
+```
+
 ## Command Code 订阅额度
 
 该功能默认关闭，由 `~/.pi/agent/usage-stats.json` 中的 `showCommandCodeQuota` 控制。开启后，扩展使用 Pi 已解析的 `command-code` API key，读取 Command Code CLI `/usage` 所使用的**非公开 alpha 接口**：

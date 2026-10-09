@@ -18,6 +18,7 @@ agent/usage-stats.json
 agent/bin
 agent/sessions
 agent/subagent-usage
+agent/codex-quota-observations/
 agent/usage-cache.json
 agent/crashes.json
 
