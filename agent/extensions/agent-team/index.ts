@@ -41,6 +41,7 @@ import { BackgroundRunRegistry, type BackgroundRunRecord, type BackgroundRunStat
 import { FleetStore, RevisionCache, liveRowRevisionKey, type FleetRun, type FleetRunStatus, type FleetStreamingDelta, type FleetTouchKind, type RestoredFleetRun } from "./fleet-store.ts";
 import { FleetWidget, showFleetOverlay } from "./fleet-view.ts";
 import { FleetWebServer } from "./fleet-web.ts";
+import { TranscriptJournal } from "./transcript.ts";
 
 const MAX_PARALLEL_TASKS = 8;
 const COLLAPSED_ITEM_COUNT = 10;
@@ -571,7 +572,7 @@ function collectRestoredFleetRuns(entries: readonly SessionEntry[]): RestoredFle
 	const completedToolCallIds = new Set<string>();
 
 	for (const entry of entries) {
-		if (entry.type !== "message" || entry.message.role !== "toolResult" || entry.message.toolName !== "subagent") continue;
+		if (entry.type !== "message" || entry.message.role !== "toolResult" || !(["subagent", "subagent_wait"].includes(entry.message.toolName))) continue;
 		completedToolCallIds.add(entry.message.toolCallId);
 		const details = entry.message.details;
 		if (!isRecord(details) || !Array.isArray(details.results)) continue;
@@ -1359,6 +1360,7 @@ async function runSingleAgent(
 	usageRootSessionId: string | undefined,
 	failbackParentSessionId: string | undefined,
 	control?: RunControlHooks,
+	journal?: TranscriptJournal,
 ): Promise<SingleResult> {
 	const configuredAgent = agents.find((a) => a.name === agentName);
 
@@ -1486,6 +1488,11 @@ async function runSingleAgent(
 	});
 	currentResult.runId = fleetRun.id;
 	currentResult.startedAt = fleetRun.startedAt;
+	try { journal?.start(fleetRun); } catch (error) {
+		fleetStore.finish(fleetRun, "failed");
+		throw error;
+	}
+	let transcriptFailed = false;
 
 	// Announce the run as soon as the Fleet entry exists. Background callers use
 	// this to expose status/stop/logs before the subprocess has finished.
@@ -1668,7 +1675,7 @@ async function runSingleAgent(
 			};
 
 			const processLine = (line: string) => {
-				if (!line.trim()) return;
+				if (transcriptFailed || !line.trim()) return;
 				let event: any;
 				try {
 					event = JSON.parse(line);
@@ -1676,6 +1683,13 @@ async function runSingleAgent(
 					return;
 				}
 				if (!event || typeof event !== "object" || Array.isArray(event)) return;
+				try { journal?.event(fleetRun.id, event); } catch {
+					transcriptFailed = true;
+					currentResult.errorMessage = "Subagent transcript persistence failed";
+					currentResult.stopReason = "error";
+					terminateProcess();
+					return;
+				}
 
 				// In-flight assistant text/thinking arrives as delta-only message_update
 				// events. Accumulate them into transient state so the Web UI can show
@@ -1816,8 +1830,8 @@ async function runSingleAgent(
 			});
 		});
 
-		currentResult.exitCode = stopRequested ? 130 : exitCode;
-		if (stopRequested) {
+		currentResult.exitCode = transcriptFailed ? 1 : stopRequested ? 130 : exitCode;
+		if (stopRequested && !transcriptFailed) {
 			currentResult.stopReason = "stopped";
 			currentResult.errorMessage = "Stopped by user";
 		}
@@ -1827,9 +1841,16 @@ async function runSingleAgent(
 		if (forceKillTimer && !stopRequested) clearTimeout(forceKillTimer);
 		currentResult.endedAt = Date.now();
 		let fleetStatus: Exclude<FleetRunStatus, "running">;
-		if (stopRequested) fleetStatus = "stopped";
+		if (transcriptFailed) fleetStatus = "failed";
+		else if (stopRequested) fleetStatus = "stopped";
 		else if (isFailedResult(currentResult)) fleetStatus = "failed";
 		else fleetStatus = "completed";
+		try { journal?.finish(fleetRun.id, fleetStatus, currentResult); } catch {
+			fleetStatus = "failed";
+			currentResult.exitCode = 1;
+			currentResult.stopReason = "error";
+			currentResult.errorMessage = "Subagent transcript persistence failed";
+		}
 		fleetStore.finish(fleetRun, fleetStatus);
 		if (tmpPromptPath)
 			try {
@@ -1909,6 +1930,7 @@ export default function (pi: ExtensionAPI) {
 	let hostMode = false;
 	let shuttingDown = false;
 	const fleetStore = new FleetStore();
+	const transcriptJournal = new TranscriptJournal((type, data) => pi.appendEntry(type, data), (type, data) => pi.events.emit(type, data));
 	const fleetWebServer = new FleetWebServer(fleetStore);
 	// Background runs are tracked here so the main agent can inspect and stop them
 	// while they are still running. Settled runs stay queryable until pruned.
@@ -2118,6 +2140,7 @@ export default function (pi: ExtensionAPI) {
 								usageRootSessionId,
 								failbackParentSessionId,
 								control,
+								transcriptJournal,
 							),
 						{ agent: t.agent, mode: "parallel", task: t.task, agentScope, projectAgentsDir: discovery.projectAgentsDir },
 						() => {
@@ -2175,6 +2198,7 @@ export default function (pi: ExtensionAPI) {
 							usageRootSessionId,
 							failbackParentSessionId,
 							control,
+							transcriptJournal,
 						),
 					{ agent: params.agent as string, mode: "single", task: params.task as string, agentScope, projectAgentsDir: discovery.projectAgentsDir },
 					() => {
@@ -2433,10 +2457,12 @@ export default function (pi: ExtensionAPI) {
 				};
 			}
 
+			const saveDelivery = transcriptJournal.steer(record.runId, params.message);
 			const sent = await sendControlCommand(record.controlSocketPath, {
 				type: "steer",
 				message: params.message,
 			});
+			saveDelivery(sent.ok);
 			if (!sent.ok) {
 				return {
 					content: [

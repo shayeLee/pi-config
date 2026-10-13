@@ -4,6 +4,7 @@
 
 node_modules
 
+agent/antigravity-accounts.json
 agent/auth.json
 agent/models-store.json
 agent/settings.json
