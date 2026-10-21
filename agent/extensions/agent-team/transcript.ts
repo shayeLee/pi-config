@@ -45,9 +45,16 @@ export class TranscriptJournal {
     }
   }
 
-  steer(runId: string, text: string) {
+  /** Fleet run id of a transcript id (the UUID hosts address runs by), while the run is open. */
+  runIdOf(transcriptId: string): string | undefined {
+    for (const [runId, state] of this.runs) if (state.id === transcriptId) return runId;
+    return undefined;
+  }
+
+  /** `source: "user"` marks a person's steer sent through the host, not the parent agent's. */
+  steer(runId: string, text: string, source?: "user") {
     const id = randomUUID();
-    this.write(runId, "input", { id, text, delivery: "submitted" });
+    this.write(runId, "input", { id, text, delivery: "submitted", ...(source ? { source } : {}) });
     return (ok: boolean) => this.write(runId, "input_status", { id, delivery: ok ? "submitted" : "failed" });
   }
 

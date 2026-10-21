@@ -1938,6 +1938,21 @@ export default function (pi: ExtensionAPI) {
 	const restoreFleetHistory = (ctx: { sessionManager: { getBranch(): SessionEntry[] } }) => {
 		fleetStore.restore(collectRestoredFleetRuns(ctx.sessionManager.getBranch()));
 	};
+	type SteerOutcome =
+		| { ok: true }
+		| { ok: false; reason: "not-found" | "not-running" | "no-channel" | "failed"; status?: string; error?: string };
+	// One steer path for the parent agent's tool and the host's control: same checks, same journal.
+	const steerRun = async (runId: string, message: string, source?: "user"): Promise<SteerOutcome> => {
+		const record = backgroundRuns.get(runId);
+		if (!record) return { ok: false, reason: "not-found" };
+		if (record.status !== "running") return { ok: false, reason: "not-running", status: record.status };
+		if (!record.controlSocketPath) return { ok: false, reason: "no-channel" };
+		const saveDelivery = transcriptJournal.steer(record.runId, message, source);
+		const sent = await sendControlCommand(record.controlSocketPath, { type: "steer", message });
+		saveDelivery(sent.ok);
+		return sent.ok ? { ok: true } : { ok: false, reason: "failed", error: sent.error };
+	};
+	type HostSteerAck = { ok: true } | { ok: false; reason: "not-found" | "not-running" | "no-channel" | "failed" | "invalid" };
 
 	pi.on("session_start", (_event, ctx) => {
 		shuttingDown = false;
@@ -1946,6 +1961,15 @@ export default function (pi: ExtensionAPI) {
 			if (identity?.version === 1 && identity.host === "pi-agent-server") hostMode = true;
 		} });
 		pi.events.emit("agent-team:host-transport", { version: 1, accept: (transport: HostTransport) => { hostTransport = transport; } });
+		// Session-scoped: lets a person steer a running child from the host UI. Runs are addressed by
+		// transcript id; only background runs with a control channel can be steered.
+		pi.events.emit("agent-team:host-control", { version: 1, steer: async (transcriptId: unknown, text: unknown): Promise<HostSteerAck> => {
+			if (typeof transcriptId !== "string" || typeof text !== "string" || !text.trim()) return { ok: false, reason: "invalid" };
+			const runId = transcriptJournal.runIdOf(transcriptId);
+			if (!runId) return { ok: false, reason: "not-found" };
+			const outcome = await steerRun(runId, text, "user");
+			return outcome.ok ? outcome : { ok: false, reason: outcome.reason };
+		} });
 		restoreFleetHistory(ctx);
 		if (ctx.mode !== "tui") return;
 		ctx.ui.setWidget(
@@ -2424,62 +2448,26 @@ export default function (pi: ExtensionAPI) {
 		parameters: SteerParams,
 
 		async execute(_toolCallId, params) {
-			const record = backgroundRuns.get(params.runId);
-			if (!record) {
-				return {
-					content: [{ type: "text", text: `No background run with id "${params.runId}".` }],
-					isError: true,
-				};
-			}
-			if (record.status !== "running") {
-				return {
-					content: [
-						{
-							type: "text",
-							text: `Run ${record.runId} is ${record.status}; it can no longer be steered.`,
-						},
-					],
-					isError: true,
-				};
-			}
-			if (!record.controlSocketPath) {
-				return {
-					content: [
-						{
-							type: "text",
-							text:
-								`Run ${record.runId} has no control channel` +
-								(process.platform === "win32" ? " on Windows." : " (the subagent may have exited).") +
-								" Use subagent_status / subagent_logs instead.",
-						},
-					],
-					isError: true,
-				};
-			}
-
-			const saveDelivery = transcriptJournal.steer(record.runId, params.message);
-			const sent = await sendControlCommand(record.controlSocketPath, {
-				type: "steer",
-				message: params.message,
-			});
-			saveDelivery(sent.ok);
-			if (!sent.ok) {
-				return {
-					content: [
-						{
-							type: "text",
-							text: `Could not steer run ${record.runId}: ${sent.error ?? "unknown error"}.`,
-						},
-					],
-					isError: true,
-				};
+			const outcome = await steerRun(params.runId, params.message);
+			if (!outcome.ok) {
+				const text =
+					outcome.reason === "not-found"
+						? `No background run with id "${params.runId}".`
+						: outcome.reason === "not-running"
+							? `Run ${params.runId} is ${outcome.status}; it can no longer be steered.`
+							: outcome.reason === "no-channel"
+								? `Run ${params.runId} has no control channel` +
+									(process.platform === "win32" ? " on Windows." : " (the subagent may have exited).") +
+									" Use subagent_status / subagent_logs instead."
+								: `Could not steer run ${params.runId}: ${outcome.error ?? "unknown error"}.`;
+				return { content: [{ type: "text", text }], isError: true };
 			}
 			return {
 				content: [
 					{
 						type: "text",
 						text:
-							`Steering message queued for run ${record.runId}. ` +
+							`Steering message queued for run ${params.runId}. ` +
 							"It is delivered at the subagent's next turn boundary.",
 					},
 				],
