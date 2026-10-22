@@ -1,0 +1,36 @@
+{
+  "mcpServers": {
+    "context7": {
+      "url": "https://mcp.context7.com/mcp",
+      "description": "Context7：查询开源库的最新文档与代码示例（公开服务，无需凭证）。",
+      "timeout": 60,
+      "piAgentServer": {
+        "maxExposure": "direct"
+      }
+    },
+    "linear": {
+      "url": "https://mcp.linear.app/mcp",
+      "description": "Linear：每个用户用自己的 Linear 账号，只读。",
+      "timeout": 60,
+      "oauth": {
+        "scope": "read"
+      },
+      "piAgentServer": {
+        "label": "Linear",
+        "maxExposure": "codemode"
+      }
+    },
+    "chrome-devtools": {
+      "command": "volta",
+      "args": [
+        "run",
+        "--node",
+        "24",
+        "npx",
+        "-y",
+        "chrome-devtools-mcp@latest"
+      ],
+      "exposure": "direct"
+    }
+  }
+}
