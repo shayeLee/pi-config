@@ -128,16 +128,22 @@ user tool body
 	return agentsDir;
 }
 
-/** Point getAgentDir() at `userCfg`, run `fn`, then restore the env var exactly. */
+/**
+ * Point getAgentDir() at `userCfg` and HOME at a temp dir (so the real
+ * ~/.pi/agent/claude-agents config is not discovered), run `fn`, then restore both exactly.
+ */
 function withUserDir(userCfg, fn) {
-	const saved = process.env.PI_CODING_AGENT_DIR;
-	const had = "PI_CODING_AGENT_DIR" in process.env;
+	const saved = { PI_CODING_AGENT_DIR: process.env.PI_CODING_AGENT_DIR, HOME: process.env.HOME };
+	const had = { PI_CODING_AGENT_DIR: "PI_CODING_AGENT_DIR" in process.env, HOME: "HOME" in process.env };
 	process.env.PI_CODING_AGENT_DIR = userCfg;
+	process.env.HOME = path.dirname(userCfg);
 	try {
 		fn();
 	} finally {
-		if (had) process.env.PI_CODING_AGENT_DIR = saved;
-		else delete process.env.PI_CODING_AGENT_DIR;
+		for (const key of ["PI_CODING_AGENT_DIR", "HOME"]) {
+			if (had[key]) process.env[key] = saved[key];
+			else delete process.env[key];
+		}
 	}
 }
 

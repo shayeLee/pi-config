@@ -6,9 +6,17 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { CONFIG_DIR_NAME, getAgentDir, parseFrontmatter } from "@earendil-works/pi-coding-agent";
 
+import { loadClaudeWorker } from "./claude-backend.ts";
+
 export type AgentScope = "user" | "project" | "both";
 
 export interface AgentConfig {
+	/** Execution backend; omitted roles keep using Pi. */
+	backend?: string;
+	claudePermissionMode?: string;
+	claudeEffort?: string;
+	/** Set when the role's configuration is broken; running it reports this instead. */
+	configError?: string;
 	name: string;
 	description: string;
 	tools?: string[];
@@ -23,6 +31,8 @@ export interface AgentConfig {
 export interface AgentDiscoveryResult {
 	agents: AgentConfig[];
 	projectAgentsDir: string | null;
+	/** Problems that removed or disabled a role without breaking discovery of the others. */
+	diagnostics: string[];
 }
 
 /**
@@ -144,6 +154,8 @@ function loadAgentsFromDir(dir: string, source: "user" | "project"): AgentConfig
 			continue;
 		}
 
+		// Claude configuration belongs exclusively to its independent JSON file.
+		if (frontmatter.backend === "claude") continue;
 		const tools = parseToolsValue(frontmatter.tools);
 		const model = typeof frontmatter.model === "string" ? frontmatter.model.trim() : undefined;
 		const thinkingLevel = typeof frontmatter.thinking === "string" ? frontmatter.thinking.trim() || undefined : undefined;
@@ -210,7 +222,25 @@ export function discoverAgents(cwd: string, scope: AgentScope): AgentDiscoveryRe
 		for (const agent of projectAgents) agentMap.set(agent.name, agent);
 	}
 
-	return { agents: Array.from(agentMap.values()), projectAgentsDir };
+	// A broken Claude configuration must not take the Pi roles down with it.
+	const diagnostics: string[] = [];
+	if (scope !== "project") {
+		let claude: AgentConfig | undefined;
+		try {
+			claude = loadClaudeWorker();
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			claude = { name: "claude-worker", description: `Unavailable: ${message}`, systemPrompt: "", backend: "claude",
+				source: "user", filePath: path.join(getAgentDir(), "claude-agents", "claude-worker.json"), configError: message };
+			diagnostics.push(message);
+		}
+		if (claude && agentMap.has(claude.name)) {
+			diagnostics.push(`Claude worker skipped: a Pi agent is already named "${claude.name}".`);
+		} else if (claude) {
+			agentMap.set(claude.name, claude);
+		}
+	}
+	return { agents: Array.from(agentMap.values()), projectAgentsDir, diagnostics };
 }
 
 export function formatAgentList(agents: AgentConfig[], maxItems: number): { text: string; remaining: number } {

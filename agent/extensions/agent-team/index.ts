@@ -26,12 +26,14 @@ import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import { clampThinkingLevel, StringEnum, type Message, type Model, type ModelThinkingLevel } from "@earendil-works/pi-ai";
 import {
 	CONFIG_DIR_NAME,
+	DefaultResourceLoader,
 	type ExtensionAPI,
 	type ModelRegistry,
 	type SessionEntry,
 	SettingsManager,
 	getAgentDir,
 	getMarkdownTheme,
+	loadProjectContextFiles,
 	withFileMutationQueue,
 } from "@earendil-works/pi-coding-agent";
 import { Container, Markdown, Spacer, Text, truncateToWidth, type Component, visibleWidth } from "@earendil-works/pi-tui";
@@ -42,6 +44,7 @@ import { FleetStore, RevisionCache, liveRowRevisionKey, type FleetRun, type Flee
 import { FleetWidget, showFleetOverlay } from "./fleet-view.ts";
 import { FleetWebServer } from "./fleet-web.ts";
 import { TranscriptJournal } from "./transcript.ts";
+import { agentBackend, claudeInvocation } from "./claude-backend.ts";
 
 const MAX_PARALLEL_TASKS = 8;
 const COLLAPSED_ITEM_COUNT = 10;
@@ -809,6 +812,9 @@ function renderSubagentResult(
 	theme: Theme,
 	fleetStore: FleetStore,
 ): Component {
+	if (result.details && "agents" in result.details) {
+		return new Text(result.content.filter(c => c.type === "text").map(c => c.text).join("\n"), 0, 0);
+	}
 	const rawDetails = result.details as SubagentDetails | undefined;
 	const isLive = Boolean(rawDetails && rawDetails.results.length === 0 && rawDetails.liveRunIds?.length);
 	if (!isLive) {
@@ -1193,8 +1199,9 @@ async function startBackgroundRun(
 	start: (control: RunControlHooks) => Promise<SingleResult>,
 	describe: { agent: string; mode: "single" | "parallel"; task: string; agentScope: AgentScope; projectAgentsDir: string | null },
 	onSettled: () => void,
-): Promise<BackgroundRunRecord<SingleResult> | undefined> {
+): Promise<{ record?: BackgroundRunRecord<SingleResult>; failure?: string }> {
 	let registered: BackgroundRunRecord<SingleResult> | undefined;
+	let failure: string | undefined;
 	let resolveSpawned: () => void = () => {};
 	const spawned = new Promise<void>((resolve) => {
 		resolveSpawned = resolve;
@@ -1237,10 +1244,21 @@ async function startBackgroundRun(
 		},
 	);
 
+	// A run that settles before spawning (unknown agent, broken configuration, a
+	// throw during setup) never reaches onSpawned; keep its reason for the caller.
+	const settledEarly = promise.then(
+		(result) => {
+			if (!registered) failure = result.stderr.trim() || result.errorMessage || "the subagent ended before its subprocess started";
+		},
+		(error) => {
+			if (!registered) failure = error instanceof Error ? error.message : String(error);
+		},
+	);
 	// The subprocess is spawned asynchronously; wait for onSpawned so the
 	// returned runId is usable immediately.
-	await Promise.race([spawned, new Promise((r) => setTimeout(r, 15000))]);
-	return registered;
+	await Promise.race([spawned, settledEarly, new Promise((r) => { const timer = setTimeout(r, 15000); timer.unref?.(); })]);
+	if (registered) return { record: registered };
+	return { failure: failure ?? "the subprocess did not start in time" };
 }
 
 /**
@@ -1339,6 +1357,18 @@ function resolveAgentThinkingLevel(
 type OnUpdateCallback = (partial: AgentToolResult<SubagentDetails>) => void;
 
 /**
+ * The skills a Pi child would see in `cwd`: the same loader, so packages, settings paths,
+ * ~/.agents/skills and project trust all apply. Handed to Claude children as a plugin.
+ */
+async function piSkillsFor(cwd: string, projectTrusted: boolean | undefined): Promise<{ name: string; path: string }[]> {
+	const agentDir = getAgentDir();
+	const loader = new DefaultResourceLoader({ cwd, agentDir, settingsManager: SettingsManager.create(cwd, agentDir, { projectTrusted }),
+		noExtensions: true, noPromptTemplates: true, noThemes: true, noContextFiles: true });
+	await loader.reload();
+	return loader.getSkills().skills.map((skill) => ({ name: skill.name, path: skill.filePath }));
+}
+
+/**
  * Run one subagent to completion and return its result.
  *
  * Runs are never bound to a parent abort signal: every subagent is an
@@ -1377,7 +1407,20 @@ async function runSingleAgent(
 		};
 	}
 
-	const agent = modelRegistry
+	if (configuredAgent.configError) {
+		return {
+			agent: agentName,
+			agentSource: configuredAgent.source,
+			task,
+			exitCode: 1,
+			messages: [],
+			stderr: configuredAgent.configError,
+			usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
+		};
+	}
+
+	const backend = agentBackend(configuredAgent);
+	const agent = backend === "pi" && modelRegistry
 		? {
 				...configuredAgent,
 				thinkingLevel: resolveAgentThinkingLevel(
@@ -1394,7 +1437,8 @@ async function runSingleAgent(
 	if (agent.tools && agent.tools.length > 0) args.push("--tools", agent.tools.join(","));
 
 	// Control channel: only meaningful for runs the caller may steer, and only
-	// where AF_UNIX exists. The socket file is created by the child.
+	// where AF_UNIX exists. The socket file is created by the child (Pi's
+	// control-ext.js, or the Claude worker speaking the same line protocol).
 	const controlSocketPath = control?.controlSocketPath;
 
 	let tmpPromptDir: string | null = null;
@@ -1488,7 +1532,7 @@ async function runSingleAgent(
 	});
 	currentResult.runId = fleetRun.id;
 	currentResult.startedAt = fleetRun.startedAt;
-	try { journal?.start(fleetRun); } catch (error) {
+	try { journal?.start({ ...fleetRun, backend, canSteer: !!controlSocketPath }); } catch (error) {
 		fleetStore.finish(fleetRun, "failed");
 		throw error;
 	}
@@ -1500,7 +1544,7 @@ async function runSingleAgent(
 		runId: fleetRun.id,
 		stop: () => fleetStore.stop(fleetRun.id),
 		live: { messages: currentResult.messages },
-		controlSocketPath: control.controlSocketPath,
+		controlSocketPath,
 		progressSummary: () => progressSummary,
 	});
 
@@ -1620,7 +1664,7 @@ async function runSingleAgent(
 	};
 
 	try {
-		if (agent.systemPrompt.trim()) {
+		if (backend === "pi" && agent.systemPrompt.trim()) {
 			const tmp = await writePromptToTempFile(agent.name, agent.systemPrompt);
 			tmpPromptDir = tmp.dir;
 			tmpPromptPath = tmp.filePath;
@@ -1640,8 +1684,17 @@ async function runSingleAgent(
 
 		args.push(`Task: ${task}`);
 
+		const claudeCwd = path.resolve(cwd ?? defaultCwd);
+		const claude = backend === "claude"
+			? claudeInvocation(agent, task, claudeCwd, process.env, {
+					controlSocket: controlSocketPath,
+					contextFiles: loadProjectContextFiles({ cwd: claudeCwd, agentDir: getAgentDir() }),
+					skills: await piSkillsFor(claudeCwd, projectTrusted),
+				})
+			: undefined;
+
 		const exitCode = await new Promise<number>((resolve) => {
-			const invocation = getPiInvocation(args);
+			const invocation = claude ?? getPiInvocation(args);
 			// Child Pi has no hosted SessionManager. Propagate the invoking extension
 			// context's session ID explicitly; process env is process-global and can
 			// belong to another hosted session (or to a standalone CLI parent).
@@ -1649,8 +1702,8 @@ async function runSingleAgent(
 				cwd: cwd ?? defaultCwd,
 				detached: process.platform !== "win32",
 				shell: false,
-				stdio: ["ignore", "pipe", "pipe"],
-				env: {
+				stdio: [claude ? "pipe" : "ignore", "pipe", "pipe"],
+				env: claude?.env ?? {
 					...process.env,
 					...(failbackParentSessionId
 						? { MODEL_FAILBACK_SESSION_ID: failbackParentSessionId }
@@ -1660,6 +1713,11 @@ async function runSingleAgent(
 					MODEL_FAILBACK_CHILD: "1",
 				},
 			});
+			if (claude) {
+				proc.stdin?.on("error", () => {}); // Early worker exit is handled by close/result validation.
+				proc.stdin?.end(claude.input);
+			}
+			let claudeTerminal = false;
 			childProcess = proc;
 			childPid = proc.pid;
 			if (stopRequested) terminateProcess();
@@ -1683,6 +1741,12 @@ async function runSingleAgent(
 					return;
 				}
 				if (!event || typeof event !== "object" || Array.isArray(event)) return;
+				if (claude && event.type === "claude_run_result") {
+					claudeTerminal = true;
+					currentResult.stopReason = event.status === "completed" ? "stop" : event.status === "stopped" ? "stopped" : "error";
+					if (typeof event.errorMessage === "string") currentResult.errorMessage = event.errorMessage;
+					return;
+				}
 				try { journal?.event(fleetRun.id, event); } catch {
 					transcriptFailed = true;
 					currentResult.errorMessage = "Subagent transcript persistence failed";
@@ -1822,7 +1886,11 @@ async function runSingleAgent(
 			proc.on("close", (code) => {
 				if (buffer.trim()) processLine(buffer);
 				clearForceKillTimerIfGroupGone();
-				resolve(code ?? 0);
+				if (claude && !claudeTerminal && !stopRequested) {
+					currentResult.stopReason = "error";
+					currentResult.errorMessage = "Claude SDK worker exited without a terminal result";
+				}
+				resolve(claude ? (code ?? 1) : (code ?? 0));
 			});
 
 			proc.on("error", () => {
@@ -1886,6 +1954,7 @@ const AgentScopeSchema = StringEnum(["user", "project", "both"] as const, {
 });
 
 const SubagentParams = Type.Object({
+	list: Type.Optional(Type.Boolean({ description: "List available agent configurations without starting any subprocess; do not combine with task arguments" })),
 	agent: Type.Optional(Type.String({ description: "Name of the agent to invoke (for single mode)" })),
 	task: Type.Optional(Type.String({ description: "Task to delegate (for single mode)" })),
 	tasks: Type.Optional(Type.Array(TaskItem, { description: "Array of {agent, task} for parallel execution" })),
@@ -2078,6 +2147,8 @@ export default function (pi: ExtensionAPI) {
 		label: "Subagent",
 		description: [
 			"Delegate tasks to specialized subagents with isolated context.",
+			'To discover available agents, call with {list: true, agentScope: "both"}; do not infer availability by scanning only Markdown directories.',
+			"Claude worker configuration is loaded separately from ~/.pi/agent/claude-agents/claude-worker.json and included in user/both scope.",
 			"Modes: single (agent + task), parallel (tasks array). Each returns one runId immediately;",
 			"the subagent's output is not included.",
 			"Collect results with subagent_wait, which blocks until the run settles. To look without blocking,",
@@ -2102,6 +2173,16 @@ export default function (pi: ExtensionAPI) {
 				: ctx.sessionManager.getSessionId();
 			const discovery = discoverAgents(ctx.cwd, agentScope);
 			const agents = discovery.agents;
+
+			if (params.list) {
+				if (params.agent !== undefined || params.task !== undefined || params.tasks !== undefined) {
+					return { content: [{type: "text", text: "List mode cannot be combined with task arguments."}], isError: true };
+				}
+				const listed = agents.map(a => ({name: a.name, description: a.description, backend: a.backend ?? "pi", source: a.source, filePath: a.filePath,
+					...(a.configError ? { available: false } : {})}));
+				const payload = discovery.diagnostics.length ? { agents: listed, diagnostics: discovery.diagnostics } : { agents: listed };
+				return { content: [{type: "text", text: JSON.stringify(payload, null, 2)}], details: payload };
+			}
 
 			const hasTasks = (params.tasks?.length ?? 0) > 0;
 			const hasSingle = Boolean(params.agent && params.task);
@@ -2146,8 +2227,9 @@ export default function (pi: ExtensionAPI) {
 				// are started immediately; concurrency is bounded by the OS and by the
 				// caller's own judgement rather than by a hidden semaphore.
 				const started: BackgroundRunRecord<SingleResult>[] = [];
+				const failed: string[] = [];
 				for (const t of params.tasks) {
-					const record = await startBackgroundRun(
+					const { record, failure } = await startBackgroundRun(
 						backgroundRuns,
 						(control) =>
 							runSingleAgent(
@@ -2171,16 +2253,18 @@ export default function (pi: ExtensionAPI) {
 							// A run finishing while the agent is idle has nothing else to wake it,
 							// so report immediately; mid-turn results wait for agent_settled.
 							// isIdle is absent from minimal hosts (and the harness).
-							if (ctx.isIdle?.() ?? false) reportUncollectedResults();
+							if (!shuttingDown && (ctx.isIdle?.() ?? false)) reportUncollectedResults();
 						},
 					);
 					if (record) started.push(record);
+					else failed.push(`  ${t.agent}: ${failure}`);
 				}
+				const failedListing = failed.length > 0 ? `\n\n${failed.length} task(s) failed to start:\n${failed.join("\n")}` : "";
 
 				if (started.length === 0) {
 					return {
 						content: [
-							{ type: "text", text: "Failed to start parallel subagents: no subprocess started in time." },
+							{ type: "text", text: `Failed to start parallel subagents.${failedListing}` },
 						],
 						details: makeDetails("parallel")([]),
 						isError: true,
@@ -2193,7 +2277,7 @@ export default function (pi: ExtensionAPI) {
 						{
 							type: "text",
 							text:
-								`${started.length} background subagent(s) started:\n${listing}\n\n` +
+								`${started.length} background subagent(s) started:\n${listing}${failedListing}\n\n` +
 								"Call subagent_wait (with no arguments) to collect all of their results. " +
 								"Do not finish the turn before collecting results you depend on.",
 						},
@@ -2205,7 +2289,7 @@ export default function (pi: ExtensionAPI) {
 			if (params.agent && params.task) {
 				// Every subagent is a background run: register it as soon as the
 				// subprocess exists and return immediately so the caller can supervise it.
-				const record = await startBackgroundRun(
+				const { record, failure } = await startBackgroundRun(
 					backgroundRuns,
 					(control) =>
 						runSingleAgent(
@@ -2229,13 +2313,13 @@ export default function (pi: ExtensionAPI) {
 						// A run finishing while the agent is idle has nothing else to wake it,
 						// so report immediately; mid-turn results wait for agent_settled.
 						// isIdle is absent from minimal hosts (and the harness).
-						if (ctx.isIdle?.() ?? false) reportUncollectedResults();
+						if (!shuttingDown && (ctx.isIdle?.() ?? false)) reportUncollectedResults();
 					},
 				);
 				if (!record) {
 					return {
 						content: [
-							{ type: "text", text: "Failed to start background subagent: the subprocess did not start in time." },
+							{ type: "text", text: `Failed to start background subagent: ${failure}` },
 						],
 						details: makeDetails("single")([]),
 						isError: true,
@@ -2264,6 +2348,7 @@ export default function (pi: ExtensionAPI) {
 
 		renderCall(args, theme, _context) {
 			const scope: AgentScope = args.agentScope ?? "both";
+			if (args.list) return new Text(`subagent list [${scope}]`, 0, 0);
 			if (args.tasks && args.tasks.length > 0) {
 				let text =
 					theme.fg("toolTitle", theme.bold("subagent ")) +

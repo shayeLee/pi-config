@@ -7,10 +7,10 @@ export class TranscriptJournal {
   private runs = new Map<string, { id: string; seq: number; message: number; open: boolean; lastPartial: number; liveRevision: number; partial?: unknown }>();
   constructor(private append: (type: string, data: unknown) => void, private emit: (type: string, data: unknown) => void) {}
 
-  start(run: { id: string; agent: string; task: string; startedAt: number; model?: string; thinkingLevel?: string }) {
+  start(run: { id: string; agent: string; task: string; startedAt: number; model?: string; thinkingLevel?: string; backend?: string; canSteer?: boolean }) {
     const state = { id: randomUUID(), seq: 0, message: 0, open: false, lastPartial: 0, liveRevision: 0 };
     this.runs.set(run.id, state);
-    this.write(run.id, "start", { runId: run.id, agent: run.agent, task: run.task, startedAt: run.startedAt, model: run.model, thinkingLevel: run.thinkingLevel });
+    this.write(run.id, "start", { runId: run.id, agent: run.agent, task: run.task, startedAt: run.startedAt, model: run.model, thinkingLevel: run.thinkingLevel, backend: run.backend, canSteer: run.canSteer });
   }
 
   private write(runId: string, kind: string, payload: unknown) {

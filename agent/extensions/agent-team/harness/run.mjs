@@ -119,10 +119,18 @@ function createMockExtensionApi() {
 	const tools = new Map();
 	const commands = new Map();
 	const shortcuts = new Map();
-	// Records every pi.sendUserMessage call so tests can assert that background
-	// results are injected back as follow-up messages.
+	// Records every message the extension sends back into the session, so tests can
+	// assert that background results are injected as follow-up messages. Reminders
+	// go through pi.sendMessage (a custom, hidden message); sendUserMessage is kept
+	// for anything that still sends a plain user message.
 	const sentUserMessages = [];
+	// Session entries and bus events the transcript journal writes.
+	const appendedEntries = [];
 	const api = {
+		appendEntry(customType, data) {
+			appendedEntries.push({ customType, data });
+		},
+		events: { on() {}, emit() {} },
 		on(event, handler) {
 			const list = handlers.get(event) ?? [];
 			list.push(handler);
@@ -139,6 +147,9 @@ function createMockExtensionApi() {
 		},
 		sendUserMessage(content, options) {
 			sentUserMessages.push({ content, options });
+		},
+		sendMessage(message, options) {
+			sentUserMessages.push({ content: message.content, customType: message.customType, display: message.display, options });
 		},
 	};
 	return { api, handlers, tools, commands, shortcuts, sentUserMessages };
@@ -725,6 +736,20 @@ async function main() {
 		const bgUnknown = await callTool(stopTool, { runId: "does-not-exist" });
 		check("unknown runId is rejected", bgUnknown.isError === true);
 
+		// (9d') A run that ends before spawning reports why, in both modes.
+		const unknownSingle = await subagent.execute("harness-call", { agent: "no-such-agent", task: "x" }, undefined, undefined, ctx);
+		check(
+			"a single run that cannot start reports the real reason",
+			unknownSingle.isError === true && (unknownSingle.content[0]?.text ?? "").includes('Unknown agent: "no-such-agent"'),
+			unknownSingle.content[0]?.text,
+		);
+		const unknownParallel = await subagent.execute("harness-call", { tasks: [{ agent: "no-such-agent", task: "x" }] }, undefined, undefined, ctx);
+		check(
+			"a parallel task that cannot start is listed with its reason",
+			unknownParallel.isError === true && (unknownParallel.content[0]?.text ?? "").includes('no-such-agent: Unknown agent: "no-such-agent"'),
+			unknownParallel.content[0]?.text,
+		);
+
 		// (9e) subagent_logs reads a settled run's transcript.
 		const bgLogs = await callTool(logsTool, { runId: bgRunId });
 		check("subagent_logs returns the transcript", (bgLogs.content[0]?.text ?? "").includes("Run " + bgRunId));
@@ -757,6 +782,11 @@ async function main() {
 			"the reminder uses followUp delivery",
 			reminded[0]?.options?.deliverAs === "followUp",
 			JSON.stringify(reminded[0]?.options),
+		);
+		check(
+			"the reminder is a hidden results-ready message that starts a turn",
+			reminded[0]?.customType === "agent-team:results-ready" && reminded[0]?.display === false && reminded[0]?.options?.triggerTurn === true,
+			JSON.stringify({ customType: reminded[0]?.customType, display: reminded[0]?.display, options: reminded[0]?.options }),
 		);
 		check(
 			"the reminder carries the subagent's output preview",
