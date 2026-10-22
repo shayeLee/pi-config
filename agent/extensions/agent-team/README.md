@@ -175,8 +175,8 @@ Pi JSON 模式按行输出事件。扩展解析每一行，并主要采集：
 ```json
 {
   "tasks": [
-    { "agent": "reviewer", "task": "..." },
-    { "agent": "reviewer", "task": "..." }
+    { "agent": "worker", "task": "..." },
+    { "agent": "claude-worker", "task": "..." }
   ]
 }
 ```

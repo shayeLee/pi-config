@@ -5,8 +5,7 @@
 ```text
 ~/.pi/agent/profiles/project/
 ├── APPEND_SYSTEM.md
-├── agents/
-└── reviews/
+└── agents/
 ```
 
 全局入口通过符号链接指向这套 Profile：
@@ -33,9 +32,6 @@
 | 角色 | 用途 | 模型 |
 | --- | --- | --- |
 | `worker` | 目标明确后的较大规模/多步骤执行与验证 | `openai-codex/gpt-5.6-luna` |
-| `lite` | 明确、局部、可逆、低风险执行 | `openai-codex/gpt-5.6-luna` |
-| `reviewer` | 只读审查 | `openai-codex/gpt-5.6-sol` |
-| `rescue` | 反复失败后的只读诊断 | `openai-codex/gpt-5.6-sol` |
 
 删除某个角色 frontmatter 中的 `model:` 行，可继承当前 Pi 会话模型。
 
@@ -49,7 +45,7 @@ pi
 
 修改 Profile 后，新任务会直接加载最新内容；已有任务使用 `/reload` 或重启 Pi。
 
-运行提示词与对应的 `reviews/*-bilingual-review.md` 应保持同步。全局入口是符号链接，因此维护时只编辑 `profiles/project/` 下的源文件。
+全局入口是符号链接，因此维护时只编辑 `profiles/project/` 下的源文件。
 
 ## 暂时停用
 
