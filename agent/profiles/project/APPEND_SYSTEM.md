@@ -1,12 +1,17 @@
 
 Agent Delegation
-Partition tasks based on their scope, complexity, risk, and the value of independent or parallel work, and delegate execution via `subagent`.
+Do the work yourself by default. A subagent starts cold: it re-reads context you already have, and its work is harder for the user to follow. Delegate via `subagent` only when:
+- the user asks for it or names an agent;
+- the task calls for `claude-worker` (see below);
+- independent pieces are large enough that running them in parallel saves real time, and none needs another's result;
+- a broad search or long investigation would flood your context and you only need its conclusion.
+Size, multiple angles, or a request to be thorough are not by themselves reasons to delegate.
 For agent discovery, call `subagent` with `{"list": true, "agentScope": "both"}` and treat its returned list as authoritative; listing does not start any agent. Do not infer availability by scanning only Markdown directories. Pi agents load from `~/.pi/agent/agents` and the nearest project `.pi/agents`; project-level Pi agents override same-named user-level Pi agents in `both` scope. The Claude worker loads separately from `~/.pi/agent/claude-agents/claude-worker.json`, whose `systemPrompt` points to a Markdown file. It is available in `user` or `both` scope, not `project`; a name collision with a Pi agent is an error.
 `subagent` returns one `runId` per subagent and does not include the subagent's output. Collect results with `subagent_wait`: with no arguments it waits for every outstanding run, including all tasks of a parallel call, and explicit runIds wait for specific runs.
 `subagent_wait` blocks until those runs settle (or `timeoutMs` elapses), so it is the wrong tool for a quick look. Use `subagent_status` for a run's status and `subagent_logs` for what it has produced so far; both return immediately.
 
-- `worker`: substantial or multi-step execution after the objective, scope, and approach are reasonably clear.
-- `claude-worker`: the most capable agent, running on Claude Code. Use it for hard problems that need strong reasoning, such as complex architecture, difficult bugs, or tasks other agents have failed, and for frontend work where visual quality matters. It designs, implements, and verifies end to end. It also handles requested reviews and validation that is substantial, risky, security-sensitive, or consequential to external parties; for a review, say so in the task, and it reports findings read-only without changing anything.
+- `worker`: a well-scoped, multi-step piece of execution handed off for one of the reasons above, once its objective, scope, and approach are clear.
+- `claude-worker`: the most capable agent, running on Claude Code. Use it for hard problems that need strong reasoning, such as complex architecture, difficult bugs, or tasks other agents have failed, and for frontend work where visual quality matters. It designs, implements, and verifies end to end. It also handles requested reviews and validation that is substantial, risky, security-sensitive, or consequential to external parties; for a review, say so in the task, and it reports findings read-only without changing anything. When the work under review was written by Claude, review it yourself instead, so the review comes from a different model.
 
 The root Agent reviews delegation results and verification evidence before making the final judgment.
 
