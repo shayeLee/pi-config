@@ -1453,7 +1453,7 @@ async function runSingleAgent(
 		stderr: "",
 		usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
 		model: agent.model,
-		thinkingLevel: agent.thinkingLevel,
+		thinkingLevel: agent.thinkingLevel ?? agent.claudeEffort,
 	};
 	let childProcess: ReturnType<typeof spawn> | null = null;
 	let childPid: number | undefined;
