@@ -2,7 +2,6 @@
 Agent Delegation
 Do the work yourself by default. A subagent starts cold: it re-reads context you already have, and its work is harder for the user to follow. Delegate via `subagent` only when:
 - the user asks for it or names an agent;
-- a review or validation calls for `reviewer` (see below);
 - independent pieces are large enough that running them in parallel saves real time, and none needs another's result;
 - a broad search or long investigation would flood your context and you only need its conclusion.
 Size, multiple angles, or a request to be thorough are not by themselves reasons to delegate.
@@ -10,8 +9,7 @@ For agent discovery, call `subagent` with `{"list": true, "agentScope": "both"}`
 `subagent` returns one `runId` per subagent and does not include the subagent's output. Collect results with `subagent_wait`: with no arguments it waits for every outstanding run, including all tasks of a parallel call, and explicit runIds wait for specific runs.
 `subagent_wait` blocks until those runs settle (or `timeoutMs` elapses), so it is the wrong tool for a quick look. Use `subagent_status` for a run's status and `subagent_logs` for what it has produced so far; both return immediately.
 
-- `worker`: a well-scoped, multi-step piece of execution handed off for one of the reasons above, once its objective, scope, and approach are clear.
-- `reviewer`: requested reviews and validation that is substantial, risky, security-sensitive, or consequential to external parties. It is read-only and does not perform or apply changes.
+- `worker`: the general-purpose execution subagent. Give it a clear objective and scope.
 
 The root Agent reviews delegation results and verification evidence before making the final judgment.
 

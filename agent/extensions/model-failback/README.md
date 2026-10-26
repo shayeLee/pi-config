@@ -264,7 +264,7 @@ E2E 会真实调用 provider，前提是 `opencode` 账户当前无余额，并�
 - 支持 `openai-codex`、`opencode`、`opencode-go`、`modelscope`、`command-code`、`workbuddy`、`workbuddy-cn` 七个 provider;
 - 使用 `chains` 表达多层 failback，精确节点优先于通配节点;
 - 终态发生后只 ban 精确的 `provider/model`，不 ban 整个 provider;
-- ban 在同一主 session 的 worker/reviewer 子进程之间共享，不跨 session;
+- ban 在同一主 session 的 子代理子进程之间共享，不跨 session;
 - session 结束时清理 ban，`/reload` 保留 ban;
 - 主 session 启动时按 `banFileTtlMs` 惰性清理异常退出遗留文件，默认 TTL 为 7 天;
 - 多个并行 subagent 写入同一 session ban 文件时使用跨进程锁;
@@ -313,7 +313,7 @@ export const myProviderHandler: ProviderFailbackHandler = {
 - `pi-workbuddy-connect` 的错误信封补全:`{code,msg}` → `{error:{message,type,code}}`,`code` 以字符串保留(实测真实 API 的 `11101` 与 mock 的 `14001` 均能活到 `errorMessage`)
 - ModelScope Qwen 的 `insufficient balance` 真实 lite subagent 接续
 - 两层 failback、链内已 ban 节点跳过、环检测、连跳上限和 cross-provider 守卫
-- worker/reviewer 子进程启动前跳过已 ban 模型
+- 子代理子进程启动前跳过已 ban 模型
 - `reload` 保留当前 session ban
 - 并行 ban 写入不丢记录、TTL 孤儿文件清理
 - 真实端到端:

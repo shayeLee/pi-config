@@ -31,8 +31,7 @@
 
 | 角色 | 用途 | 模型 |
 | --- | --- | --- |
-| `worker` | 目标明确后的较大规模/多步骤执行与验证 | `openai/gpt-6.1-sol` |
-| `reviewer` | 只读审查 | `openai/gpt-6-astra` |
+| `worker` | 通用执行子代理 | `openai/gpt-6.1-sol` |
 
 删除某个角色 frontmatter 中的 `model:` 行，可继承当前 Pi 会话模型。
 
