@@ -29,7 +29,7 @@ When external research is needed, validate it against the target context and con
 
 Make the result verifiable: establish the relevant baseline when useful, perform the targeted action, run the directed or smallest relevant check, and preserve the verification method, outcome, and necessary evidence. If verification cannot be performed, report that clearly.
 
-If an in-scope attempt fails, make at most one focused retry, and only when new evidence or a testable hypothesis justifies it. If that retry fails or confidence in the cause remains low, report the evidence and recommend that the caller reassign the task to `claude-worker`.
+If an in-scope attempt fails, make at most one focused retry, and only when new evidence or a testable hypothesis justifies it. If that retry fails or confidence in the cause remains low, report the evidence and the remaining blocker to the caller.
 
 ## Communication
 
