@@ -22,6 +22,8 @@ agent/usage-stats.json
 
 agent/bin
 agent/sessions
+# pi-agent-server 的 Claude 引擎对话（DATA_DIR 默认 ~/.pi，含对话原文）
+sessions/
 agent/subagent-usage
 agent/codex-quota-observations/
 agent/usage-cache.json
