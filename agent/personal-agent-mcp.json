@@ -1,0 +1,74 @@
+{
+  "mcpServers": {
+    "browser": {
+      "command": "/Users/mz/.volta/bin/volta",
+      "args": [
+        "run",
+        "--node",
+        "24",
+        "npx",
+        "-y",
+        "chrome-devtools-mcp@1.12.0",
+        "--autoConnect",
+        "--no-usage-statistics",
+        "--no-performance-crux",
+        "--no-javascript-evaluation",
+        "--no-file-navigations",
+        "--redact-network-headers",
+        "--no-category-performance",
+        "--no-category-memory",
+        "--no-category-emulation"
+      ],
+      "owners": [
+        "ip:127.0.0.1",
+        "user:1656b60d-4540-4fe0-ae81-d3f69352c01a"
+      ],
+      "allow": [
+        "list_pages",
+        "select_page",
+        "take_snapshot",
+        "take_screenshot",
+        "wait_for",
+        "list_console_messages",
+        "get_console_message",
+        "list_network_requests",
+        "get_network_request",
+        "get_css_styles",
+        "new_page",
+        "navigate_page"
+      ],
+      "deny": [
+        "evaluate_script",
+        "upload_file",
+        "lighthouse_audit",
+        "screencast_start",
+        "screencast_stop"
+      ]
+    },
+    "figma": {
+      "command": "/Users/mz/.volta/bin/volta",
+      "args": [
+        "run",
+        "--node",
+        "24",
+        "npx",
+        "-y",
+        "figma-developer-mcp@0.13.2",
+        "--stdio"
+      ],
+      "env": {
+        "FIGMA_API_KEY": "${FIGMA_API_KEY}"
+      },
+      "owners": [
+        "ip:127.0.0.1",
+        "user:1656b60d-4540-4fe0-ae81-d3f69352c01a"
+      ],
+      "allow": [
+        "get_figma_data"
+      ],
+      "deny": [
+        "download_figma_images"
+      ]
+    }
+  }
+}

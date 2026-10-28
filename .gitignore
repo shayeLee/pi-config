@@ -43,3 +43,7 @@ agent/.workbuddy-cn-auth.json
 agent/.workbuddy-cn-settings.json
 
 agent/extensions/**/pnpm-lock.yaml
+
+# pi-agent-server 个人助理（Claude 引擎）：对话归档含对话原文；工作目录里是浏览器快照等临时文件
+personal-agent-archive/
+agent/personal-agent-claude/
