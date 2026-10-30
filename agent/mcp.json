@@ -19,18 +19,6 @@
         "label": "Linear",
         "maxExposure": "codemode"
       }
-    },
-    "chrome-devtools": {
-      "command": "volta",
-      "args": [
-        "run",
-        "--node",
-        "24",
-        "npx",
-        "-y",
-        "chrome-devtools-mcp@latest"
-      ],
-      "exposure": "direct"
     }
   }
 }
