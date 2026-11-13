@@ -16,7 +16,9 @@
       },
       "owners": [
         "ip:127.0.0.1",
-        "user:1656b60d-4540-4fe0-ae81-d3f69352c01a"
+        "user:1656b60d-4540-4fe0-ae81-d3f69352c01a",
+        "user:3acd2eb5-f304-4987-a875-231cf8b51e97",
+        "user:af788729-5699-4a66-bbf8-515ed26c95ec"
       ],
       "allow": [
         "get_figma_data"
@@ -29,7 +31,9 @@
   "bash": {
     "owners": [
       "user:1656b60d-4540-4fe0-ae81-d3f69352c01a",
-      "ip:127.0.0.1"
+      "ip:127.0.0.1",
+      "user:3acd2eb5-f304-4987-a875-231cf8b51e97",
+      "user:af788729-5699-4a66-bbf8-515ed26c95ec"
     ]
   },
   "memory": {

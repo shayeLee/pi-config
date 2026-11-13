@@ -47,3 +47,13 @@ agent/extensions/**/pnpm-lock.yaml
 # pi-agent-server 个人助理（Claude 引擎）：对话归档含对话原文；工作目录里是浏览器快照等临时文件
 personal-agent-archive/
 agent/personal-agent-claude/
+
+# pi-agent-server 本机运行数据：文件回退快照、个人记忆、推送密钥和进程/沙箱状态
+/file-checkpoints/
+/personal-agent-memory/
+/web-push/
+/agent/*.db.background-processes.json
+/agent/*.db.command-sandbox.json
+
+# 个人助理 MCP 配置的本地备份
+/agent/personal-agent-mcp.json.bak-*
