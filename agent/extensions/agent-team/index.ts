@@ -45,6 +45,7 @@ import { FleetWidget, showFleetOverlay } from "./fleet-view.ts";
 import { FleetWebServer } from "./fleet-web.ts";
 import { TranscriptJournal } from "./transcript.ts";
 import { agentBackend, claudeInvocation } from "./claude-backend.ts";
+import { electronPiInvocation } from "./electron-invocation.ts";
 
 const MAX_PARALLEL_TASKS = 8;
 const COLLAPSED_ITEM_COUNT = 10;
@@ -1168,6 +1169,8 @@ async function writePromptToTempFile(agentName: string, prompt: string): Promise
 }
 
 function getPiInvocation(args: string[]): { command: string; args: string[] } {
+	const electron = electronPiInvocation(args);
+	if (electron) return electron;
 	const currentScript = process.argv[1];
 	const isBunVirtualScript = currentScript?.startsWith("/$bunfs/root/");
 	const isPiCliScript = /pi-coding-agent[/\\]dist[/\\]cli\.js$/i.test(currentScript || "");
