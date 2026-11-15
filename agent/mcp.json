@@ -1,5 +1,16 @@
 {
   "mcpServers": {
+    "mcp-server-askecho-search-infinity": {
+      "command": "uvx",
+      "args": ["--from", "git+https://github.com/volcengine/mcp-server#subdirectory=server/mcp_server_askecho_search_infinity", "mcp-server-askecho-search-infinity"],
+      "env": {
+        "ASK_ECHO_SEARCH_INFINITY_API_KEY": "${ARK_AGENT_PLAN_API_KEY}"
+      },
+      "description": "豆包联网搜索：通过火山方舟 Agent Plan 查询实时网页信息。",
+      "piAgentServer": {
+        "defaultEnabled": true
+      }
+    },
     "context7": {
       "url": "https://mcp.context7.com/mcp",
       "description": "Context7：查询开源库的最新文档与代码示例（公开服务，无需凭证）。",
