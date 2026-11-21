@@ -65,4 +65,6 @@ agent/personal-agent-claude/
 /acp-permissions/
 /acp-permissions-audit.jsonl
 /codex-quota/
+/agent/extensions-removed/
+/agent/screenshots/
 

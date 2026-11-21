@@ -2,7 +2,11 @@
   "mcpServers": {
     "mcp-server-askecho-search-infinity": {
       "command": "uvx",
-      "args": ["--from", "git+https://github.com/volcengine/mcp-server#subdirectory=server/mcp_server_askecho_search_infinity", "mcp-server-askecho-search-infinity"],
+      "args": [
+        "--from",
+        "git+https://github.com/volcengine/mcp-server#subdirectory=server/mcp_server_askecho_search_infinity",
+        "mcp-server-askecho-search-infinity"
+      ],
       "env": {
         "ASK_ECHO_SEARCH_INFINITY_API_KEY": "${ARK_AGENT_PLAN_API_KEY}"
       },

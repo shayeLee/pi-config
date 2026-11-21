@@ -2,7 +2,7 @@
 name: worker
 description: General-purpose execution subagent for a bounded task with a clear objective and scope.
 tools: read, grep, find, ls, bash, edit, write
-model: opencode-go/glm-5.3-flash
+model: openai/gpt-6.2-sol
 ---
 
 # Worker
