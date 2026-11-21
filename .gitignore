@@ -57,3 +57,12 @@ agent/personal-agent-claude/
 
 # 个人助理 MCP 配置的本地备份
 /agent/personal-agent-mcp.json.bak-*
+
+# pi-agent-server ACP 与 Codex 额度本机运行数据
+/acp-account-email.json
+/acp-last-quota.json
+/acp-model-catalog/
+/acp-permissions/
+/acp-permissions-audit.jsonl
+/codex-quota/
+
